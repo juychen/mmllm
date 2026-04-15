@@ -1,0 +1,2 @@
+
+./merge_meth.sh /data2st1/junyi/output/llm0401/processed_meth/MC_AMY.bw /data1st2/hannan_25/data/Nanopore_processV1/nanopore_06_distribution/MC21D-AMY.6mA_5mC5hmC.CG.pileup.m.bigwig /data1st2/hannan_25/data/Nanopore_processV1/nanopore_06_distribution/MC39B-AMY.6mA_5mC5hmC.CG.pileup.m.bigwig /data1st2/hannan_25/data/Nanopore_processV1/nanopore_06_distribution/MC33A-AMY.6mA_5mC5hmC.CG.pileup.m.bigwig

@@ -1,0 +1,16 @@
+#!/bin/bash
+source /home/junyichen/anaconda3/etc/profile.d/conda.sh
+conda activate evo2
+cd /home/junyichen/code/mmllm/
+# GET current time
+current_time=$(date "+%Y-%m-%d%H:%M:%S")
+echo "Current time: $current_time"
+python run_sample_size_experiments.py \
+  --sample-sizes 1000 5000 10000 30000 70000\
+  --scheduler cosine \
+  --num-epochs 100 \
+  --batch-size 64 \
+  --scheduler-patience 5 \
+  --scheduler-min-lr 1e-5 \
+  --output-csv output/$current_time\_sample_size_results.csv \
+  --output-json output/$current_time\_sample_size_results.json
