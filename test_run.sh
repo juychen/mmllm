@@ -6,7 +6,7 @@ cd /home/junyichen/code/mmllm/
 current_time=$(date "+%Y-%m-%d%H:%M:%S")
 echo "Current time: $current_time"
 python run_sample_size_experiments.py \
-  --sample-sizes 1000 5000 10000 30000 70000\
+  --sample-sizes 70000 100000\
   --scheduler cosine \
   --num-epochs 100 \
   --batch-size 64 \
