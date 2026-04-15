@@ -238,8 +238,8 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
     final_val_loss, final_val_r2, final_val_pearsonr = evaluate(model, prepared.val_loader, device)
     final_preds, final_targets, final_masks = collect_predictions(model, prepared.val_loader, device)
 
-    signal_csv = args.prediction_signal_csv.format(sample_size=prepared.usable_dmrs)
-    regression_plot = args.regression_plot_path.format(sample_size=prepared.usable_dmrs)
+    signal_csv = args.prediction_signal_csv.format(sample_size=prepared.usable_dmrs, timestamp=args.timestamp)
+    regression_plot = args.regression_plot_path.format(sample_size=prepared.usable_dmrs, timestamp=args.timestamp)
     export_prediction_signals(
         signal_csv,
         prepared.val_region_metadata,
@@ -308,14 +308,15 @@ def parse_args():
     parser.add_argument("--atac-scaling", choices=["none", "minmax"], default="minmax")
     parser.add_argument("--output-csv", default="output/sample_size_results.csv")
     parser.add_argument("--output-json", default="output/sample_size_results.json")
+    parser.add_argument("--timestamp", default="", help="Optional timestamp string for output path templates.")
     parser.add_argument(
         "--prediction-signal-csv",
-        default="output/prediction_signals_{sample_size}.csv",
+        default="output/{timestamp}_prediction_signals_{sample_size}.csv",
         help="Per-sample-size CSV export path template for predicted and true methylation signals.",
     )
     parser.add_argument(
         "--regression-plot-path",
-        default="output/regression_plot_{sample_size}.png",
+        default="output/{timestamp}_regression_plot_{sample_size}.png",
         help="Per-sample-size regression plot output path template.",
     )
     return parser.parse_args()
