@@ -1,13 +1,51 @@
 import argparse
 import json
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 
+import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
- 
-from data import load_data, prepare_experiment_data
+import torch.nn.functional as F
+
+from data import (
+    assign_non_overlapping_groups,
+    find_cpg_candidate_positions,
+    load_data,
+    scale_atac_tensor,
+    sequence_to_base_ids,
+)
 from models import MinimalCrossHyenaRegressor
+
+
+@dataclass
+class PreparedAtacSequenceData:
+    train_loader: torch.utils.data.DataLoader
+    val_loader: torch.utils.data.DataLoader
+    usable_dmrs: int
+    seq_len: int
+    post_filter_len: int
+    train_regions: int
+    val_regions: int
+    non_overlap_groups: int
+
+
+@dataclass
+class ExperimentResult:
+    num_dmrs: int
+    query_modality: str
+    context_modality: str
+    train_regions: int
+    val_regions: int
+    non_overlap_groups: int
+    best_epoch: int
+    final_lr: float
+    best_val_loss: float
+    best_val_r2: float
+    best_val_pearsonr: float
+    final_val_loss: float
+    final_val_r2: float
+    final_val_pearsonr: float
 
 
 def masked_mse_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -55,6 +93,75 @@ def build_optimizer(model: nn.Module, args) -> torch.optim.Optimizer:
     return torch.optim.AdamW(param_groups, lr=args.learning_rate)
 
 
+def prepare_atac_query_sequence_context_data(
+    num_dmrs: int,
+    args,
+    df_dmr,
+    seqs,
+    _mcg_tracks,
+    hmcg_tracks,
+    atac_tracks,
+) -> PreparedAtacSequenceData:
+    usable_dmrs = min(num_dmrs, len(df_dmr), len(seqs), len(hmcg_tracks), len(atac_tracks))
+    seq_len = min(len(hmcg_tracks[0]), len(atac_tracks[0]), len(seqs[0]))
+    post_filter_len = min(seq_len, 4)
+    base_to_index = {"A": 0, "C": 1, "G": 2, "T": 3, "N": 0}
+
+    query_tensor = torch.tensor(
+        np.stack([np.asarray(atac_tracks[idx][:seq_len], dtype=np.float32) for idx in range(usable_dmrs)]),
+        dtype=torch.float32,
+    ).unsqueeze(-1)
+    query_tensor = scale_atac_tensor(query_tensor, args.atac_scaling)
+
+    hm5c_target = torch.tensor(
+        np.stack([np.asarray(hmcg_tracks[idx][:seq_len], dtype=np.float32) for idx in range(usable_dmrs)]),
+        dtype=torch.float32,
+    ).unsqueeze(-1)
+
+    base_ids_tensor = torch.stack([
+        sequence_to_base_ids(seqs[idx], seq_len, base_to_index) for idx in range(usable_dmrs)
+    ])
+    sequence_onehot = F.one_hot(base_ids_tensor, num_classes=4).float()
+    loss_mask = find_cpg_candidate_positions(base_ids_tensor).unsqueeze(-1).float()
+
+    split_regions_df = df_dmr.iloc[:usable_dmrs].copy().reset_index().rename(columns={"index": "original_idx"})
+    split_regions_df["chr"] = split_regions_df["chr"].astype(str)
+    split_regions_df["start_expanded"] = split_regions_df["start_expanded"].astype(int)
+    split_regions_df["end_expanded"] = split_regions_df["end_expanded"].astype(int)
+    split_regions_df = assign_non_overlapping_groups(split_regions_df, "chr", "start_expanded", "end_expanded")
+
+    group_ids = split_regions_df["overlap_group"].drop_duplicates().to_numpy()
+    num_train_groups = max(1, int(len(group_ids) * args.train_ratio))
+    train_group_ids = set(group_ids[:num_train_groups].tolist())
+    train_mask = split_regions_df["overlap_group"].isin(train_group_ids).to_numpy()
+    train_idx = torch.from_numpy(np.flatnonzero(train_mask)).long()
+    val_idx = torch.from_numpy(np.flatnonzero(~train_mask)).long()
+
+    train_dataset = torch.utils.data.TensorDataset(
+        query_tensor[train_idx],
+        sequence_onehot[train_idx],
+        hm5c_target[train_idx],
+        loss_mask[train_idx],
+    )
+    val_dataset = torch.utils.data.TensorDataset(
+        query_tensor[val_idx],
+        sequence_onehot[val_idx],
+        hm5c_target[val_idx],
+        loss_mask[val_idx],
+    )
+
+    return PreparedAtacSequenceData(
+        train_loader=torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True),
+        val_loader=torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False),
+        usable_dmrs=usable_dmrs,
+        seq_len=seq_len,
+        post_filter_len=post_filter_len,
+        train_regions=len(train_idx),
+        val_regions=len(val_idx),
+        non_overlap_groups=split_regions_df["overlap_group"].nunique(),
+    )
+
+
 def evaluate(model: nn.Module, loader, device: torch.device) -> tuple[float, float, float]:
     model.eval()
     total_loss = 0.0
@@ -63,13 +170,12 @@ def evaluate(model: nn.Module, loader, device: torch.device) -> tuple[float, flo
     targets = []
     masks = []
     with torch.no_grad():
-        for query_batch, sequence_batch, atac_batch, target_batch, mask_batch in loader:
+        for query_batch, context_batch, target_batch, mask_batch in loader:
             query_batch = query_batch.to(device)
-            sequence_batch = sequence_batch.to(device)
-            atac_batch = atac_batch.to(device)
+            context_batch = context_batch.to(device)
             target_batch = target_batch.to(device)
             mask_batch = mask_batch.to(device)
-            context_batch = build_context_batch(sequence_batch, atac_batch, model.run_args)
+
             pred = model(query_batch, context_batch)
             loss = masked_mse_loss(pred, target_batch, mask_batch)
 
@@ -100,59 +206,25 @@ def evaluate(model: nn.Module, loader, device: torch.device) -> tuple[float, flo
     return total_loss / max(total_count, 1), r2.item(), pearson_r_value
 
 
-@dataclass
-class ExperimentResult:
-    num_dmrs: int
-    use_m5c: bool
-    use_sequence: bool
-    use_atac: bool
-    train_regions: int
-    val_regions: int
-    non_overlap_groups: int
-    best_epoch: int
-    final_lr: float
-    best_val_loss: float
-    best_val_r2: float
-    best_val_pearsonr: float
-    final_val_loss: float
-    final_val_r2: float
-    final_val_pearsonr: float
-
-
-def build_context_batch(sequence_batch: torch.Tensor, atac_batch: torch.Tensor, args) -> torch.Tensor:
-    context_parts = []
-    if args.use_sequence:
-        context_parts.append(sequence_batch)
-    if args.use_atac:
-        context_parts.append(atac_batch)
-    if not context_parts:
-        raise ValueError("At least one context modality must be enabled.")
-    return torch.cat(context_parts, dim=-1)
-
-
-def get_context_dim(args) -> int:
-    context_dim = 0
-    if args.use_sequence:
-        context_dim += 4
-    if args.use_atac:
-        context_dim += 1
-    if context_dim == 0:
-        raise ValueError("At least one context modality must be enabled.")
-    return context_dim
-
-
 def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks) -> ExperimentResult:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    prepared = prepare_experiment_data(num_dmrs, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks)
+    prepared = prepare_atac_query_sequence_context_data(
+        num_dmrs,
+        args,
+        df_dmr,
+        seqs,
+        mcg_tracks,
+        hmcg_tracks,
+        atac_tracks,
+    )
 
     model = MinimalCrossHyenaRegressor(
         seq_len=prepared.seq_len,
         query_dim=1,
-        context_dim=get_context_dim(args),
+        context_dim=4,
         hidden_dim=args.hidden_dim,
         post_filter_len=prepared.post_filter_len,
     ).to(device)
-    model.run_args = args
     optimizer = build_optimizer(model, args)
     scheduler = build_scheduler(optimizer, args, args.num_epochs)
 
@@ -167,13 +239,11 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
         model.train()
         running_loss = 0.0
         seen = 0
-        for query_batch, sequence_batch, atac_batch, target_batch, mask_batch in prepared.train_loader:
+        for query_batch, context_batch, target_batch, mask_batch in prepared.train_loader:
             query_batch = query_batch.to(device)
-            sequence_batch = sequence_batch.to(device)
-            atac_batch = atac_batch.to(device)
+            context_batch = context_batch.to(device)
             target_batch = target_batch.to(device)
             mask_batch = mask_batch.to(device)
-            context_batch = build_context_batch(sequence_batch, atac_batch, args)
 
             optimizer.zero_grad()
             pred = model(query_batch, context_batch)
@@ -204,7 +274,7 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
             best_val_r2 = val_r2
             best_val_pearsonr = val_pearsonr
             best_epoch = epoch
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
             patience_left = args.patience
         else:
             patience_left -= 1
@@ -217,9 +287,8 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
 
     return ExperimentResult(
         num_dmrs=prepared.usable_dmrs,
-        use_m5c=args.use_m5c,
-        use_sequence=args.use_sequence,
-        use_atac=args.use_atac,
+        query_modality="atac",
+        context_modality="sequence",
         train_regions=prepared.train_regions,
         val_regions=prepared.val_regions,
         non_overlap_groups=prepared.non_overlap_groups,
@@ -235,20 +304,13 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Run non-overlap 5mC+Sequence+ATAC to 5hmC experiments at different sample sizes.")
+    parser = argparse.ArgumentParser(
+        description="Run non-overlap ATAC-query and sequence-context experiments for predicting 5hmC."
+    )
     parser.add_argument("--dmr-csv", default="output/dmr_with_sequences.csv")
     parser.add_argument("--genome-fasta", default="/data2st1/junyi/ref/GRCm38.p6.genome.fa")
-    parser.add_argument("--m5c-bedgraph", default="/data2st1/junyi/output/llm0401/processed_meth/MC_AMY.CG.m.bedGraph.gz")
     parser.add_argument("--hm5c-bedgraph", default="/data2st1/junyi/output/llm0401/processed_meth/MC_AMY.CG.h.bedGraph.gz")
     parser.add_argument("--atac-bw", default="/data2st2/junyi/output/atac1112/tobiasbam/BULK/corrected/AMY_MC_track.bw")
-    parser.set_defaults(use_m5c=True)
-    parser.add_argument("--use-m5c", dest="use_m5c", action="store_true", help="Use the 5mC track as the query input.")
-    parser.add_argument("--no-use-m5c", dest="use_m5c", action="store_false", help="Disable the 5mC query input and replace it with zeros.")
-    parser.set_defaults(use_sequence=True, use_atac=True)
-    parser.add_argument("--use-sequence", dest="use_sequence", action="store_true", help="Use DNA sequence in the context input.")
-    parser.add_argument("--no-use-sequence", dest="use_sequence", action="store_false", help="Disable DNA sequence in the context input.")
-    parser.add_argument("--use-atac", dest="use_atac", action="store_true", help="Use ATAC signal in the context input.")
-    parser.add_argument("--no-use-atac", dest="use_atac", action="store_false", help="Disable ATAC signal in the context input.")
     parser.add_argument("--sample-sizes", nargs="+", type=int, required=True)
     parser.add_argument("--target-length", type=int, default=1024)
     parser.add_argument("--train-ratio", type=float, default=0.8)
@@ -264,8 +326,10 @@ def parse_args():
     parser.add_argument("--scheduler-patience", type=int, default=2)
     parser.add_argument("--scheduler-t-max", type=int, default=0)
     parser.add_argument("--atac-scaling", choices=["none", "minmax"], default="minmax")
-    parser.add_argument("--output-csv", default="output/sample_size_results.csv")
-    parser.add_argument("--output-json", default="output/sample_size_results.json")
+    parser.add_argument("--output-csv", default="output/atac_query_sequence_context_results.csv")
+    parser.add_argument("--output-json", default="output/atac_query_sequence_context_results.json")
+    parser.set_defaults(use_m5c=False)
+    parser.add_argument("--m5c-bedgraph", default=None)
     return parser.parse_args()
 
 
@@ -279,8 +343,8 @@ def main():
     results_df = pd.DataFrame(results)
     print(results_df)
     results_df.to_csv(args.output_csv, index=False)
-    with open(args.output_json, "w", encoding="utf-8") as f:
-        json.dump({"args": vars(args), "results": results}, f, indent=2)
+    with open(args.output_json, "w", encoding="utf-8") as file_obj:
+        json.dump({"args": vars(args), "results": results}, file_obj, indent=2)
 
 
 if __name__ == "__main__":

@@ -217,3 +217,29 @@ class MinimalCrossHyenaRegressor(nn.Module):
         hidden = self.post_hyena(hidden)
         hidden = self.norm(hidden)
         return self.head(hidden)
+
+
+class MinimalHyenaRegressor(nn.Module):
+    def __init__(
+        self,
+        seq_len: int,
+        context_dim: int,
+        hidden_dim: int = 64,
+    ):
+        super().__init__()
+        self.context_proj = nn.Linear(context_dim, hidden_dim)
+        self.backbone = HyenaLayer(hidden_dim, seq_len)
+        self.residual = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.LayerNorm(hidden_dim),
+        )
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.head = nn.Linear(hidden_dim, 1)
+
+    def forward(self, context_track: torch.Tensor) -> torch.Tensor:
+        hidden = self.context_proj(context_track)
+        hidden = self.backbone(hidden)
+        hidden = hidden + self.residual(hidden)
+        hidden = self.norm(hidden)
+        return self.head(hidden)

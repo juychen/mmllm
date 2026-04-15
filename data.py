@@ -116,7 +116,7 @@ def load_data(args):
 
     genome = pyfaidx.Fasta(args.genome_fasta)
     tbx_5hmc = pysam.TabixFile(args.hm5c_bedgraph)
-    tbx_5mc = pysam.TabixFile(args.m5c_bedgraph)
+    tbx_5mc = pysam.TabixFile(args.m5c_bedgraph) if args.use_m5c and args.m5c_bedgraph else None
     atac_bw = pyBigWig.open(args.atac_bw)
 
     seqs = []
@@ -128,7 +128,8 @@ def load_data(args):
         start = int(row["start_expanded"])
         end = int(row["end_expanded"])
         seqs.append(get_sequence(chrom, start, end, genome))
-        mcg_tracks.append(fast_tabix_to_track(tbx_5mc, chrom.replace("chr", ""), start, end))
+        if tbx_5mc is not None:
+            mcg_tracks.append(fast_tabix_to_track(tbx_5mc, chrom.replace("chr", ""), start, end))
         hmcg_tracks.append(fast_tabix_to_track(tbx_5hmc, chrom.replace("chr", ""), start, end))
         atac_tracks.append(np.nan_to_num(atac_bw.values(chrom, start, end + 1), nan=0.0))
 
@@ -136,15 +137,24 @@ def load_data(args):
 
 
 def prepare_experiment_data(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks) -> PreparedExperimentData:
-    usable_dmrs = min(num_dmrs, len(df_dmr), len(seqs), len(mcg_tracks), len(hmcg_tracks), len(atac_tracks))
-    seq_len = min(len(mcg_tracks[0]), len(hmcg_tracks[0]), len(atac_tracks[0]), len(seqs[0]))
+    track_lengths = [len(hmcg_tracks[0]), len(atac_tracks[0]), len(seqs[0])]
+    usable_counts = [num_dmrs, len(df_dmr), len(seqs), len(hmcg_tracks), len(atac_tracks)]
+    if mcg_tracks:
+        track_lengths.append(len(mcg_tracks[0]))
+        usable_counts.append(len(mcg_tracks))
+
+    usable_dmrs = min(usable_counts)
+    seq_len = min(track_lengths)
     post_filter_len = min(seq_len, 4)
     base_to_index = {"A": 0, "C": 1, "G": 2, "T": 3, "N": 0}
+    if mcg_tracks:
+        query_tensor = torch.tensor(
+            np.stack([np.asarray(mcg_tracks[idx][:seq_len], dtype=np.float32) for idx in range(usable_dmrs)]),
+            dtype=torch.float32,
+        ).unsqueeze(-1)
+    else:
+        query_tensor = torch.zeros((usable_dmrs, seq_len, 1), dtype=torch.float32)
 
-    query_tensor = torch.tensor(
-        np.stack([np.asarray(mcg_tracks[idx][:seq_len], dtype=np.float32) for idx in range(usable_dmrs)]),
-        dtype=torch.float32,
-    ).unsqueeze(-1)
     hm5c_target = torch.tensor(
         np.stack([np.asarray(hmcg_tracks[idx][:seq_len], dtype=np.float32) for idx in range(usable_dmrs)]),
         dtype=torch.float32,
