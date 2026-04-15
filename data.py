@@ -19,6 +19,7 @@ class PreparedExperimentData:
     train_regions: int
     val_regions: int
     non_overlap_groups: int
+    val_region_metadata: pd.DataFrame
 
 
 def get_sequence(chrom: str, start: int, end: int, genome: pyfaidx.Fasta) -> str:
@@ -207,4 +208,5 @@ def prepare_experiment_data(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_
         train_regions=len(train_idx),
         val_regions=len(val_idx),
         non_overlap_groups=split_regions_df["overlap_group"].nunique(),
+        val_region_metadata=split_regions_df.iloc[val_idx.numpy()].reset_index(drop=True),
     )

@@ -16,6 +16,7 @@ from data import (
     sequence_to_base_ids,
 )
 from models import MinimalCrossHyenaRegressor
+from utils import export_prediction_signals, plot_regression_predictions
 
 
 @dataclass
@@ -28,6 +29,7 @@ class PreparedAtacSequenceData:
     train_regions: int
     val_regions: int
     non_overlap_groups: int
+    val_region_metadata: pd.DataFrame
 
 
 @dataclass
@@ -46,6 +48,8 @@ class ExperimentResult:
     final_val_loss: float
     final_val_r2: float
     final_val_pearsonr: float
+    signal_csv: str
+    regression_plot: str
 
 
 def masked_mse_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -159,6 +163,7 @@ def prepare_atac_query_sequence_context_data(
         train_regions=len(train_idx),
         val_regions=len(val_idx),
         non_overlap_groups=split_regions_df["overlap_group"].nunique(),
+        val_region_metadata=split_regions_df.iloc[val_idx.numpy()].reset_index(drop=True),
     )
 
 
@@ -204,6 +209,23 @@ def evaluate(model: nn.Module, loader, device: torch.device) -> tuple[float, flo
     else:
         pearson_r_value = float("nan")
     return total_loss / max(total_count, 1), r2.item(), pearson_r_value
+
+
+def collect_predictions(model: nn.Module, loader, device: torch.device):
+    model.eval()
+    preds = []
+    targets = []
+    masks = []
+    with torch.no_grad():
+        for query_batch, context_batch, target_batch, mask_batch in loader:
+            query_batch = query_batch.to(device)
+            context_batch = context_batch.to(device)
+            pred = model(query_batch, context_batch)
+            preds.append(pred.detach().cpu())
+            targets.append(target_batch.detach().cpu())
+            masks.append(mask_batch.detach().cpu())
+
+    return torch.cat(preds, dim=0), torch.cat(targets, dim=0), torch.cat(masks, dim=0)
 
 
 def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks) -> ExperimentResult:
@@ -284,6 +306,24 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
     if best_state is not None:
         model.load_state_dict(best_state)
     final_val_loss, final_val_r2, final_val_pearsonr = evaluate(model, prepared.val_loader, device)
+    final_preds, final_targets, final_masks = collect_predictions(model, prepared.val_loader, device)
+
+    signal_csv = args.prediction_signal_csv.format(sample_size=prepared.usable_dmrs)
+    regression_plot = args.regression_plot_path.format(sample_size=prepared.usable_dmrs)
+    export_prediction_signals(
+        signal_csv,
+        prepared.val_region_metadata,
+        final_preds.numpy(),
+        final_targets.numpy(),
+        final_masks.numpy(),
+    )
+    plot_regression_predictions(
+        regression_plot,
+        final_preds.numpy(),
+        final_targets.numpy(),
+        final_masks.numpy(),
+        title=f"ATAC Query vs Sequence Context (n={prepared.usable_dmrs})",
+    )
 
     return ExperimentResult(
         num_dmrs=prepared.usable_dmrs,
@@ -300,6 +340,8 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
         final_val_loss=final_val_loss,
         final_val_r2=final_val_r2,
         final_val_pearsonr=final_val_pearsonr,
+        signal_csv=signal_csv,
+        regression_plot=regression_plot,
     )
 
 
@@ -328,6 +370,16 @@ def parse_args():
     parser.add_argument("--atac-scaling", choices=["none", "minmax"], default="minmax")
     parser.add_argument("--output-csv", default="output/atac_query_sequence_context_results.csv")
     parser.add_argument("--output-json", default="output/atac_query_sequence_context_results.json")
+    parser.add_argument(
+        "--prediction-signal-csv",
+        default="output/atac_query_sequence_context_prediction_signals_{sample_size}.csv",
+        help="Per-sample-size CSV export path template for predicted and true methylation signals.",
+    )
+    parser.add_argument(
+        "--regression-plot-path",
+        default="output/atac_query_sequence_context_regression_plot_{sample_size}.png",
+        help="Per-sample-size regression plot output path template.",
+    )
     parser.set_defaults(use_m5c=False)
     parser.add_argument("--m5c-bedgraph", default=None)
     return parser.parse_args()
