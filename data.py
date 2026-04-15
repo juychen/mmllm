@@ -52,9 +52,9 @@ def find_cpg_candidate_positions(base_ids: torch.Tensor) -> torch.Tensor:
     is_g = base_ids == 2
     right_is_g = torch.zeros_like(is_g)
     right_is_g[:, :-1] = is_g[:, 1:]
-    left_is_c = torch.zeros_like(is_c)
-    left_is_c[:, 1:] = is_c[:, :-1]
-    return (is_c & right_is_g) | (is_g & left_is_c)
+    right_is_c = torch.zeros_like(is_c)
+    right_is_c[:, :-1] = is_c[:, 1:]
+    return (is_c & right_is_g) | (is_g & right_is_c)
 
 
 def scale_atac_tensor(atac_tensor: torch.Tensor, mode: str) -> torch.Tensor:
