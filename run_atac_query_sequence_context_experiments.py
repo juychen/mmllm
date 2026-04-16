@@ -132,6 +132,7 @@ def prepare_atac_query_sequence_context_data(
     split_regions_df["chr"] = split_regions_df["chr"].astype(str)
     split_regions_df["start_expanded"] = split_regions_df["start_expanded"].astype(int)
     split_regions_df["end_expanded"] = split_regions_df["end_expanded"].astype(int)
+    split_regions_df["sequence"] = [str(seqs[idx])[:seq_len].upper() for idx in range(usable_dmrs)]
     split_regions_df = assign_non_overlapping_groups(split_regions_df, "chr", "start_expanded", "end_expanded")
 
     group_ids = split_regions_df["overlap_group"].drop_duplicates().to_numpy()

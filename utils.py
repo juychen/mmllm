@@ -31,7 +31,11 @@ def export_prediction_signals(
     rows = []
     metadata_records = region_metadata.reset_index(drop=True).to_dict("records")
     for region_idx, metadata in enumerate(metadata_records):
+        sequence = str(metadata.get("sequence") or "").upper()
+        region_start = metadata.get("start_expanded")
         for position_idx in range(prediction_array.shape[1]):
+            base = sequence[position_idx] if position_idx < len(sequence) else ""
+            genomic_position = int(region_start) + position_idx if pd.notna(region_start) else None
             rows.append(
                 {
                     "region_idx": region_idx,
@@ -40,6 +44,8 @@ def export_prediction_signals(
                     "start_expanded": metadata.get("start_expanded"),
                     "end_expanded": metadata.get("end_expanded"),
                     "position_idx": position_idx,
+                    "genomic_position": genomic_position,
+                    "base": base,
                     "predicted_signal": float(prediction_array[region_idx, position_idx]),
                     "true_signal": float(target_array[region_idx, position_idx]),
                     "mask": float(mask_array[region_idx, position_idx]),

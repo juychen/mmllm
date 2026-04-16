@@ -25,6 +25,9 @@ current_time=$(date "+%Y-%m-%d-%H-%M-%S")
 #   --scheduler-min-lr 1e-5 \
 #   --output-csv output/$current_time\_sample_size_results.csv \
 #   --output-json output/$current_time\_sample_size_results.json
+condition=MC
+region=AMY
+
 echo "Current time: $current_time"
 python run_sample_size_experiments.py \
   --sample-sizes 2000 20000 100000\
