@@ -4,10 +4,13 @@ conda activate evo2
 cd /home/junyichen/code/mmllm/ || exit 1
 
 regions=("${@}")
-conditions=(MC MW)
+#conditions=(MC MW)
+conditions=(MC)
 
 if [[ ${#regions[@]} -eq 0 ]]; then
-  regions=(AMY HIP PFC)
+  #regions=(AMY HIP PFC)
+  regions=(AMY)
+
 fi
 
 for region in "${regions[@]}"; do
