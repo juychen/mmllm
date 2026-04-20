@@ -66,9 +66,9 @@ def find_cpg_candidate_positions(base_ids: torch.Tensor) -> torch.Tensor:
     is_g = base_ids == 2
     right_is_g = torch.zeros_like(is_g)
     right_is_g[:, :-1] = is_g[:, 1:]
-    right_is_c = torch.zeros_like(is_c)
-    right_is_c[:, :-1] = is_c[:, 1:]
-    return (is_c & right_is_g)
+    left_is_c = torch.zeros_like(is_c)
+    left_is_c[:, 1:] = is_c[:, :-1]
+    return (is_c & right_is_g) | (is_g & left_is_c)
 
 def find_forward_cpg_positions(base_ids: torch.Tensor) -> torch.Tensor:
     is_c = base_ids == 1
