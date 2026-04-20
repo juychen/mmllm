@@ -401,3 +401,65 @@ def prepare_experiment_data(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_
     if not hasattr(legacy_args, "augment_reverse_complement"):
         legacy_args.augment_reverse_complement = False
     return prepare_modality_experiment_data(num_dmrs, legacy_args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks)
+
+
+def toy_test_non_overlap_split(train_ratio: float = 0.8) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    toy_regions = pd.DataFrame(
+        [
+            {"original_idx": 0, "chr": "1", "start_expanded": 100, "end_expanded": 180},
+            {"original_idx": 1, "chr": "1", "start_expanded": 160, "end_expanded": 220},
+            {"original_idx": 2, "chr": "1", "start_expanded": 230, "end_expanded": 260},
+            {"original_idx": 3, "chr": "1", "start_expanded": 255, "end_expanded": 310},
+            {"original_idx": 4, "chr": "1", "start_expanded": 400, "end_expanded": 450},
+            {"original_idx": 5, "chr": "1", "start_expanded": 451, "end_expanded": 500},
+            {"original_idx": 6, "chr": "2", "start_expanded": 100, "end_expanded": 140},
+            {"original_idx": 7, "chr": "2", "start_expanded": 130, "end_expanded": 180},
+            {"original_idx": 8, "chr": "2", "start_expanded": 300, "end_expanded": 360},
+            {"original_idx": 9, "chr": "2", "start_expanded": 500, "end_expanded": 560},
+        ]
+    )
+
+    grouped = assign_non_overlapping_groups(toy_regions, "chr", "start_expanded", "end_expanded")
+    group_ids = grouped["overlap_group"].drop_duplicates().to_numpy()
+    num_train_groups = max(1, int(len(group_ids) * train_ratio))
+    train_group_ids = set(group_ids[:num_train_groups].tolist())
+
+    train_regions = grouped[grouped["overlap_group"].isin(train_group_ids)].reset_index(drop=True)
+    val_regions = grouped[~grouped["overlap_group"].isin(train_group_ids)].reset_index(drop=True)
+
+    overlap_rows = []
+    for train_row in train_regions.itertuples(index=False):
+        for val_row in val_regions.itertuples(index=False):
+            same_chr = train_row.chr == val_row.chr
+            overlaps = train_row.start_expanded <= val_row.end_expanded and val_row.start_expanded <= train_row.end_expanded
+            if same_chr and overlaps:
+                overlap_rows.append(
+                    {
+                        "train_original_idx": train_row.original_idx,
+                        "val_original_idx": val_row.original_idx,
+                        "chr": train_row.chr,
+                        "train_start": train_row.start_expanded,
+                        "train_end": train_row.end_expanded,
+                        "val_start": val_row.start_expanded,
+                        "val_end": val_row.end_expanded,
+                    }
+                )
+
+    overlap_frame = pd.DataFrame(overlap_rows)
+
+    print("Toy regions with overlap groups:")
+    print(grouped[["original_idx", "chr", "start_expanded", "end_expanded", "overlap_group"]])
+    print("\nTrain groups:", sorted(train_group_ids))
+    print("Train original_idx:", train_regions["original_idx"].tolist())
+    print("Val original_idx:", val_regions["original_idx"].tolist())
+    if overlap_frame.empty:
+        print("\nResult: no train/val overlaps detected.")
+    else:
+        print("\nResult: found train/val overlaps.")
+        print(overlap_frame)
+
+    return grouped, train_regions, val_regions
+
+
+if __name__ == "__main__":
+    toy_test_non_overlap_split()
