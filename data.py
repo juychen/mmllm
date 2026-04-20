@@ -22,6 +22,10 @@ class PreparedExperimentData:
     val_region_metadata: pd.DataFrame
 
 
+TRACK_MODALITIES = {"5mc", "5hmc", "atac"}
+CONTEXT_MODALITIES = {"sequence", *TRACK_MODALITIES}
+
+
 def get_sequence(chrom: str, start: int, end: int, genome: pyfaidx.Fasta) -> str:
     return genome[chrom][start - 1 : end].seq
 
@@ -55,6 +59,14 @@ def find_cpg_candidate_positions(base_ids: torch.Tensor) -> torch.Tensor:
     right_is_c = torch.zeros_like(is_c)
     right_is_c[:, :-1] = is_c[:, 1:]
     return (is_c & right_is_g) | (is_g & right_is_c)
+
+
+def find_forward_cpg_positions(base_ids: torch.Tensor) -> torch.Tensor:
+    is_c = base_ids == 1
+    is_g = base_ids == 2
+    right_is_g = torch.zeros_like(is_g)
+    right_is_g[:, :-1] = is_g[:, 1:]
+    return is_c & right_is_g
 
 
 def scale_atac_tensor(atac_tensor: torch.Tensor, mode: str) -> torch.Tensor:
@@ -117,7 +129,18 @@ def load_data(args):
 
     genome = pyfaidx.Fasta(args.genome_fasta)
     tbx_5hmc = pysam.TabixFile(args.hm5c_bedgraph)
-    tbx_5mc = pysam.TabixFile(args.m5c_bedgraph) if args.use_m5c and args.m5c_bedgraph else None
+    requested_track_modalities = set()
+    if hasattr(args, "input_modality"):
+        requested_track_modalities.add(args.input_modality)
+    if hasattr(args, "target_modality"):
+        requested_track_modalities.add(args.target_modality)
+    if hasattr(args, "context_modalities"):
+        requested_track_modalities.update(modality for modality in args.context_modalities if modality in TRACK_MODALITIES)
+
+    should_load_5mc = bool(getattr(args, "m5c_bedgraph", None)) and (
+        getattr(args, "use_m5c", False) or "5mc" in requested_track_modalities
+    )
+    tbx_5mc = pysam.TabixFile(args.m5c_bedgraph) if should_load_5mc else None
     atac_bw = pyBigWig.open(args.atac_bw)
 
     seqs = []
@@ -137,7 +160,75 @@ def load_data(args):
     return df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks
 
 
-def prepare_experiment_data(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks) -> PreparedExperimentData:
+def get_track_arrays(args, mcg_tracks, hmcg_tracks, atac_tracks, usable_dmrs: int, seq_len: int) -> dict[str, np.ndarray]:
+    track_arrays = {
+        "5hmc": np.stack([np.asarray(hmcg_tracks[idx][:seq_len], dtype=np.float32) for idx in range(usable_dmrs)]),
+        "atac": np.stack([np.asarray(atac_tracks[idx][:seq_len], dtype=np.float32) for idx in range(usable_dmrs)]),
+    }
+    if mcg_tracks:
+        track_arrays["5mc"] = np.stack([np.asarray(mcg_tracks[idx][:seq_len], dtype=np.float32) for idx in range(usable_dmrs)])
+    return track_arrays
+
+
+def tensorize_track_modality(modality: str, track_arrays: dict[str, np.ndarray], args) -> torch.Tensor:
+    if modality not in TRACK_MODALITIES:
+        raise ValueError(f"Unknown track modality: {modality}")
+    if modality not in track_arrays:
+        raise ValueError(f"Requested modality '{modality}' is unavailable with the current inputs.")
+    track_tensor = torch.tensor(track_arrays[modality], dtype=torch.float32).unsqueeze(-1)
+    if modality == "atac":
+        return scale_atac_tensor(track_tensor, args.atac_scaling)
+    return track_tensor
+
+
+def build_sequence_tensor(seqs, usable_dmrs: int, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
+    base_to_index = {"A": 0, "C": 1, "G": 2, "T": 3, "N": 0}
+    base_ids_tensor = torch.stack([
+        sequence_to_base_ids(seqs[idx], seq_len, base_to_index) for idx in range(usable_dmrs)
+    ])
+    sequence_onehot = F.one_hot(base_ids_tensor, num_classes=4).float()
+    return base_ids_tensor, sequence_onehot
+
+
+def build_context_tensor(context_modalities: list[str], sequence_tensor: torch.Tensor, track_tensors: dict[str, torch.Tensor]) -> torch.Tensor:
+    context_parts = []
+    for modality in context_modalities:
+        if modality == "sequence":
+            context_parts.append(sequence_tensor)
+            continue
+        if modality not in track_tensors:
+            raise ValueError(f"Context modality '{modality}' is unavailable with the current inputs.")
+        context_parts.append(track_tensors[modality])
+    if not context_parts:
+        raise ValueError("At least one context modality must be enabled.")
+    return torch.cat(context_parts, dim=-1)
+
+
+def resolve_loss_mask(mask_mode: str, base_ids_tensor: torch.Tensor) -> torch.Tensor:
+    if mask_mode == "cpg_both":
+        mask = find_cpg_candidate_positions(base_ids_tensor)
+    elif mask_mode == "cpg_forward":
+        mask = find_forward_cpg_positions(base_ids_tensor)
+    elif mask_mode == "all":
+        mask = torch.ones_like(base_ids_tensor, dtype=torch.bool)
+    else:
+        raise ValueError(f"Unknown mask mode: {mask_mode}")
+    return mask.unsqueeze(-1).float()
+
+
+def prepare_modality_experiment_data(
+    num_dmrs: int,
+    args,
+    df_dmr,
+    seqs,
+    mcg_tracks,
+    hmcg_tracks,
+    atac_tracks,
+) -> PreparedExperimentData:
+    requested_track_modalities = {args.input_modality, args.target_modality, *args.context_modalities}
+    if "5mc" in requested_track_modalities and not mcg_tracks:
+        raise ValueError("Requested modality '5mc' but no 5mC track was loaded. Set --m5c-bedgraph to a valid path.")
+
     track_lengths = [len(hmcg_tracks[0]), len(atac_tracks[0]), len(seqs[0])]
     usable_counts = [num_dmrs, len(df_dmr), len(seqs), len(hmcg_tracks), len(atac_tracks)]
     if mcg_tracks:
@@ -147,29 +238,17 @@ def prepare_experiment_data(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_
     usable_dmrs = min(usable_counts)
     seq_len = min(track_lengths)
     post_filter_len = min(seq_len, 4)
-    base_to_index = {"A": 0, "C": 1, "G": 2, "T": 3, "N": 0}
-    if mcg_tracks:
-        query_tensor = torch.tensor(
-            np.stack([np.asarray(mcg_tracks[idx][:seq_len], dtype=np.float32) for idx in range(usable_dmrs)]),
-            dtype=torch.float32,
-        ).unsqueeze(-1)
-    else:
-        query_tensor = torch.zeros((usable_dmrs, seq_len, 1), dtype=torch.float32)
 
-    hm5c_target = torch.tensor(
-        np.stack([np.asarray(hmcg_tracks[idx][:seq_len], dtype=np.float32) for idx in range(usable_dmrs)]),
-        dtype=torch.float32,
-    ).unsqueeze(-1)
-    raw_atac_tensor = torch.tensor(
-        np.stack([np.asarray(atac_tracks[idx][:seq_len], dtype=np.float32) for idx in range(usable_dmrs)]),
-        dtype=torch.float32,
-    ).unsqueeze(-1)
-    atac_tensor = scale_atac_tensor(raw_atac_tensor, args.atac_scaling)
-    base_ids_tensor = torch.stack([
-        sequence_to_base_ids(seqs[idx], seq_len, base_to_index) for idx in range(usable_dmrs)
-    ])
-    sequence_onehot = F.one_hot(base_ids_tensor, num_classes=4).float()
-    loss_mask = find_cpg_candidate_positions(base_ids_tensor).unsqueeze(-1).float()
+    track_arrays = get_track_arrays(args, mcg_tracks, hmcg_tracks, atac_tracks, usable_dmrs, seq_len)
+    base_ids_tensor, sequence_onehot = build_sequence_tensor(seqs, usable_dmrs, seq_len)
+    track_tensors = {
+        modality: tensorize_track_modality(modality, track_arrays, args) for modality in track_arrays
+    }
+
+    query_tensor = tensorize_track_modality(args.input_modality, track_arrays, args)
+    target_tensor = tensorize_track_modality(args.target_modality, track_arrays, args)
+    context_tensor = build_context_tensor(args.context_modalities, sequence_onehot, track_tensors)
+    loss_mask = resolve_loss_mask(args.mask_mode, base_ids_tensor)
 
     split_regions_df = df_dmr.iloc[:usable_dmrs].copy().reset_index().rename(columns={"index": "original_idx"})
     split_regions_df["chr"] = split_regions_df["chr"].astype(str)
@@ -187,16 +266,14 @@ def prepare_experiment_data(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_
 
     train_dataset = torch.utils.data.TensorDataset(
         query_tensor[train_idx],
-        sequence_onehot[train_idx],
-        atac_tensor[train_idx],
-        hm5c_target[train_idx],
+        context_tensor[train_idx],
+        target_tensor[train_idx],
         loss_mask[train_idx],
     )
     val_dataset = torch.utils.data.TensorDataset(
         query_tensor[val_idx],
-        sequence_onehot[val_idx],
-        atac_tensor[val_idx],
-        hm5c_target[val_idx],
+        context_tensor[val_idx],
+        target_tensor[val_idx],
         loss_mask[val_idx],
     )
 
@@ -211,3 +288,21 @@ def prepare_experiment_data(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_
         non_overlap_groups=split_regions_df["overlap_group"].nunique(),
         val_region_metadata=split_regions_df.iloc[val_idx.numpy()].reset_index(drop=True),
     )
+
+
+def prepare_experiment_data(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks) -> PreparedExperimentData:
+    legacy_args = args
+    if not hasattr(legacy_args, "input_modality"):
+        legacy_args.input_modality = "5mc"
+    if not hasattr(legacy_args, "target_modality"):
+        legacy_args.target_modality = "5hmc"
+    if not hasattr(legacy_args, "context_modalities"):
+        legacy_context_modalities = []
+        if getattr(legacy_args, "use_sequence", False):
+            legacy_context_modalities.append("sequence")
+        if getattr(legacy_args, "use_atac", False):
+            legacy_context_modalities.append("atac")
+        legacy_args.context_modalities = legacy_context_modalities
+    if not hasattr(legacy_args, "mask_mode"):
+        legacy_args.mask_mode = "cpg_both"
+    return prepare_modality_experiment_data(num_dmrs, legacy_args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks)

@@ -22,7 +22,9 @@ Observed results recorded in this repo:
 
 ### Training and model code
 
-- `run_sample_size_experiments.py`: main experiment script for training a minimal CrossHyena regressor across multiple sample sizes.
+- `run_multimodal_track_experiments.py`: unified experiment script for arbitrary track-to-track prediction with configurable signal input, context modalities, and target.
+- `run_sample_size_experiments.py`: legacy sample-size experiment entry point for the fixed `5mC + sequence + ATAC -> 5hmC` setup.
+- `run_atac_query_sequence_context_experiments.py`: legacy experiment entry point for the fixed `ATAC + sequence -> 5hmC` setup.
 - `test_hyena.py`: prototype `MultiModalStripedHyena` implementation and toy forward-pass smoke test.
 - `test_run.sh`: local launcher for the sample-size experiment sweep.
 
@@ -46,12 +48,12 @@ These notebooks contain exploratory analysis and model iteration history.
 
 ## Main experiment
 
-`run_sample_size_experiments.py` builds a small regression model with:
+`run_multimodal_track_experiments.py` builds a small regression model with:
 
-- query input: 5mC track
-- context input: one-hot DNA sequence plus ATAC signal
-- target: 5hmC track
-- loss: masked MSE over CpG candidate positions
+- query input: any one of `5mc`, `5hmc`, or `atac`
+- context input: any non-empty combination of `sequence`, `5mc`, `5hmc`, and `atac`
+- target: any one of `5mc`, `5hmc`, or `atac`
+- loss: masked MSE over a configurable position mask
 - split strategy: non-overlapping genomic region groups, then train/validation split by group
 
 For each requested sample size, the script:
@@ -98,7 +100,7 @@ The current scripts assume locally available genomics files, including:
 
 Default paths in the training script point to the author's local filesystem, so you will almost certainly need to override them.
 
-Relevant defaults in `run_sample_size_experiments.py`:
+Relevant defaults in `run_multimodal_track_experiments.py`:
 
 - `--dmr-csv output/dmr_with_sequences.csv`
 - `--genome-fasta /data2st1/junyi/ref/GRCm38.p6.genome.fa`
@@ -106,13 +108,16 @@ Relevant defaults in `run_sample_size_experiments.py`:
 - `--hm5c-bedgraph /data2st1/junyi/output/llm0401/processed_meth/MC_AMY.CG.h.bedGraph.gz`
 - `--atac-bw /data2st2/junyi/output/atac1112/tobiasbam/BULK/corrected/AMY_MC_track.bw`
 
-## Running the sample-size sweep
+## Running the unified multimodal sweep
 
 Example:
 
 ```bash
-python run_sample_size_experiments.py \
+python run_multimodal_track_experiments.py \
 	--sample-sizes 1000 5000 10000 30000 70000 \
+	--input-modality 5mc \
+	--context-modalities sequence atac \
+	--target-modality 5hmc \
 	--dmr-csv output/dmr_with_sequences.csv \
 	--genome-fasta /path/to/GRCm38.p6.genome.fa \
 	--m5c-bedgraph /path/to/MC_AMY.CG.m.bedGraph.gz \
@@ -121,13 +126,23 @@ python run_sample_size_experiments.py \
 	--scheduler cosine \
 	--num-epochs 100 \
 	--batch-size 64 \
-	--output-csv output/sample_size_results.csv \
-	--output-json output/sample_size_results.json
+	--output-csv output/multimodal_track_results.csv \
+	--output-json output/multimodal_track_results.json
 ```
+
+This reproduces the old `5mC + sequence + ATAC -> 5hmC` experiment, but the new script also lets you run combinations such as:
+
+- `--input-modality atac --context-modalities sequence --target-modality 5hmc`
+- `--input-modality 5hmc --context-modalities sequence 5mc atac --target-modality atac`
+- `--input-modality 5mc --context-modalities sequence 5hmc --target-modality 5mc`
 
 Useful arguments:
 
 - `--sample-sizes`: one or more dataset sizes to evaluate
+- `--input-modality`: one signal track used as the query branch
+- `--context-modalities`: one or more context modalities concatenated along the channel axis
+- `--target-modality`: prediction target track
+- `--mask-mode`: `cpg_both`, `cpg_forward`, or `all`
 - `--target-length`: fixed region length, default `1024`
 - `--train-ratio`: fraction of non-overlap groups used for training, default `0.8`
 - `--hidden-dim`: hidden width of the regressor, default `64`
@@ -137,6 +152,13 @@ Useful arguments:
 - `--atac-scaling`: `none` or `minmax`
 
 The script prints per-epoch metrics and saves one summary row per sample size.
+
+## Legacy fixed experiments
+
+The older scripts remain in the repo for convenience, but they are now thin legacy entry points for specific hard-coded modality combinations:
+
+- `run_sample_size_experiments.py`: `5mC + sequence + ATAC -> 5hmC`
+- `run_atac_query_sequence_context_experiments.py`: `ATAC + sequence -> 5hmC`
 
 ## Local launcher script
 
