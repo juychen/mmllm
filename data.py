@@ -24,6 +24,8 @@ class PreparedExperimentData:
 
 TRACK_MODALITIES = {"5mc", "5hmc", "atac"}
 CONTEXT_MODALITIES = {"sequence", *TRACK_MODALITIES}
+BASE_COMPLEMENT_INDEX = torch.tensor([3, 2, 1, 0], dtype=torch.long)
+DNA_COMPLEMENT_TABLE = str.maketrans("ACGTN", "TGCAN")
 
 
 def get_sequence(chrom: str, start: int, end: int, genome: pyfaidx.Fasta) -> str:
@@ -86,6 +88,10 @@ def normalize_sequence(sequence) -> str:
     if isinstance(sequence, (list, tuple, np.ndarray)):
         return "".join(sequence).upper()
     raise TypeError(f"Unsupported sequence type: {type(sequence)}")
+
+
+def reverse_complement_sequence(sequence: str) -> str:
+    return normalize_sequence(sequence).translate(DNA_COMPLEMENT_TABLE)[::-1]
 
 
 def sequence_to_base_ids(sequence, seq_len: int, base_to_index: dict[str, int]) -> torch.Tensor:
@@ -190,6 +196,12 @@ def build_sequence_tensor(seqs, usable_dmrs: int, seq_len: int) -> tuple[torch.T
     return base_ids_tensor, sequence_onehot
 
 
+def reverse_complement_sequence_tensor(sequence_tensor: torch.Tensor) -> torch.Tensor:
+    complement_index = BASE_COMPLEMENT_INDEX.to(sequence_tensor.device)
+    complemented = sequence_tensor.index_select(dim=-1, index=complement_index)
+    return torch.flip(complemented, dims=[1])
+
+
 def build_context_tensor(context_modalities: list[str], sequence_tensor: torch.Tensor, track_tensors: dict[str, torch.Tensor]) -> torch.Tensor:
     context_parts = []
     for modality in context_modalities:
@@ -214,6 +226,56 @@ def resolve_loss_mask(mask_mode: str, base_ids_tensor: torch.Tensor) -> torch.Te
     else:
         raise ValueError(f"Unknown mask mode: {mask_mode}")
     return mask.unsqueeze(-1).float()
+
+
+def augment_with_reverse_complement(
+    query_tensor: torch.Tensor,
+    context_tensor: torch.Tensor,
+    target_tensor: torch.Tensor,
+    loss_mask: torch.Tensor,
+    base_ids_tensor: torch.Tensor,
+    sequence_tensor: torch.Tensor,
+    region_metadata: pd.DataFrame,
+    args,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, pd.DataFrame]:
+    if not getattr(args, "augment_reverse_complement", False):
+        metadata = region_metadata.copy().reset_index(drop=True)
+        metadata["strand_view"] = "+"
+        return query_tensor, context_tensor, target_tensor, loss_mask, metadata
+
+    rc_query_tensor = torch.flip(query_tensor, dims=[1])
+    rc_target_tensor = torch.flip(target_tensor, dims=[1])
+    rc_context_tensor = torch.flip(context_tensor, dims=[1])
+
+    if "sequence" in args.context_modalities:
+        sequence_offset = 0
+        for modality in args.context_modalities:
+            if modality == "sequence":
+                break
+            sequence_offset += 1
+        rc_sequence_tensor = reverse_complement_sequence_tensor(sequence_tensor)
+        rc_context_tensor = rc_context_tensor.clone()
+        rc_context_tensor[:, :, sequence_offset : sequence_offset + 4] = rc_sequence_tensor
+    else:
+        rc_sequence_tensor = torch.flip(sequence_tensor, dims=[1])
+
+    rc_base_ids_tensor = torch.argmax(rc_sequence_tensor, dim=-1)
+    rc_loss_mask = resolve_loss_mask(args.mask_mode, rc_base_ids_tensor)
+
+    forward_metadata = region_metadata.copy().reset_index(drop=True)
+    forward_metadata["strand_view"] = "+"
+    rc_metadata = region_metadata.copy().reset_index(drop=True)
+    rc_metadata["strand_view"] = "-"
+    rc_metadata["sequence"] = rc_metadata["sequence"].map(reverse_complement_sequence)
+    augmented_metadata = pd.concat([forward_metadata, rc_metadata], ignore_index=True)
+
+    return (
+        torch.cat([query_tensor, rc_query_tensor], dim=0),
+        torch.cat([context_tensor, rc_context_tensor], dim=0),
+        torch.cat([target_tensor, rc_target_tensor], dim=0),
+        torch.cat([loss_mask, rc_loss_mask], dim=0),
+        augmented_metadata,
+    )
 
 
 def prepare_modality_experiment_data(
@@ -264,17 +326,41 @@ def prepare_modality_experiment_data(
     train_idx = torch.from_numpy(np.flatnonzero(train_mask)).long()
     val_idx = torch.from_numpy(np.flatnonzero(~train_mask)).long()
 
-    train_dataset = torch.utils.data.TensorDataset(
+    train_region_metadata = split_regions_df.iloc[train_idx.numpy()].reset_index(drop=True)
+    val_region_metadata = split_regions_df.iloc[val_idx.numpy()].reset_index(drop=True)
+
+    train_query_tensor, train_context_tensor, train_target_tensor, train_loss_mask, train_region_metadata = augment_with_reverse_complement(
         query_tensor[train_idx],
         context_tensor[train_idx],
         target_tensor[train_idx],
         loss_mask[train_idx],
+        base_ids_tensor[train_idx],
+        sequence_onehot[train_idx],
+        train_region_metadata,
+        args,
     )
-    val_dataset = torch.utils.data.TensorDataset(
+    val_query_tensor, val_context_tensor, val_target_tensor, val_loss_mask, val_region_metadata = augment_with_reverse_complement(
         query_tensor[val_idx],
         context_tensor[val_idx],
         target_tensor[val_idx],
         loss_mask[val_idx],
+        base_ids_tensor[val_idx],
+        sequence_onehot[val_idx],
+        val_region_metadata,
+        args,
+    )
+
+    train_dataset = torch.utils.data.TensorDataset(
+        train_query_tensor,
+        train_context_tensor,
+        train_target_tensor,
+        train_loss_mask,
+    )
+    val_dataset = torch.utils.data.TensorDataset(
+        val_query_tensor,
+        val_context_tensor,
+        val_target_tensor,
+        val_loss_mask,
     )
 
     return PreparedExperimentData(
@@ -283,10 +369,10 @@ def prepare_modality_experiment_data(
         usable_dmrs=usable_dmrs,
         seq_len=seq_len,
         post_filter_len=post_filter_len,
-        train_regions=len(train_idx),
-        val_regions=len(val_idx),
+        train_regions=len(train_dataset),
+        val_regions=len(val_dataset),
         non_overlap_groups=split_regions_df["overlap_group"].nunique(),
-        val_region_metadata=split_regions_df.iloc[val_idx.numpy()].reset_index(drop=True),
+        val_region_metadata=val_region_metadata,
     )
 
 
@@ -305,4 +391,6 @@ def prepare_experiment_data(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_
         legacy_args.context_modalities = legacy_context_modalities
     if not hasattr(legacy_args, "mask_mode"):
         legacy_args.mask_mode = "cpg_both"
+    if not hasattr(legacy_args, "augment_reverse_complement"):
+        legacy_args.augment_reverse_complement = False
     return prepare_modality_experiment_data(num_dmrs, legacy_args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks)

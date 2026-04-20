@@ -299,6 +299,11 @@ def parse_args():
         default="cpg_both",
         help="Loss mask to apply over positions.",
     )
+    parser.add_argument(
+        "--augment-reverse-complement",
+        action="store_true",
+        help="After train/val split, augment each subset with reverse-complement sequence views and reversed signal tracks.",
+    )
     parser.add_argument("--target-length", type=int, default=1024)
     parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--batch-size", type=int, default=128)

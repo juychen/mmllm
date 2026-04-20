@@ -40,6 +40,7 @@ def export_prediction_signals(
                 {
                     "region_idx": region_idx,
                     "original_idx": metadata.get("original_idx"),
+                    "strand_view": metadata.get("strand_view", "+"),
                     "chr": metadata.get("chr"),
                     "start_expanded": metadata.get("start_expanded"),
                     "end_expanded": metadata.get("end_expanded"),
