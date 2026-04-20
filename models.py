@@ -2,20 +2,6 @@ import torch
 import torch.nn as nn
 
 
-class SinusoidalPositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, seq_len: int):
-        super().__init__()
-        position = torch.arange(seq_len, dtype=torch.float32).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) * (-torch.log(torch.tensor(10000.0)) / d_model))
-        pe = torch.zeros(seq_len, d_model, dtype=torch.float32)
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer("pe", pe.unsqueeze(0))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.pe[:, : x.size(1), :].to(dtype=x.dtype)
-
-
 class HyenaFilter(nn.Module):
     def __init__(
         self,
@@ -209,13 +195,11 @@ class MinimalCrossHyenaRegressor(nn.Module):
         context_dim: int,
         hidden_dim: int = 64,
         post_filter_len: int | None = None,
-        position_encoding: str = "none",
     ):
         super().__init__()
         self.query_proj = nn.Linear(query_dim, hidden_dim)
         self.context_proj = nn.Linear(context_dim, hidden_dim)
         self.cross = CrossHyenaLayer(hidden_dim, seq_len, long_mixer="conv", filter_len=post_filter_len)
-        self.position_encoding = self._build_position_encoding(position_encoding, hidden_dim, seq_len)
         self.cross_to_post = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
@@ -225,20 +209,10 @@ class MinimalCrossHyenaRegressor(nn.Module):
         self.norm = nn.LayerNorm(hidden_dim)
         self.head = nn.Linear(hidden_dim, 1)
 
-    @staticmethod
-    def _build_position_encoding(position_encoding: str, hidden_dim: int, seq_len: int) -> nn.Module | None:
-        if position_encoding == "none":
-            return None
-        if position_encoding == "sinusoidal":
-            return SinusoidalPositionalEncoding(hidden_dim, seq_len)
-        raise ValueError(f"Unknown position_encoding: {position_encoding}")
-
     def forward(self, query_track: torch.Tensor, context_track: torch.Tensor) -> torch.Tensor:
         query = self.query_proj(query_track)
         context = self.context_proj(context_track)
         hidden = self.cross(query, context)
-        if self.position_encoding is not None:
-            hidden = self.position_encoding(hidden)
         hidden = hidden + self.cross_to_post(hidden)
         hidden = self.post_hyena(hidden)
         hidden = self.norm(hidden)
@@ -251,11 +225,9 @@ class MinimalHyenaRegressor(nn.Module):
         seq_len: int,
         context_dim: int,
         hidden_dim: int = 64,
-        position_encoding: str = "none",
     ):
         super().__init__()
         self.context_proj = nn.Linear(context_dim, hidden_dim)
-        self.position_encoding = MinimalCrossHyenaRegressor._build_position_encoding(position_encoding, hidden_dim, seq_len)
         self.backbone = HyenaLayer(hidden_dim, seq_len)
         self.residual = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
@@ -267,8 +239,6 @@ class MinimalHyenaRegressor(nn.Module):
 
     def forward(self, context_track: torch.Tensor) -> torch.Tensor:
         hidden = self.context_proj(context_track)
-        if self.position_encoding is not None:
-            hidden = self.position_encoding(hidden)
         hidden = self.backbone(hidden)
         hidden = hidden + self.residual(hidden)
         hidden = self.norm(hidden)
