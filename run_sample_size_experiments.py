@@ -173,6 +173,7 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
         context_dim=get_context_dim(args),
         hidden_dim=args.hidden_dim,
         post_filter_len=prepared.post_filter_len,
+        position_encoding=args.position_encoding,
     ).to(device)
     model.run_args = args
     optimizer = build_optimizer(model, args)
@@ -296,6 +297,7 @@ def parse_args():
     parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--hidden-dim", type=int, default=64)
+    parser.add_argument("--position-encoding", choices=["none", "sinusoidal"], default="none")
     parser.add_argument("--num-epochs", type=int, default=30)
     parser.add_argument("--patience", type=int, default=5)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
