@@ -33,18 +33,24 @@ python run_multimodal_track_experiments.py \
   --sample-sizes 2000 \
   --input-modality atac \
   --context-modalities sequence \
-  --target-modality 5hmc
+  --target-modality 5hmc \
+  --mask-mode cpg_both 
+  #--augment-reverse-complement 
 
 current_time=$(date "+%Y-%m-%d-%H-%M-%S")
 python run_multimodal_track_experiments.py \
   --sample-sizes 2000 \
   --input-modality 5mc \
   --context-modalities sequence \
-  --target-modality 5hmc
+  --target-modality 5hmc \
+  --mask-mode cpg_both 
+#  --augment-reverse-complement 
 
 current_time=$(date "+%Y-%m-%d-%H-%M-%S")
 python run_multimodal_track_experiments.py \
   --sample-sizes 2000 \
   --input-modality atac \
   --context-modalities sequence \
-  --target-modality 5mc
+  --target-modality 5mc \
+  --mask-mode cpg_both 
+  #--augment-reverse-complement 

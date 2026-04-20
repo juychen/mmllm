@@ -53,6 +53,14 @@ def fast_tabix_to_track(tbx: pysam.TabixFile, chrom: str, start_1based: int, end
     return track
 
 
+# def find_cpg_candidate_positions(base_ids: torch.Tensor) -> torch.Tensor:
+#     is_c = base_ids == 1
+#     is_g = base_ids == 2
+#     right_is_g = torch.zeros_like(is_g)
+#     right_is_g[:, :-1] = is_g[:, 1:]
+#     right_is_c = torch.zeros_like(is_c)
+#     right_is_c[:, :-1] = is_c[:, 1:]
+#     return (is_c & right_is_g) | (is_g & right_is_c)
 def find_cpg_candidate_positions(base_ids: torch.Tensor) -> torch.Tensor:
     is_c = base_ids == 1
     is_g = base_ids == 2
@@ -60,8 +68,7 @@ def find_cpg_candidate_positions(base_ids: torch.Tensor) -> torch.Tensor:
     right_is_g[:, :-1] = is_g[:, 1:]
     right_is_c = torch.zeros_like(is_c)
     right_is_c[:, :-1] = is_c[:, 1:]
-    return (is_c & right_is_g) | (is_g & right_is_c)
-
+    return (is_c & right_is_g)
 
 def find_forward_cpg_positions(base_ids: torch.Tensor) -> torch.Tensor:
     is_c = base_ids == 1
