@@ -33,7 +33,7 @@ output_dir="output/${region}_${condition}"
 
 echo "[$region] Current time: $current_time"
 python run_multimodal_track_experiments.py \
-  --sample-sizes 2000 50000 100000 \
+  --sample-sizes 10000 20000 \
   --input-modality atac \
   --context-modalities sequence \
   --target-modality 5hmc \
@@ -55,7 +55,7 @@ python run_multimodal_track_experiments.py \
 current_time=$(date "+%Y-%m-%d-%H-%M-%S")
 echo "[$region] Current time: $current_time"
 python run_multimodal_track_experiments.py \
-  --sample-sizes 2000 50000 100000 \
+  --sample-sizes 10000 20000 \
   --input-modality 5mc \
   --context-modalities sequence \
   --target-modality 5hmc \
@@ -77,7 +77,7 @@ python run_multimodal_track_experiments.py \
 current_time=$(date "+%Y-%m-%d-%H-%M-%S")
 echo "[$region] Current time: $current_time"
 python run_multimodal_track_experiments.py \
-  --sample-sizes 2000 50000 100000 \
+  --sample-sizes 10000 20000 \
   --input-modality atac \
   --context-modalities sequence \
   --target-modality 5mc \
