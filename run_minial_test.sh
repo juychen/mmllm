@@ -33,8 +33,9 @@ output_dir="output/${region}_${condition}"
 
 echo "[$region] Current time: $current_time"
 python run_multimodal_track_experiments.py \
-  --sample-sizes 10000 20000 \
+  --sample-sizes 2000 10000 20000 50000 100000\
   --input-modality atac \
+  --augment-reverse-complement \
   --context-modalities sequence \
   --target-modality 5hmc \
   --mask-mode cpg_both \
@@ -55,8 +56,9 @@ python run_multimodal_track_experiments.py \
 current_time=$(date "+%Y-%m-%d-%H-%M-%S")
 echo "[$region] Current time: $current_time"
 python run_multimodal_track_experiments.py \
-  --sample-sizes 10000 20000 \
+  --sample-sizes 2000 10000 20000 50000 100000\
   --input-modality 5mc \
+  --augment-reverse-complement \
   --context-modalities sequence \
   --target-modality 5hmc \
   --mask-mode cpg_both \
@@ -77,8 +79,9 @@ python run_multimodal_track_experiments.py \
 current_time=$(date "+%Y-%m-%d-%H-%M-%S")
 echo "[$region] Current time: $current_time"
 python run_multimodal_track_experiments.py \
-  --sample-sizes 10000 20000 \
+  --sample-sizes 2000 10000 20000 50000 100000\
   --input-modality atac \
+  --augment-reverse-complement \
   --context-modalities sequence \
   --target-modality 5mc \
   --mask-mode cpg_both \
