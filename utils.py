@@ -1,12 +1,26 @@
+import random
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import torch
 
 
 def ensure_parent_dir(file_path: str) -> None:
     Path(file_path).parent.mkdir(parents=True, exist_ok=True)
+
+
+def set_random_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    if torch.backends.cudnn.is_available():
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
 def export_prediction_signals(

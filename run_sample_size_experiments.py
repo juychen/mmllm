@@ -8,7 +8,7 @@ import torch.nn as nn
  
 from data import load_data, prepare_experiment_data
 from models import MinimalCrossHyenaRegressor
-from utils import export_prediction_signals, plot_regression_predictions
+from utils import export_prediction_signals, plot_regression_predictions, set_random_seed
 
 
 def masked_mse_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -306,6 +306,7 @@ def parse_args():
     parser.add_argument("--scheduler-patience", type=int, default=2)
     parser.add_argument("--scheduler-t-max", type=int, default=0)
     parser.add_argument("--atac-scaling", choices=["none", "minmax"], default="minmax")
+    parser.add_argument("--seed", type=int, default=7, help="Random seed for reproducible initialization and dataloader shuffling.")
     parser.add_argument("--output-csv", default="output/sample_size_results.csv")
     parser.add_argument("--output-json", default="output/sample_size_results.json")
     parser.add_argument("--timestamp", default="", help="Optional timestamp string for output path templates.")
@@ -324,6 +325,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    set_random_seed(args.seed)
     df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks = load_data(args)
     results = []
     for sample_size in args.sample_sizes:
