@@ -151,7 +151,7 @@ def load_data(args):
         requested_track_modalities.update(modality for modality in args.context_modalities if modality in TRACK_MODALITIES)
 
     should_load_5mc = bool(getattr(args, "m5c_bedgraph", None)) and (
-        getattr(args, "use_m5c", False) or "5mc" in requested_track_modalities
+        getattr(args, "use_m5c", False) or "5mc" in requested_track_modalities or 'multi' in requested_track_modalities
     )
     tbx_5mc = pysam.TabixFile(args.m5c_bedgraph) if should_load_5mc else None
     atac_bw = pyBigWig.open(args.atac_bw)
@@ -268,6 +268,8 @@ def augment_with_reverse_complement(
 
     rc_base_ids_tensor = torch.argmax(rc_sequence_tensor, dim=-1)
     rc_loss_mask = resolve_loss_mask(args.mask_mode, rc_base_ids_tensor)
+    if "multi" in args.target_modality:
+        rc_loss_mask = rc_loss_mask.repeat(1, 1, loss_mask.shape[-1])
 
     forward_metadata = region_metadata.copy().reset_index(drop=True)
     forward_metadata["strand_view"] = "+"
@@ -381,6 +383,100 @@ def prepare_modality_experiment_data(
         non_overlap_groups=split_regions_df["overlap_group"].nunique(),
         val_region_metadata=val_region_metadata,
     )
+
+
+def prepare_multimodal_multitask_data(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks) -> dict:
+    usable_dmrs = min(num_dmrs, len(df_dmr), len(seqs), len(hmcg_tracks), len(atac_tracks), len(mcg_tracks))
+    seq_len = min(len(hmcg_tracks[0]), len(atac_tracks[0]), len(seqs[0]))
+    post_filter_len = min(seq_len, 4)
+
+    if usable_dmrs <= 0:
+        raise ValueError(
+            "prepare_multimodal_multitask_data: no usable regions/tracks. "
+            f"Lengths: df_dmr={len(df_dmr)}, seqs={len(seqs)}, hmcg_tracks={len(hmcg_tracks)}, "
+            f"atac_tracks={len(atac_tracks)}, mcg_tracks={len(mcg_tracks)}. "
+            "Check your --hm5c-bedgraph/--m5c-bedgraph/--atac-bw paths and DMR CSV."
+        )
+
+    track_arrays = get_track_arrays(args, mcg_tracks, hmcg_tracks, atac_tracks, usable_dmrs, seq_len)
+    base_ids_tensor, sequence_onehot = build_sequence_tensor(seqs, usable_dmrs, seq_len)
+
+    query_tensor = tensorize_track_modality("atac", track_arrays, args)
+    hm5c = track_arrays.get("5hmc")
+    mc5c = track_arrays.get("5mc")
+    if mc5c is None:
+        raise ValueError("5mC tracks required for multitask experiments but not available.")
+    hm5c_tensor = torch.tensor(hm5c, dtype=torch.float32).unsqueeze(-1)
+    mc5c_tensor = torch.tensor(mc5c, dtype=torch.float32).unsqueeze(-1)
+    multitask_target = torch.cat([mc5c_tensor, hm5c_tensor], dim=-1)
+
+    loss_mask = resolve_loss_mask(getattr(args, "mask_mode", "cpg_both"), base_ids_tensor)
+    loss_mask = loss_mask.repeat(1, 1, 2)
+
+    split_regions_df = df_dmr.iloc[:usable_dmrs].copy().reset_index().rename(columns={"index": "original_idx"})
+    split_regions_df["chr"] = split_regions_df["chr"].astype(str)
+    split_regions_df["start_expanded"] = split_regions_df["start_expanded"].astype(int)
+    split_regions_df["end_expanded"] = split_regions_df["end_expanded"].astype(int)
+    split_regions_df["sequence"] = [str(seqs[idx])[:seq_len].upper() for idx in range(usable_dmrs)]
+    split_regions_df = assign_non_overlapping_groups(split_regions_df, "chr", "start_expanded", "end_expanded")
+
+    group_ids = split_regions_df["overlap_group"].drop_duplicates().to_numpy()
+    num_train_groups = max(1, int(len(group_ids) * getattr(args, "train_ratio", 0.8)))
+    train_group_ids = set(group_ids[:num_train_groups].tolist())
+    train_mask = split_regions_df["overlap_group"].isin(train_group_ids).to_numpy()
+    train_idx = torch.from_numpy(np.flatnonzero(train_mask)).long()
+    val_idx = torch.from_numpy(np.flatnonzero(~train_mask)).long()
+
+    train_region_metadata = split_regions_df.iloc[train_idx.numpy()].reset_index(drop=True)
+    val_region_metadata = split_regions_df.iloc[val_idx.numpy()].reset_index(drop=True)
+
+    # call augmentation helper which will only augment when args.augment_reverse_complement True
+    train_query_tensor, train_context_tensor, train_target_tensor, train_loss_mask, train_region_metadata = augment_with_reverse_complement(
+        query_tensor[train_idx],
+        sequence_onehot[train_idx],
+        multitask_target[train_idx],
+        loss_mask[train_idx],
+        base_ids_tensor[train_idx],
+        sequence_onehot[train_idx],
+        train_region_metadata,
+        args,
+    )
+
+    val_query_tensor, val_context_tensor, val_target_tensor, val_loss_mask, val_region_metadata = augment_with_reverse_complement(
+        query_tensor[val_idx],
+        sequence_onehot[val_idx],
+        multitask_target[val_idx],
+        loss_mask[val_idx],
+        base_ids_tensor[val_idx],
+        sequence_onehot[val_idx],
+        val_region_metadata,
+        args,
+    )
+
+    train_dataset = torch.utils.data.TensorDataset(
+        train_query_tensor,
+        train_context_tensor,
+        train_target_tensor,
+        train_loss_mask,
+    )
+    val_dataset = torch.utils.data.TensorDataset(
+        val_query_tensor,
+        val_context_tensor,
+        val_target_tensor,
+        val_loss_mask,
+    )
+
+    return {
+        "train_loader": torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True),
+        "val_loader": torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False),
+        "usable_dmrs": usable_dmrs,
+        "seq_len": seq_len,
+        "post_filter_len": post_filter_len,
+        "train_regions": len(train_dataset),
+        "val_regions": len(val_dataset),
+        "non_overlap_groups": split_regions_df["overlap_group"].nunique(),
+        "val_region_metadata": val_region_metadata,
+    }
 
 
 def prepare_experiment_data(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks) -> PreparedExperimentData:
