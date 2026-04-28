@@ -33,8 +33,11 @@ class ExperimentResult:
     final_val_loss: float
     final_val_r2: float
     final_val_pearsonr: float
-    signal_csv: str
-    regression_plot: str
+    signal_csvs: dict
+    regression_plots: dict
+    final_val_loss_per_task: dict
+    final_val_r2_per_task: dict
+    final_val_pearsonr_per_task: dict
 
 def multitask_masked_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor, task_weights=None) -> torch.Tensor:
     T = pred.shape[-1]
@@ -145,6 +148,48 @@ def collect_predictions(model, loader, device):
             masks.append(mask_batch.detach().cpu())
     return torch.cat(preds, dim=0), torch.cat(targets, dim=0), torch.cat(masks, dim=0)
 
+
+def evaluate_per_task(model, loader, device):
+    """Return per-task (loss, r2, pearson) as lists in task order."""
+    preds, targets, masks = collect_predictions(model, loader, device)
+    # preds: (N, L, T) or (N, T) depending on shape; ensure last dim is tasks
+    # targets: may have extra last dim; squeeze if needed
+    targets = targets.squeeze(-1)
+    T = preds.shape[-1]
+    losses = []
+    r2s = []
+    pearsons = []
+    for t in range(T):
+        pred_t = preds[..., t]
+        target_t = targets[..., t]
+        mask_t = masks[..., t]
+        # MSE loss over masked positions
+        se = (pred_t - target_t) ** 2
+        denom = mask_t.sum().clamp_min(1.0)
+        loss_t = (se * mask_t).sum() / denom
+        losses.append(float(loss_t))
+        # R2
+        masked_targets = target_t[mask_t.bool()]
+        masked_preds = pred_t[mask_t.bool()]
+        if masked_targets.numel() > 0:
+            target_mean = masked_targets.mean()
+            ss_res = ((masked_targets - masked_preds) ** 2).sum()
+            ss_tot = ((masked_targets - target_mean) ** 2).sum().clamp_min(1e-12)
+            r2_t = 1.0 - (ss_res / ss_tot)
+            r2s.append(float(r2_t))
+        else:
+            r2s.append(float('nan'))
+        # Pearson
+        if masked_targets.numel() > 1:
+            centered_targets = masked_targets - masked_targets.mean()
+            centered_preds = masked_preds - masked_preds.mean()
+            denom = centered_targets.pow(2).sum().sqrt() * centered_preds.pow(2).sum().sqrt()
+            pearson = (centered_targets * centered_preds).sum() / denom.clamp_min(1e-12)
+            pearsons.append(float(pearson))
+        else:
+            pearsons.append(float('nan'))
+    return losses, r2s, pearsons
+
 def run_experiment(num_dmrs, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     prepared = prepare_multimodal_multitask_data(
@@ -219,10 +264,20 @@ def run_experiment(num_dmrs, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_t
         model.load_state_dict(best_state)
     final_val_loss, final_val_r2, final_val_pearsonr = evaluate(model, prepared["val_loader"], device, task_weights)
     final_preds, final_targets, final_masks = collect_predictions(model, prepared["val_loader"], device)
+    # compute per-task final metrics
+    per_losses, per_r2s, per_pearsons = evaluate_per_task(model, prepared["val_loader"], device)
+    # map task names to per-task metrics
+    task_names = ["5mc", "5hmc"]
+    final_val_loss_per_task = {task: per_losses[i] for i, task in enumerate(task_names)}
+    final_val_r2_per_task = {task: per_r2s[i] for i, task in enumerate(task_names)}
+    final_val_pearsonr_per_task = {task: per_pearsons[i] for i, task in enumerate(task_names)}
+    # Base templates (used to derive per-task paths)
     signal_csv = args.prediction_signal_csv.format(sample_size=prepared["usable_dmrs"], timestamp=args.timestamp)
     regression_plot = args.regression_plot_path.format(sample_size=prepared["usable_dmrs"], timestamp=args.timestamp)
     # Export predictions and plots per task dimension. dim 0 -> 5mc, dim 1 -> 5hmc
     task_names = ["5mc", "5hmc"]
+    signal_csvs = {}
+    regression_plots = {}
     for dim, task in enumerate(task_names):
         preds_dim = final_preds[..., dim].numpy()
         targets_dim = final_targets[..., dim].numpy()
@@ -251,6 +306,8 @@ def run_experiment(num_dmrs, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_t
             masks_dim,
             title=f"ATAC+sequence multitask {task} (n={prepared['usable_dmrs']})",
         )
+        signal_csvs[task] = task_signal_csv
+        regression_plots[task] = task_plot
     return ExperimentResult(
         num_dmrs=prepared["usable_dmrs"],
         train_regions=prepared["train_regions"],
@@ -264,8 +321,11 @@ def run_experiment(num_dmrs, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_t
         final_val_loss=final_val_loss,
         final_val_r2=final_val_r2,
         final_val_pearsonr=final_val_pearsonr,
-        signal_csv=signal_csv,
-        regression_plot=regression_plot,
+        signal_csvs=signal_csvs,
+        regression_plots=regression_plots,
+        final_val_loss_per_task=final_val_loss_per_task,
+        final_val_r2_per_task=final_val_r2_per_task,
+        final_val_pearsonr_per_task=final_val_pearsonr_per_task,
     )
 
 def parse_args():
@@ -348,6 +408,28 @@ def main():
     results_df.to_csv(args.output_csv, index=False)
     with open(args.output_json, "w", encoding="utf-8") as file_obj:
         json.dump({"args": vars(args), "results": results}, file_obj, indent=2)
+
+    # Also write per-modality JSON files (one per predicted task/modalitiy)
+    task_names = ["5mc", "5hmc"]
+    for task in task_names:
+        mod_results = []
+        for r in results:
+            mod_r = r.copy()
+            signal = mod_r.pop("signal_csvs", {}).get(task)
+            plot = mod_r.pop("regression_plots", {}).get(task)
+            mod_r["signal_csv"] = signal
+            mod_r["regression_plot"] = plot
+            # replace aggregated final metrics with per-task metrics for this modality
+            mod_r["final_val_loss"] = mod_r.pop("final_val_loss_per_task", {}).get(task)
+            mod_r["final_val_r2"] = mod_r.pop("final_val_r2_per_task", {}).get(task)
+            mod_r["final_val_pearsonr"] = mod_r.pop("final_val_pearsonr_per_task", {}).get(task)
+            mod_results.append(mod_r)
+        if args.output_json.endswith(".json"):
+            mod_path = args.output_json.replace("multi_", f"multi_{task}_")
+        else:
+            mod_path = f"{args.output_json}_{task}.json"
+        with open(mod_path, "w", encoding="utf-8") as fh:
+            json.dump({"args": vars(args), "results": mod_results}, fh, indent=2)
 
 if __name__ == "__main__":
     main()
