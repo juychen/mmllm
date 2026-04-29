@@ -235,7 +235,11 @@ class MinimalCrossHyenaRegressor(nn.Module):
         hidden = hidden + self.cross_to_post(hidden)
         hidden = self.post_hyena(hidden)
         hidden = self.norm(hidden)
-        return self.head(hidden)
+        out = self.head(hidden)
+        # If head produces multiple task logits, convert to probabilities that sum to 1
+        if out.shape[-1] > 1:
+            return torch.softmax(out, dim=-1)
+        return out
 
 
 class MinimalHyenaRegressor(nn.Module):

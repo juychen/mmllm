@@ -209,7 +209,8 @@ def run_experiment(num_dmrs, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_t
         post_filter_len=prepared["post_filter_len"],
         use_positional_encoding=args.use_positional_encoding,
     ).to(device)
-    model.head = nn.Linear(args.hidden_dim, 2).to(device)
+    # predict three channels: 5mc, 5hmc, c (complement), and convert to probabilities via softmax
+    model.head = nn.Linear(args.hidden_dim, 3).to(device)
     task_weights = torch.tensor(args.task_weights, dtype=torch.float32) if args.task_weights is not None else None
     optimizer = build_optimizer(model, args)
     scheduler = build_scheduler(optimizer, args, args.num_epochs)
@@ -267,7 +268,7 @@ def run_experiment(num_dmrs, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_t
     # compute per-task final metrics
     per_losses, per_r2s, per_pearsons = evaluate_per_task(model, prepared["val_loader"], device)
     # map task names to per-task metrics
-    task_names = ["5mc", "5hmc"]
+    task_names = ["5mc", "5hmc", "c"]
     final_val_loss_per_task = {task: per_losses[i] for i, task in enumerate(task_names)}
     final_val_r2_per_task = {task: per_r2s[i] for i, task in enumerate(task_names)}
     final_val_pearsonr_per_task = {task: per_pearsons[i] for i, task in enumerate(task_names)}
@@ -275,7 +276,7 @@ def run_experiment(num_dmrs, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_t
     signal_csv = args.prediction_signal_csv.format(sample_size=prepared["usable_dmrs"], timestamp=args.timestamp)
     regression_plot = args.regression_plot_path.format(sample_size=prepared["usable_dmrs"], timestamp=args.timestamp)
     # Export predictions and plots per task dimension. dim 0 -> 5mc, dim 1 -> 5hmc
-    task_names = ["5mc", "5hmc"]
+    task_names = ["5mc", "5hmc", "c"]
     signal_csvs = {}
     regression_plots = {}
     for dim, task in enumerate(task_names):
@@ -284,11 +285,20 @@ def run_experiment(num_dmrs, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_t
         masks_dim = final_masks[..., dim].numpy()
         # create per-task file paths by inserting task name before extension
         if signal_csv.endswith(".csv"):
-            task_signal_csv = signal_csv.replace("multi_", f"multi_{task}_")
+            #task_signal_csv = signal_csv.replace("multi_", f"multi3_{task}_")
+            task_signal_csv = args.prediction_signal_csv.format(
+                sample_size=f"{task}_{prepared['usable_dmrs']}",
+                timestamp=args.timestamp,
+            )
+
         else:
             task_signal_csv = f"{signal_csv}_{task}.csv"
         if regression_plot.endswith(".png"):
-            task_plot = regression_plot.replace("multi_", f"multi_{task}_")
+            #task_plot = regression_plot.replace("multi_", f"multi3_{task}_")
+            task_plot = args.regression_plot_path.format(
+                sample_size=f"{task}_{prepared['usable_dmrs']}",
+                timestamp=args.timestamp,
+            )
         else:
             task_plot = f"{regression_plot}_{task}.png"
 
@@ -379,7 +389,7 @@ def parse_args():
         nargs="+",
         type=float,
         default=None,
-        help="Optional per-task weights for multitask loss (space-separated floats, length=2).",
+        help="Optional per-task weights for multitask loss (space-separated floats, length=3).",
     )
     parser.add_argument(
         "--mask-mode",
@@ -410,7 +420,7 @@ def main():
         json.dump({"args": vars(args), "results": results}, file_obj, indent=2)
 
     # Also write per-modality JSON files (one per predicted task/modalitiy)
-    task_names = ["5mc", "5hmc"]
+    task_names = ["5mc", "5hmc", "c"]
     for task in task_names:
         mod_results = []
         for r in results:
@@ -424,8 +434,8 @@ def main():
             mod_r["final_val_r2"] = mod_r.pop("final_val_r2_per_task", {}).get(task)
             mod_r["final_val_pearsonr"] = mod_r.pop("final_val_pearsonr_per_task", {}).get(task)
             mod_results.append(mod_r)
-        if args.output_json.endswith(".json"):
-            mod_path = args.output_json.replace("multi_", f"multi_{task}_")
+        if args.output_json.endswith("_results.json"):
+            mod_path = args.output_json.replace("_results.json", f"_{task}_results.json")
         else:
             mod_path = f"{args.output_json}_{task}.json"
         with open(mod_path, "w", encoding="utf-8") as fh:

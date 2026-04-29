@@ -406,12 +406,18 @@ def prepare_multimodal_multitask_data(num_dmrs: int, args, df_dmr, seqs, mcg_tra
     mc5c = track_arrays.get("5mc")
     if mc5c is None:
         raise ValueError("5mC tracks required for multitask experiments but not available.")
-    hm5c_tensor = torch.tensor(hm5c, dtype=torch.float32).unsqueeze(-1)
-    mc5c_tensor = torch.tensor(mc5c, dtype=torch.float32).unsqueeze(-1)
-    multitask_target = torch.cat([mc5c_tensor, hm5c_tensor], dim=-1)
+    hm5c_tensor = torch.tensor(hm5c, dtype=torch.float32).unsqueeze(-1) /100
+    mc5c_tensor = torch.tensor(mc5c, dtype=torch.float32).unsqueeze(-1) /100
+    # compute complement channel `c` so that mc + hm + c = 1 per position; handle numerical issues by
+    # clamping and re-normalizing per-position
+    c_tensor = (1.0 - mc5c_tensor - hm5c_tensor).clamp(min=0.0)
+    multitask_target = torch.cat([mc5c_tensor, hm5c_tensor, c_tensor], dim=-1)
+    # normalize per-position to sum to 1 (in case input sums deviate from 1)
+    sum_per_pos = multitask_target.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+    multitask_target = multitask_target / sum_per_pos
 
     loss_mask = resolve_loss_mask(getattr(args, "mask_mode", "cpg_both"), base_ids_tensor)
-    loss_mask = loss_mask.repeat(1, 1, 2)
+    loss_mask = loss_mask.repeat(1, 1, 3)
 
     split_regions_df = df_dmr.iloc[:usable_dmrs].copy().reset_index().rename(columns={"index": "original_idx"})
     split_regions_df["chr"] = split_regions_df["chr"].astype(str)
