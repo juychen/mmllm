@@ -35,7 +35,7 @@ echo "[$region] Current time: $current_time"
 python run_multimodal_multitask_experiments.py \
   --sample-sizes 2000 10000\
   --augment-reverse-complement \
-  --mask-mode cpg_both \
+  --mask-mode cpg_forward \
   --m5c-bedgraph /data2st1/junyi/output/llm0401/processed_meth/${condition}_${region}.CG.m.bedGraph.gz \
   --hm5c-bedgraph /data2st1/junyi/output/llm0401/processed_meth/${condition}_${region}.CG.h.bedGraph.gz \
   --atac-bw /data2st2/junyi/output/atac1112/tobiasbam/BULK/corrected/${region}_${condition}_track.bw \

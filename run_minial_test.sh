@@ -38,7 +38,7 @@ python run_multimodal_track_experiments.py \
   --augment-reverse-complement \
   --context-modalities sequence \
   --target-modality 5hmc \
-  --mask-mode cpg_both \
+  --mask-mode cpg_forward \
   --m5c-bedgraph /data2st1/junyi/output/llm0401/processed_meth/${condition}_${region}.CG.m.bedGraph.gz \
   --hm5c-bedgraph /data2st1/junyi/output/llm0401/processed_meth/${condition}_${region}.CG.h.bedGraph.gz \
   --atac-bw /data2st2/junyi/output/atac1112/tobiasbam/BULK/corrected/${region}_${condition}_track.bw \
@@ -61,7 +61,7 @@ python run_multimodal_track_experiments.py \
   --augment-reverse-complement \
   --context-modalities sequence \
   --target-modality 5hmc \
-  --mask-mode cpg_both \
+  --mask-mode cpg_forward \
   --scheduler cosine \
   --m5c-bedgraph /data2st1/junyi/output/llm0401/processed_meth/${condition}_${region}.CG.m.bedGraph.gz \
   --hm5c-bedgraph /data2st1/junyi/output/llm0401/processed_meth/${condition}_${region}.CG.h.bedGraph.gz \
@@ -80,11 +80,34 @@ current_time=$(date "+%Y-%m-%d-%H-%M-%S")
 echo "[$region] Current time: $current_time"
 python run_multimodal_track_experiments.py \
   --sample-sizes 2000 10000 20000 50000 100000\
+  --input-modality 5hmc \
+  --augment-reverse-complement \
+  --context-modalities sequence \
+  --target-modality 5mc \
+  --mask-mode cpg_forward \
+  --scheduler cosine \
+  --m5c-bedgraph /data2st1/junyi/output/llm0401/processed_meth/${condition}_${region}.CG.m.bedGraph.gz \
+  --hm5c-bedgraph /data2st1/junyi/output/llm0401/processed_meth/${condition}_${region}.CG.h.bedGraph.gz \
+  --atac-bw /data2st2/junyi/output/atac1112/tobiasbam/BULK/corrected/${region}_${condition}_track.bw \
+  --num-epochs 100 \
+  --batch-size 64 \
+  --scheduler-patience 5 \
+  --scheduler-min-lr 1e-5 \
+  --timestamp "$current_time" \
+  --output-csv ${output_dir}/${current_time}_5hmc_to_5mc_results.csv \
+  --output-json ${output_dir}/${current_time}_5hmc_to_5mc_results.json \
+  --prediction-signal-csv ${output_dir}/${current_time}_5hmc_to_5mc_{sample_size}.csv \
+  --regression-plot-path ${output_dir}/${current_time}_5hmc_to_5mc_{sample_size}.png
+
+current_time=$(date "+%Y-%m-%d-%H-%M-%S")
+echo "[$region] Current time: $current_time"
+python run_multimodal_track_experiments.py \
+  --sample-sizes 2000 10000 20000 50000 100000\
   --input-modality atac \
   --augment-reverse-complement \
   --context-modalities sequence \
   --target-modality 5mc \
-  --mask-mode cpg_both \
+  --mask-mode cpg_forward \
   --scheduler cosine \
   --m5c-bedgraph /data2st1/junyi/output/llm0401/processed_meth/${condition}_${region}.CG.m.bedGraph.gz \
   --hm5c-bedgraph /data2st1/junyi/output/llm0401/processed_meth/${condition}_${region}.CG.h.bedGraph.gz \
