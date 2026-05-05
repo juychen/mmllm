@@ -28,6 +28,14 @@ BASE_COMPLEMENT_INDEX = torch.tensor([3, 2, 1, 0], dtype=torch.long)
 DNA_COMPLEMENT_TABLE = str.maketrans("ACGTN", "TGCAN")
 
 
+def ensure_path_list(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    return [str(item) for item in value]
+
+
 def get_sequence(chrom: str, start: int, end: int, genome: pyfaidx.Fasta) -> str:
     return genome[chrom][start - 1 : end].seq
 
@@ -141,7 +149,10 @@ def load_data(args):
     df_dmr.loc[short_mask, "end_expanded"] = df_dmr.loc[short_mask, "center"] + half_window - 1
 
     genome = pyfaidx.Fasta(args.genome_fasta)
-    tbx_5hmc = pysam.TabixFile(args.hm5c_bedgraph)
+    hm5c_paths = ensure_path_list(getattr(args, "hm5c_bedgraph", None))
+    m5c_paths = ensure_path_list(getattr(args, "m5c_bedgraph", None))
+    atac_paths = ensure_path_list(getattr(args, "atac_bw", None))
+
     requested_track_modalities = set()
     if hasattr(args, "input_modality"):
         requested_track_modalities.add(args.input_modality)
@@ -150,27 +161,64 @@ def load_data(args):
     if hasattr(args, "context_modalities"):
         requested_track_modalities.update(modality for modality in args.context_modalities if modality in TRACK_MODALITIES)
 
-    should_load_5mc = bool(getattr(args, "m5c_bedgraph", None)) and (
+    should_load_5mc = bool(m5c_paths) and (
         getattr(args, "use_m5c", False) or "5mc" in requested_track_modalities or 'multi' in requested_track_modalities
     )
-    tbx_5mc = pysam.TabixFile(args.m5c_bedgraph) if should_load_5mc else None
-    atac_bw = pyBigWig.open(args.atac_bw)
+
+    use_all_input_groups = getattr(args, "use_all_input_groups", False)
+    num_groups = max(len(hm5c_paths), len(atac_paths), len(m5c_paths) if should_load_5mc else 0)
+    if num_groups == 0:
+        raise ValueError("No input track paths were provided. Check --hm5c-bedgraph/--m5c-bedgraph/--atac-bw.")
+
+    if not use_all_input_groups:
+        hm5c_paths = hm5c_paths[:1]
+        atac_paths = atac_paths[:1]
+        if should_load_5mc:
+            m5c_paths = m5c_paths[:1]
+        num_groups = 1
+    else:
+        if len(hm5c_paths) != len(atac_paths):
+            raise ValueError(
+                "When --use-all-input-groups is enabled, --hm5c-bedgraph and --atac-bw must have the same number of paths."
+            )
+        if should_load_5mc and len(m5c_paths) != len(hm5c_paths):
+            raise ValueError(
+                "When --use-all-input-groups is enabled, --m5c-bedgraph must have the same number of paths as --hm5c-bedgraph."
+            )
+
+    tbx_5hmc_list = [pysam.TabixFile(path) for path in hm5c_paths]
+    tbx_5mc_list = [pysam.TabixFile(path) for path in m5c_paths] if should_load_5mc else []
+    atac_bw_list = [pyBigWig.open(path) for path in atac_paths]
 
     seqs = []
     mcg_tracks = []
     hmcg_tracks = []
     atac_tracks = []
-    for _, row in df_dmr.iterrows():
-        chrom = "chr" + str(row["chr"])
-        start = int(row["start_expanded"])
-        end = int(row["end_expanded"])
-        seqs.append(get_sequence(chrom, start, end, genome))
-        if tbx_5mc is not None:
-            mcg_tracks.append(fast_tabix_to_track(tbx_5mc, chrom.replace("chr", ""), start, end))
-        hmcg_tracks.append(fast_tabix_to_track(tbx_5hmc, chrom.replace("chr", ""), start, end))
-        atac_tracks.append(np.nan_to_num(atac_bw.values(chrom, start, end + 1), nan=0.0))
+    dmr_frames = []
+    for group_idx in range(num_groups):
+        group_df = df_dmr.copy()
+        group_df["input_group"] = group_idx
+        group_df["hm5c_bedgraph_path"] = hm5c_paths[group_idx]
+        group_df["atac_bw_path"] = atac_paths[group_idx]
+        if should_load_5mc:
+            group_df["m5c_bedgraph_path"] = m5c_paths[group_idx]
+        dmr_frames.append(group_df)
 
-    return df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks
+        tbx_5hmc = tbx_5hmc_list[group_idx]
+        tbx_5mc = tbx_5mc_list[group_idx] if should_load_5mc else None
+        atac_bw = atac_bw_list[group_idx]
+        for _, row in df_dmr.iterrows():
+            chrom = "chr" + str(row["chr"])
+            start = int(row["start_expanded"])
+            end = int(row["end_expanded"])
+            seqs.append(get_sequence(chrom, start, end, genome))
+            if tbx_5mc is not None:
+                mcg_tracks.append(fast_tabix_to_track(tbx_5mc, chrom.replace("chr", ""), start, end))
+            hmcg_tracks.append(fast_tabix_to_track(tbx_5hmc, chrom.replace("chr", ""), start, end))
+            atac_tracks.append(np.nan_to_num(atac_bw.values(chrom, start, end + 1), nan=0.0))
+
+    combined_df_dmr = pd.concat(dmr_frames, ignore_index=True)
+    return combined_df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks
 
 
 def get_track_arrays(args, mcg_tracks, hmcg_tracks, atac_tracks, usable_dmrs: int, seq_len: int) -> dict[str, np.ndarray]:

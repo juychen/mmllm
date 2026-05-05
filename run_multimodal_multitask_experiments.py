@@ -22,6 +22,8 @@ from utils import export_prediction_signals, plot_regression_predictions, set_ra
 @dataclass
 class ExperimentResult:
     num_dmrs: int
+    input_group_files: list[dict]
+    output_files: dict
     train_regions: int
     val_regions: int
     non_overlap_groups: int
@@ -275,6 +277,32 @@ def run_experiment(num_dmrs, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_t
     # Base templates (used to derive per-task paths)
     signal_csv = args.prediction_signal_csv.format(sample_size=prepared["usable_dmrs"], timestamp=args.timestamp)
     regression_plot = args.regression_plot_path.format(sample_size=prepared["usable_dmrs"], timestamp=args.timestamp)
+    input_group_files = []
+    if "input_group" in df_dmr.columns:
+        group_columns = [column for column in ["m5c_bedgraph_path", "hm5c_bedgraph_path", "atac_bw_path"] if column in df_dmr.columns]
+        grouped_inputs = (
+            df_dmr.loc[:, ["input_group", *group_columns]]
+            .drop_duplicates()
+            .sort_values("input_group")
+        )
+        for input_group, group_rows in grouped_inputs.groupby("input_group", sort=True):
+            group_record = {"input_group": int(input_group)}
+            if "m5c_bedgraph_path" in group_rows.columns:
+                group_record["m5c_bedgraph"] = str(group_rows["m5c_bedgraph_path"].iloc[0])
+            if "hm5c_bedgraph_path" in group_rows.columns:
+                group_record["hm5c_bedgraph"] = str(group_rows["hm5c_bedgraph_path"].iloc[0])
+            if "atac_bw_path" in group_rows.columns:
+                group_record["atac_bw"] = str(group_rows["atac_bw_path"].iloc[0])
+            input_group_files.append(group_record)
+    else:
+        input_group_files.append(
+            {
+                "input_group": 0,
+                "m5c_bedgraph": args.m5c_bedgraph[0] if getattr(args, "m5c_bedgraph", None) else None,
+                "hm5c_bedgraph": args.hm5c_bedgraph[0] if getattr(args, "hm5c_bedgraph", None) else None,
+                "atac_bw": args.atac_bw[0] if getattr(args, "atac_bw", None) else None,
+            }
+        )
     # Export predictions and plots per task dimension. dim 0 -> 5mc, dim 1 -> 5hmc
     task_names = ["5mc", "5hmc", "c"]
     signal_csvs = {}
@@ -320,6 +348,13 @@ def run_experiment(num_dmrs, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_t
         regression_plots[task] = task_plot
     return ExperimentResult(
         num_dmrs=prepared["usable_dmrs"],
+        input_group_files=input_group_files,
+        output_files={
+            "results_csv": args.output_csv,
+            "results_json": args.output_json,
+            "signal_csvs": signal_csvs,
+            "regression_plots": regression_plots,
+        },
         train_regions=prepared["train_regions"],
         val_regions=prepared["val_regions"],
         non_overlap_groups=prepared["non_overlap_groups"],
@@ -344,9 +379,24 @@ def parse_args():
     )
     parser.add_argument("--dmr-csv", default="output/dmr_with_sequences.csv")
     parser.add_argument("--genome-fasta", default="/data2st1/junyi/ref/GRCm38.p6.genome.fa")
-    parser.add_argument("--m5c-bedgraph", default="/data2st1/junyi/output/llm0401/processed_meth/MC_AMY.CG.m.bedGraph.gz")
-    parser.add_argument("--hm5c-bedgraph", default="/data2st1/junyi/output/llm0401/processed_meth/MC_AMY.CG.h.bedGraph.gz")
-    parser.add_argument("--atac-bw", default="/data2st2/junyi/output/atac1112/tobiasbam/BULK/corrected/AMY_MC_track.bw")
+    parser.add_argument(
+        "--m5c-bedgraph",
+        nargs="+",
+        default=["/data2st1/junyi/output/llm0401/processed_meth/MC_AMY.CG.m.bedGraph.gz"],
+        help="One or more 5mC bedGraph.gz paths. With --use-all-input-groups, all provided paths are combined into one training set.",
+    )
+    parser.add_argument(
+        "--hm5c-bedgraph",
+        nargs="+",
+        default=["/data2st1/junyi/output/llm0401/processed_meth/MC_AMY.CG.h.bedGraph.gz"],
+        help="One or more 5hmC bedGraph.gz paths. With --use-all-input-groups, all provided paths are combined into one training set.",
+    )
+    parser.add_argument(
+        "--atac-bw",
+        nargs="+",
+        default=["/data2st2/junyi/output/atac1112/tobiasbam/BULK/corrected/AMY_MC_track.bw"],
+        help="One or more ATAC bigWig paths. With --use-all-input-groups, all provided paths are combined into one training set.",
+    )
     parser.add_argument("--sample-sizes", nargs="+", type=int, required=True)
     parser.add_argument("--target-length", type=int, default=1024)
     parser.add_argument("--train-ratio", type=float, default=0.8)
@@ -401,6 +451,11 @@ def parse_args():
         "--augment-reverse-complement",
         action="store_true",
         help="After train/val split, augment each subset with reverse-complement sequence views and reversed signal tracks.",
+    )
+    parser.add_argument(
+        "--use-all-input-groups",
+        action="store_true",
+        help="Combine all provided m5C/5hmC/ATAC path groups into one shared training dataset instead of using only the first path trio.",
     )
     return parser.parse_args()
 
