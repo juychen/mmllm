@@ -138,6 +138,45 @@ def assign_non_overlapping_groups(region_frame: pd.DataFrame, chrom_col: str, st
     return ordered.sort_values("original_idx").reset_index(drop=True)
 
 
+def _chromosome_sort_key(chrom_value) -> tuple[int, int | str]:
+    chrom_str = str(chrom_value)
+    chrom_body = chrom_str[3:] if chrom_str.lower().startswith("chr") else chrom_str
+    chrom_body_lower = chrom_body.lower()
+    if chrom_body_lower.isdigit():
+        return 0, int(chrom_body_lower)
+    special_ranks = {"x": 23, "y": 24, "m": 25, "mt": 25}
+    if chrom_body_lower in special_ranks:
+        return 1, special_ranks[chrom_body_lower]
+    return 2, chrom_body_lower
+
+
+def reorder_regions_by_genomic_position(
+    region_frame: pd.DataFrame,
+    seqs: list,
+    mcg_tracks: list,
+    hmcg_tracks: list,
+    atac_tracks: list,
+) -> tuple[pd.DataFrame, list, list, list, list]:
+    ordered = region_frame.copy()
+    chrom_keys = ordered["chr"].map(_chromosome_sort_key)
+    ordered["_chrom_sort_bucket"] = chrom_keys.map(lambda key: key[0])
+    ordered["_chrom_sort_value"] = chrom_keys.map(lambda key: key[1])
+    ordered["_original_order"] = np.arange(len(ordered), dtype=np.int64)
+    ordered = ordered.sort_values(
+        ["_chrom_sort_bucket", "_chrom_sort_value", "start_expanded", "end_expanded", "input_group", "_original_order"],
+        kind="mergesort",
+    )
+    order = ordered["_original_order"].to_numpy()
+    ordered = ordered.drop(columns=["_chrom_sort_bucket", "_chrom_sort_value", "_original_order"]).reset_index(drop=True)
+
+    def reorder_payload(values: list) -> list:
+        if not values:
+            return values
+        return [values[idx] for idx in order]
+
+    return ordered, reorder_payload(seqs), reorder_payload(mcg_tracks), reorder_payload(hmcg_tracks), reorder_payload(atac_tracks)
+
+
 def load_data(args):
     df_dmr = pd.read_csv(args.dmr_csv)
     target_length = args.target_length
@@ -218,6 +257,14 @@ def load_data(args):
             atac_tracks.append(np.nan_to_num(atac_bw.values(chrom, start, end + 1), nan=0.0))
 
     combined_df_dmr = pd.concat(dmr_frames, ignore_index=True)
+    if use_all_input_groups:
+        combined_df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks = reorder_regions_by_genomic_position(
+            combined_df_dmr,
+            seqs,
+            mcg_tracks,
+            hmcg_tracks,
+            atac_tracks,
+        )
     return combined_df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks
 
 

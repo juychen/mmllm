@@ -39,7 +39,7 @@ fi
 echo "[$region] Current time: $current_time"
 
 common_args=(
-  --sample-sizes 200000
+  --sample-sizes 5000 20000 50000 200000 500000
   --augment-reverse-complement
   --mask-mode cpg_forward
   --scheduler cosine

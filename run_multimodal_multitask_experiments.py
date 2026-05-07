@@ -1,6 +1,7 @@
 import argparse
 import json
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -37,6 +38,7 @@ class ExperimentResult:
     final_val_pearsonr: float
     signal_csvs: dict
     regression_plots: dict
+    checkpoint_paths: dict
     final_val_loss_per_task: dict
     final_val_r2_per_task: dict
     final_val_pearsonr_per_task: dict
@@ -94,6 +96,24 @@ def build_optimizer(model, args):
         {"params": no_decay_params, "weight_decay": 0.0},
     ]
     return torch.optim.AdamW(param_groups, lr=args.learning_rate)
+
+
+def save_checkpoint(checkpoint_path: str, model, optimizer, scheduler, epoch: int, metrics: dict, args, num_dmrs: int):
+    checkpoint_file = Path(checkpoint_path)
+    checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+    scheduler_state = scheduler.state_dict() if scheduler is not None else None
+    torch.save(
+        {
+            "epoch": epoch,
+            "num_dmrs": num_dmrs,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler_state,
+            "metrics": metrics,
+            "args": vars(args),
+        },
+        checkpoint_file,
+    )
 
 def evaluate(model, loader, device, task_weights=None):
     model.eval()
@@ -221,8 +241,12 @@ def run_experiment(num_dmrs, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_t
     best_val_r2 = float("nan")
     best_val_pearsonr = float("nan")
     best_state = None
+    last_epoch = 0
+    best_checkpoint_path = args.best_checkpoint_path.format(sample_size=prepared["usable_dmrs"], timestamp=args.timestamp)
+    last_checkpoint_path = args.last_checkpoint_path.format(sample_size=prepared["usable_dmrs"], timestamp=args.timestamp)
     patience_left = args.patience
     for epoch in range(1, args.num_epochs + 1):
+        last_epoch = epoch
         model.train()
         running_loss = 0.0
         seen = 0
@@ -258,11 +282,42 @@ def run_experiment(num_dmrs, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_t
             best_val_pearsonr = val_pearsonr
             best_epoch = epoch
             best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+            save_checkpoint(
+                best_checkpoint_path,
+                model,
+                optimizer,
+                scheduler,
+                epoch,
+                {
+                    "train_loss": train_loss,
+                    "val_loss": val_loss,
+                    "val_r2": val_r2,
+                    "val_pearsonr": val_pearsonr,
+                    "is_best": True,
+                },
+                args,
+                prepared["usable_dmrs"],
+            )
             patience_left = args.patience
         else:
             patience_left -= 1
             if args.patience > 0 and patience_left <= 0:
                 break
+    save_checkpoint(
+        last_checkpoint_path,
+        model,
+        optimizer,
+        scheduler,
+        last_epoch,
+        {
+            "val_loss": val_loss,
+            "val_r2": val_r2,
+            "val_pearsonr": val_pearsonr,
+            "is_best": last_epoch == best_epoch,
+        },
+        args,
+        prepared["usable_dmrs"],
+    )
     if best_state is not None:
         model.load_state_dict(best_state)
     final_val_loss, final_val_r2, final_val_pearsonr = evaluate(model, prepared["val_loader"], device, task_weights)
@@ -354,6 +409,10 @@ def run_experiment(num_dmrs, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_t
             "results_json": args.output_json,
             "signal_csvs": signal_csvs,
             "regression_plots": regression_plots,
+            "checkpoints": {
+                "best": best_checkpoint_path,
+                "last": last_checkpoint_path,
+            },
         },
         train_regions=prepared["train_regions"],
         val_regions=prepared["val_regions"],
@@ -368,6 +427,10 @@ def run_experiment(num_dmrs, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_t
         final_val_pearsonr=final_val_pearsonr,
         signal_csvs=signal_csvs,
         regression_plots=regression_plots,
+        checkpoint_paths={
+            "best": best_checkpoint_path,
+            "last": last_checkpoint_path,
+        },
         final_val_loss_per_task=final_val_loss_per_task,
         final_val_r2_per_task=final_val_r2_per_task,
         final_val_pearsonr_per_task=final_val_pearsonr_per_task,
@@ -433,6 +496,16 @@ def parse_args():
         "--regression-plot-path",
         default="output/{timestamp}_multimodal_multitask_regression_plot_{sample_size}.png",
         help="Per-sample-size regression plot output path template.",
+    )
+    parser.add_argument(
+        "--best-checkpoint-path",
+        default="output/{timestamp}_multimodal_multitask_best_{sample_size}.pt",
+        help="Per-sample-size checkpoint path template for the best validation epoch.",
+    )
+    parser.add_argument(
+        "--last-checkpoint-path",
+        default="output/{timestamp}_multimodal_multitask_last_{sample_size}.pt",
+        help="Per-sample-size checkpoint path template for the last trained epoch.",
     )
     parser.add_argument(
         "--task-weights",
