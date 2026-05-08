@@ -4,7 +4,7 @@ conda activate evo2
 cd /home/junyichen/code/mmllm/ || exit 1
 
 region="${1:-ALL}"
-condition="${2:-ALL}"
+condition="${2:-MC}"
 chromosome="${3:-ALL}"
 
 if [[ $# -gt 0 ]]; then
@@ -70,7 +70,7 @@ run_experiment() {
   echo "[$region/${condition}] Current time: $current_time | chromosome: $chrom"
 
   common_args=(
-    --sample-sizes 500000
+    --sample-sizes 5000 20000 50000 200000 500000
     --augment-reverse-complement
     --mask-mode cpg_forward
     --scheduler cosine
@@ -81,10 +81,8 @@ run_experiment() {
     --scheduler-min-lr 1e-5
     --output-csv "${output_dir}/${current_time}_multi_integrated_results.csv"
     --output-json "${output_dir}/${current_time}_multi_integrated_results.json"
-    --prediction-signal-csv "${output_dir}/${current_time}_${chrom}_multi_integrated_{sample_size}.csv"
-    --regression-plot-path "${output_dir}/${current_time}_${chrom}_multi_integrated_{sample_size}.png"
-    --best-checkpoint-path "${output_dir}/${current_time}_${chrom}_multi_integrated_best_{sample_size}.pt"
-    --last-checkpoint-path "${output_dir}/${current_time}_${chrom}_multi_integrated_last_{sample_size}.pt"
+    --prediction-signal-csv "${output_dir}/${current_time}_multi_integrated_{sample_size}.csv"
+    --regression-plot-path "${output_dir}/${current_time}_multi_integrated_{sample_size}.png"
     "${chrom_args[@]}"
   )
 
@@ -125,7 +123,7 @@ run_experiment() {
 chromosome=$(normalize_chromosome "$chromosome")
 
 if [[ "$chromosome" == "ALL" ]]; then
-  chromosomes=(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 X Y)
+  chromosomes=(chr1 chr2 chr3 chr4 chr5 chr6 chr7 chr8 chr9 chr10 chr11 chr12 chr13 chr14 chr15 chr16 chr17 chr18 chr19 chrX chrY)
   for chrom in "${chromosomes[@]}"; do
     run_experiment "$chrom"
   done

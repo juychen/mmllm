@@ -23,6 +23,7 @@ from utils import export_prediction_signals, plot_regression_predictions, set_ra
 @dataclass
 class ExperimentResult:
     num_dmrs: int
+    chromosome: str | None
     input_group_files: list[dict]
     output_files: dict
     train_regions: int
@@ -211,6 +212,32 @@ def evaluate_per_task(model, loader, device):
         else:
             pearsons.append(float('nan'))
     return losses, r2s, pearsons
+
+
+def normalize_chromosome_label(chromosome: str) -> str:
+    chrom_value = str(chromosome).strip()
+    if not chrom_value:
+        raise ValueError("--chromosome cannot be empty.")
+    return chrom_value if chrom_value.lower().startswith("chr") else f"chr{chrom_value}"
+
+
+def subset_dataset_by_chromosome(df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks, chromosome: str):
+    normalized_chromosome = normalize_chromosome_label(chromosome)
+    chrom_series = df_dmr["chr"].astype(str).map(normalize_chromosome_label)
+    matched_indices = np.flatnonzero(chrom_series == normalized_chromosome)
+    if matched_indices.size == 0:
+        available_chromosomes = sorted(chrom_series.drop_duplicates().tolist())
+        raise ValueError(
+            f"No DMR rows found for chromosome {normalized_chromosome}. "
+            f"Available chromosomes: {', '.join(available_chromosomes)}"
+        )
+    filtered_df = df_dmr.iloc[matched_indices].reset_index(drop=True)
+    index_list = matched_indices.tolist()
+    filtered_seqs = [seqs[idx] for idx in index_list]
+    filtered_mcg_tracks = [mcg_tracks[idx] for idx in index_list]
+    filtered_hmcg_tracks = [hmcg_tracks[idx] for idx in index_list]
+    filtered_atac_tracks = [atac_tracks[idx] for idx in index_list]
+    return normalized_chromosome, filtered_df, filtered_seqs, filtered_mcg_tracks, filtered_hmcg_tracks, filtered_atac_tracks
 
 def run_experiment(num_dmrs, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -403,6 +430,7 @@ def run_experiment(num_dmrs, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_t
         regression_plots[task] = task_plot
     return ExperimentResult(
         num_dmrs=prepared["usable_dmrs"],
+        chromosome=getattr(args, "chromosome", None),
         input_group_files=input_group_files,
         output_files={
             "results_csv": args.output_csv,
@@ -461,6 +489,11 @@ def parse_args():
         help="One or more ATAC bigWig paths. With --use-all-input-groups, all provided paths are combined into one training set.",
     )
     parser.add_argument("--sample-sizes", nargs="+", type=int, required=True)
+    parser.add_argument(
+        "--chromosome",
+        default=None,
+        help="Optional chromosome selector, e.g. '1' or 'chr1'. Only matching regions are used for training.",
+    )
     parser.add_argument("--target-length", type=int, default=1024)
     parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--batch-size", type=int, default=128)
@@ -534,10 +567,23 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.chromosome is not None:
+        args.chromosome = normalize_chromosome_label(args.chromosome)
+    Path(args.output_csv).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.output_json).parent.mkdir(parents=True, exist_ok=True)
     # this script uses sequence as the only context modality
     args.context_modalities = ["sequence"]
     set_random_seed(args.seed)
     df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks = load_data(args)
+    if args.chromosome is not None:
+        df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks = subset_dataset_by_chromosome(
+            df_dmr,
+            seqs,
+            mcg_tracks,
+            hmcg_tracks,
+            atac_tracks,
+            args.chromosome,
+        )[1:]
     results = []
     for sample_size in args.sample_sizes:
         results.append(asdict(run_experiment(sample_size, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks)))
