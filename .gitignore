@@ -2,7 +2,7 @@ output/
 .vscode/
 *.pyc
 __pycache__/
-
+output
 # Python
 *.pyo
 *.pyd
