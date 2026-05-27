@@ -589,6 +589,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    args.use_m5c = True
     if args.chromosome is not None:
         args.chromosome = normalize_chromosome_label(args.chromosome)
 
