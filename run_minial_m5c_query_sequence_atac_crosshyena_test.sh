@@ -3,8 +3,8 @@ source /home/junyichen/anaconda3/etc/profile.d/conda.sh
 conda activate evo2
 cd /home/junyichen/code/mmllm/ || exit 1
 
-region="${1:-ALL}"
-condition="${2:-ALL}"
+region="${1:-AMY}"
+condition="${2:-MC}"
 
 if [[ $# -gt 0 ]]; then
   case "$1" in
