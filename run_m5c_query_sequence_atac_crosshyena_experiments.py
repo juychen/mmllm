@@ -17,7 +17,7 @@ from data import (
     resolve_loss_mask,
     tensorize_track_modality,
 )
-from models import M5CQuerySequenceAtacCrossHyenaRegressor
+from models import M5CQuerySequenceAtacCrossHyenaRegressor, M5CQuerySequenceAtacCrossHyenaRegressorModelB
 from utils import export_prediction_signals, plot_regression_predictions, set_random_seed
 
 
@@ -338,12 +338,20 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     prepared = prepare_sequence_atac_crosshyena_data(num_dmrs, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks)
 
-    model = M5CQuerySequenceAtacCrossHyenaRegressor(
-        seq_len=prepared.seq_len,
-        hidden_dim=args.hidden_dim,
-        post_filter_len=prepared.post_filter_len,
-        use_positional_encoding=args.use_positional_encoding,
-    ).to(device)
+    if args.model_name == "model_b":
+        model = M5CQuerySequenceAtacCrossHyenaRegressorModelB(
+            seq_len=prepared.seq_len,
+            hidden_dim=args.hidden_dim,
+            use_positional_encoding=args.use_positional_encoding,
+            num_blocks=args.model_b_blocks,
+        ).to(device)
+    else:
+        model = M5CQuerySequenceAtacCrossHyenaRegressor(
+            seq_len=prepared.seq_len,
+            hidden_dim=args.hidden_dim,
+            post_filter_len=prepared.post_filter_len,
+            use_positional_encoding=args.use_positional_encoding,
+        ).to(device)
     optimizer = build_optimizer(model, args)
     scheduler = build_scheduler(optimizer, args, args.num_epochs)
 
@@ -550,6 +558,8 @@ def parse_args():
     parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--hidden-dim", type=int, default=64)
+    parser.add_argument("--model-name", choices=["baseline", "model_b"], default="baseline")
+    parser.add_argument("--model-b-blocks", type=int, default=2)
     parser.add_argument("--use-positional-encoding", action="store_true")
     parser.add_argument("--num-epochs", type=int, default=30)
     parser.add_argument("--patience", type=int, default=5)
