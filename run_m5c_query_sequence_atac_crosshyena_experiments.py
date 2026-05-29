@@ -344,6 +344,7 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
             hidden_dim=args.hidden_dim,
             use_positional_encoding=args.use_positional_encoding,
             num_blocks=args.model_b_blocks,
+            fusion_type=args.model_b_fusion,
         ).to(device)
     else:
         model = M5CQuerySequenceAtacCrossHyenaRegressor(
@@ -560,6 +561,7 @@ def parse_args():
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--model-name", choices=["baseline", "model_b"], default="baseline")
     parser.add_argument("--model-b-blocks", type=int, default=2)
+    parser.add_argument("--model-b-fusion", choices=["cross_hyena", "cross_attention"], default="cross_hyena")
     parser.add_argument("--use-positional-encoding", action="store_true")
     parser.add_argument("--num-epochs", type=int, default=30)
     parser.add_argument("--patience", type=int, default=5)

@@ -347,11 +347,35 @@ class CrossHyenaResidualBranch(nn.Module):
         return hidden + self.gate(branch_output)
 
 
+class CrossAttentionResidualBranch(nn.Module):
+    def __init__(self, hidden_dim: int, num_heads: int = 4):
+        super().__init__()
+        self.query_norm = nn.LayerNorm(hidden_dim)
+        self.context_norm = nn.LayerNorm(hidden_dim)
+        self.attention = nn.MultiheadAttention(hidden_dim, num_heads=num_heads, batch_first=True)
+        self.gate = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+    def forward(self, hidden: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        normalized_hidden = self.query_norm(hidden)
+        normalized_context = self.context_norm(context)
+        branch_output, _ = self.attention(normalized_hidden, normalized_context, normalized_context, need_weights=False)
+        return hidden + self.gate(branch_output)
+
+
 class StripedHyenaBlock(nn.Module):
-    def __init__(self, hidden_dim: int, seq_len: int):
+    def __init__(self, hidden_dim: int, seq_len: int, fusion_type: str = "cross_hyena"):
         super().__init__()
         short_len, _, _ = _resolve_hyena_filter_lengths(seq_len)
-        self.cross_short = CrossHyenaResidualBranch(hidden_dim, seq_len, filter_len=short_len, long_mixer="conv")
+        if fusion_type == "cross_attention":
+            self.cross_short = CrossAttentionResidualBranch(hidden_dim)
+        elif fusion_type == "cross_hyena":
+            self.cross_short = CrossHyenaResidualBranch(hidden_dim, seq_len, filter_len=short_len, long_mixer="conv")
+        else:
+            raise ValueError(f"Unknown fusion_type: {fusion_type}")
         self.hyena_block_1 = MultiScaleHyenaBlock(hidden_dim, seq_len, include_short=True)
         self.hyena_block_2 = MultiScaleHyenaBlock(hidden_dim, seq_len, include_short=False)
         self.output_norm = nn.LayerNorm(hidden_dim)
@@ -373,6 +397,7 @@ class M5CQuerySequenceAtacCrossHyenaRegressorModelB(nn.Module):
         hidden_dim: int = 64,
         use_positional_encoding: bool = False,
         num_blocks: int = 2,
+        fusion_type: str = "cross_hyena",
     ):
         super().__init__()
         self.query_proj = nn.Linear(query_dim, hidden_dim)
@@ -384,7 +409,7 @@ class M5CQuerySequenceAtacCrossHyenaRegressorModelB(nn.Module):
         self.context_proj = nn.Linear(2 * hidden_dim, hidden_dim)
         self.context_norm = nn.LayerNorm(hidden_dim)
         self.position_encoding = SinusoidalPositionalEncoding(hidden_dim, seq_len) if use_positional_encoding else None
-        self.blocks = nn.ModuleList([StripedHyenaBlock(hidden_dim, seq_len) for _ in range(num_blocks)])
+        self.blocks = nn.ModuleList([StripedHyenaBlock(hidden_dim, seq_len, fusion_type=fusion_type) for _ in range(num_blocks)])
         self.final_norm = nn.LayerNorm(hidden_dim)
         self.head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),

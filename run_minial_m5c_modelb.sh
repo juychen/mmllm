@@ -5,12 +5,15 @@ cd /home/junyichen/code/mmllm/ || exit 1
 
 region="${1:-AMY}"
 condition="${2:-MC}"
+fusion_type="${3:-cross_attention}"
 
 if [[ $# -gt 0 ]]; then
   case "$1" in
     -h|--help)
       echo "Usage: $0 [REGION|ALL] [CONDITION]"
+      echo "Usage: $0 [REGION|ALL] [CONDITION] [cross_hyena|cross_attention]"
       echo "Example: $0 AMY MC"
+      echo "Example: $0 AMY MC cross_attention"
       echo "Example: $0 ALL"
       exit 0
       ;;
@@ -29,9 +32,15 @@ if [[ "$region" != "ALL" && "$condition" != "MC" && "$condition" != "MW" ]]; the
   exit 1
 fi
 
+if [[ "$fusion_type" != "cross_hyena" && "$fusion_type" != "cross_attention" ]]; then
+  echo "Unsupported model_b fusion: $fusion_type"
+  echo "Allowed values: cross_hyena cross_attention"
+  exit 1
+fi
+
 run_experiment() {
   current_time=$(date "+%Y-%m-%d-%H-%M-%S")
-  run_label="m5c_query_sequence_atac_crosshyena_modelb"
+  run_label="m5c_query_sequence_atac_crosshyena_modelb_${fusion_type}"
   if [[ "$region" == "ALL" ]]; then
     output_dir="output/ALL_GROUPS"
   else
@@ -47,12 +56,13 @@ run_experiment() {
     --sample-sizes 500000
     --model-name model_b
     --model-b-blocks 2
+    --model-b-fusion "$fusion_type"
     --augment-reverse-complement
     --mask-mode cpg_forward
     --scheduler cosine
     --num-epochs 100
     --batch-size 64
-    --scheduler-patience 5
+    --scheduler-patience 15
     --timestamp "$current_time"
     --scheduler-min-lr 1e-5
     --output-csv "${output_dir}/${current_time}_${run_label}_results.csv"
