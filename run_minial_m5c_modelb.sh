@@ -5,7 +5,7 @@ cd /home/junyichen/code/mmllm/ || exit 1
 
 region="${1:-AMY}"
 condition="${2:-MC}"
-fusion_type="${3:-cross_attention}"
+fusion_type="${3:-cross_hyena}"
 
 if [[ $# -gt 0 ]]; then
   case "$1" in
@@ -62,6 +62,7 @@ run_experiment() {
     --scheduler cosine
     --num-epochs 100
     --batch-size 64
+    --target-length 16384
     --scheduler-patience 15
     --timestamp "$current_time"
     --scheduler-min-lr 1e-5
