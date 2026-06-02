@@ -2,6 +2,13 @@ import torch
 import torch.nn as nn
 
 
+def _resolve_hyena_filter_lengths(seq_len: int) -> tuple[int, int, int]:
+    short_len = min(seq_len, 5)
+    mid_len = min(seq_len, max(16, seq_len // 4))
+    long_len = seq_len
+    return short_len, mid_len, long_len
+
+
 class SinusoidalPositionalEncoding(nn.Module):
     def __init__(self, d_model: int, seq_len: int):
         super().__init__()
@@ -240,6 +247,187 @@ class MinimalCrossHyenaRegressor(nn.Module):
         if out.shape[-1] > 1:
             return torch.softmax(out, dim=-1)
         return out
+
+
+class M5CQuerySequenceAtacCrossHyenaRegressor(nn.Module):
+    def __init__(
+        self,
+        seq_len: int,
+        query_dim: int = 1,
+        sequence_dim: int = 4,
+        atac_dim: int = 1,
+        hidden_dim: int = 64,
+        post_filter_len: int | None = None,
+        use_positional_encoding: bool = False,
+    ):
+        super().__init__()
+        self.query_proj = nn.Linear(query_dim, hidden_dim)
+        self.sequence_proj = nn.Linear(sequence_dim, hidden_dim)
+        self.atac_proj = nn.Linear(atac_dim, hidden_dim)
+        self.sequence_norm = nn.LayerNorm(hidden_dim)
+        self.atac_norm = nn.LayerNorm(hidden_dim)
+        self.context_proj = nn.Linear(2 * hidden_dim, hidden_dim)
+        self.context_norm = nn.LayerNorm(hidden_dim)
+        self.position_encoding = SinusoidalPositionalEncoding(hidden_dim, seq_len) if use_positional_encoding else None
+        self.cross = CrossHyenaLayer(hidden_dim, seq_len, long_mixer="conv", filter_len=post_filter_len)
+        self.cross_to_post = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.LayerNorm(hidden_dim),
+        )
+        self.post_hyena = HyenaLayer(hidden_dim, seq_len)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.head = nn.Linear(hidden_dim, 1)
+
+    def forward(self, m5c_track: torch.Tensor, sequence_track: torch.Tensor, atac_track: torch.Tensor) -> torch.Tensor:
+        query = self.query_proj(m5c_track)
+        sequence_hidden = self.sequence_norm(self.sequence_proj(sequence_track))
+        atac_hidden = self.atac_norm(self.atac_proj(atac_track))
+        context = self.context_norm(self.context_proj(torch.cat([sequence_hidden, atac_hidden], dim=-1)))
+        if self.position_encoding is not None:
+            query = self.position_encoding(query)
+            context = self.position_encoding(context)
+        hidden = self.cross(query, context)
+        hidden = hidden + self.cross_to_post(hidden)
+        hidden = self.post_hyena(hidden)
+        hidden = self.norm(hidden)
+        return self.head(hidden)
+
+
+class HyenaResidualBranch(nn.Module):
+    def __init__(self, hidden_dim: int, seq_len: int, filter_len: int, long_mixer: str):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.hyena = HyenaLayer(hidden_dim, seq_len, filter_len=filter_len, long_mixer=long_mixer)
+        self.gate = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        branch_input = self.norm(hidden)
+        branch_output = self.hyena(branch_input)
+        return hidden + self.gate(branch_output)
+
+
+class MultiScaleHyenaBlock(nn.Module):
+    def __init__(self, hidden_dim: int, seq_len: int, include_short: bool = True):
+        super().__init__()
+        short_len, mid_len, long_len = _resolve_hyena_filter_lengths(seq_len)
+        self.short_branch = (
+            HyenaResidualBranch(hidden_dim, seq_len, filter_len=short_len, long_mixer="conv") if include_short else None
+        )
+        self.mid_branch = HyenaResidualBranch(hidden_dim, seq_len, filter_len=mid_len, long_mixer="hyena")
+        self.long_branch = HyenaResidualBranch(hidden_dim, seq_len, filter_len=long_len, long_mixer="hyena")
+        self.output_norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        if self.short_branch is not None:
+            hidden = self.short_branch(hidden)
+        hidden = self.mid_branch(hidden)
+        hidden = self.long_branch(hidden)
+        return self.output_norm(hidden)
+
+
+class CrossHyenaResidualBranch(nn.Module):
+    def __init__(self, hidden_dim: int, seq_len: int, filter_len: int, long_mixer: str):
+        super().__init__()
+        self.query_norm = nn.LayerNorm(hidden_dim)
+        self.context_norm = nn.LayerNorm(hidden_dim)
+        self.cross = CrossHyenaLayer(hidden_dim, seq_len, filter_len=filter_len, long_mixer=long_mixer)
+        self.gate = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+    def forward(self, hidden: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        branch_output = self.cross(self.query_norm(hidden), self.context_norm(context))
+        return hidden + self.gate(branch_output)
+
+
+class CrossAttentionResidualBranch(nn.Module):
+    def __init__(self, hidden_dim: int, num_heads: int = 4):
+        super().__init__()
+        self.query_norm = nn.LayerNorm(hidden_dim)
+        self.context_norm = nn.LayerNorm(hidden_dim)
+        self.attention = nn.MultiheadAttention(hidden_dim, num_heads=num_heads, batch_first=True)
+        self.gate = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+    def forward(self, hidden: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        normalized_hidden = self.query_norm(hidden)
+        normalized_context = self.context_norm(context)
+        branch_output, _ = self.attention(normalized_hidden, normalized_context, normalized_context, need_weights=False)
+        return hidden + self.gate(branch_output)
+
+
+class StripedHyenaBlock(nn.Module):
+    def __init__(self, hidden_dim: int, seq_len: int, fusion_type: str = "cross_hyena"):
+        super().__init__()
+        short_len, _, _ = _resolve_hyena_filter_lengths(seq_len)
+        if fusion_type == "cross_attention":
+            self.cross_short = CrossAttentionResidualBranch(hidden_dim)
+        elif fusion_type == "cross_hyena":
+            self.cross_short = CrossHyenaResidualBranch(hidden_dim, seq_len, filter_len=short_len, long_mixer="conv")
+        else:
+            raise ValueError(f"Unknown fusion_type: {fusion_type}")
+        self.hyena_block_1 = MultiScaleHyenaBlock(hidden_dim, seq_len, include_short=True)
+        self.hyena_block_2 = MultiScaleHyenaBlock(hidden_dim, seq_len, include_short=False)
+        self.output_norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, hidden: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        hidden = self.cross_short(hidden, context)
+        hidden = self.hyena_block_1(hidden)
+        hidden = self.hyena_block_2(hidden)
+        return self.output_norm(hidden)
+
+
+class M5CQuerySequenceAtacCrossHyenaRegressorModelB(nn.Module):
+    def __init__(
+        self,
+        seq_len: int,
+        query_dim: int = 1,
+        sequence_dim: int = 4,
+        atac_dim: int = 1,
+        hidden_dim: int = 64,
+        use_positional_encoding: bool = False,
+        num_blocks: int = 2,
+        fusion_type: str = "cross_hyena",
+    ):
+        super().__init__()
+        self.query_proj = nn.Linear(query_dim, hidden_dim)
+        self.sequence_proj = nn.Linear(sequence_dim, hidden_dim)
+        self.atac_proj = nn.Linear(atac_dim, hidden_dim)
+        self.query_norm = nn.LayerNorm(hidden_dim)
+        self.sequence_norm = nn.LayerNorm(hidden_dim)
+        self.atac_norm = nn.LayerNorm(hidden_dim)
+        self.context_proj = nn.Linear(2 * hidden_dim, hidden_dim)
+        self.context_norm = nn.LayerNorm(hidden_dim)
+        self.position_encoding = SinusoidalPositionalEncoding(hidden_dim, seq_len) if use_positional_encoding else None
+        self.blocks = nn.ModuleList([StripedHyenaBlock(hidden_dim, seq_len, fusion_type=fusion_type) for _ in range(num_blocks)])
+        self.final_norm = nn.LayerNorm(hidden_dim)
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, m5c_track: torch.Tensor, sequence_track: torch.Tensor, atac_track: torch.Tensor) -> torch.Tensor:
+        hidden = self.query_norm(self.query_proj(m5c_track))
+        sequence_hidden = self.sequence_norm(self.sequence_proj(sequence_track))
+        atac_hidden = self.atac_norm(self.atac_proj(atac_track))
+        context = self.context_norm(self.context_proj(torch.cat([sequence_hidden, atac_hidden], dim=-1)))
+        if self.position_encoding is not None:
+            hidden = self.position_encoding(hidden)
+            context = self.position_encoding(context)
+        for block in self.blocks:
+            hidden = block(hidden, context)
+        return self.head(self.final_norm(hidden))
 
 
 class MinimalHyenaRegressor(nn.Module):
