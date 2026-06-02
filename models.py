@@ -242,51 +242,6 @@ class MinimalCrossHyenaRegressor(nn.Module):
         return out
 
 
-class M5CQuerySequenceAtacCrossHyenaRegressor(nn.Module):
-    def __init__(
-        self,
-        seq_len: int,
-        query_dim: int = 1,
-        sequence_dim: int = 4,
-        atac_dim: int = 1,
-        hidden_dim: int = 64,
-        post_filter_len: int | None = None,
-        use_positional_encoding: bool = False,
-    ):
-        super().__init__()
-        self.query_proj = nn.Linear(query_dim, hidden_dim)
-        self.sequence_proj = nn.Linear(sequence_dim, hidden_dim)
-        self.atac_proj = nn.Linear(atac_dim, hidden_dim)
-        self.sequence_norm = nn.LayerNorm(hidden_dim)
-        self.atac_norm = nn.LayerNorm(hidden_dim)
-        self.context_proj = nn.Linear(2 * hidden_dim, hidden_dim)
-        self.context_norm = nn.LayerNorm(hidden_dim)
-        self.position_encoding = SinusoidalPositionalEncoding(hidden_dim, seq_len) if use_positional_encoding else None
-        self.cross = CrossHyenaLayer(hidden_dim, seq_len, long_mixer="conv", filter_len=post_filter_len)
-        self.cross_to_post = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.LayerNorm(hidden_dim),
-        )
-        self.post_hyena = HyenaLayer(hidden_dim, seq_len)
-        self.norm = nn.LayerNorm(hidden_dim)
-        self.head = nn.Linear(hidden_dim, 1)
-
-    def forward(self, m5c_track: torch.Tensor, sequence_track: torch.Tensor, atac_track: torch.Tensor) -> torch.Tensor:
-        query = self.query_proj(m5c_track)
-        sequence_hidden = self.sequence_norm(self.sequence_proj(sequence_track))
-        atac_hidden = self.atac_norm(self.atac_proj(atac_track))
-        context = self.context_norm(self.context_proj(torch.cat([sequence_hidden, atac_hidden], dim=-1)))
-        if self.position_encoding is not None:
-            query = self.position_encoding(query)
-            context = self.position_encoding(context)
-        hidden = self.cross(query, context)
-        hidden = hidden + self.cross_to_post(hidden)
-        hidden = self.post_hyena(hidden)
-        hidden = self.norm(hidden)
-        return self.head(hidden)
-
-
 class MinimalHyenaRegressor(nn.Module):
     def __init__(
         self,
