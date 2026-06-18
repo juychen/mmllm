@@ -4,7 +4,8 @@ set -euo pipefail
 source /home/junyichen/anaconda3/etc/profile.d/conda.sh
 conda activate snapatac2
 
-INPUT_DIR=/data1st2/hannan_25/data/Nanopore_processV1/nanopore_06_distribution
+#INPUT_DIR=/data1st2/hannan_25/data/Nanopore_processV1/nanopore_06_distribution
+INPUT_DIR=/data1st2/hannan_25/data/Nanopore_processV1/nanopore_06_distribution/bigwig
 OUTPUT_DIR=/data2st1/junyi/output/llm0401/processed_meth
 
 mkdir -p "$OUTPUT_DIR"
