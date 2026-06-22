@@ -486,72 +486,75 @@ class MaskedTrackPretrainingModelB(nn.Module):
         use_positional_encoding: bool = False,
         num_blocks: int = 4,
         fusion_type: str = "cross_hyena",
+        num_context_tracks: int = 2,
     ):
         super().__init__()
+        num_heads = 1 + num_context_tracks  # query (5mC) + each context track
 
-        # Query branch: 5mC (masked) — mirrors Model B's query_proj
+        # Query branch: 5mC (masked)
         self.query_proj = nn.Linear(query_dim, hidden_dim)
         self.query_norm = nn.LayerNorm(hidden_dim)
 
-        # Context track projections: 5hmC, ATAC — each through its own proj like Model B
+        # Context track projections — one per context track
         self.context_track_projs = nn.ModuleList([
-            nn.Linear(context_track_dim, hidden_dim) for _ in range(2)
+            nn.Linear(context_track_dim, hidden_dim) for _ in range(num_context_tracks)
         ])
         self.context_track_norms = nn.ModuleList([
-            nn.LayerNorm(hidden_dim) for _ in range(2)
+            nn.LayerNorm(hidden_dim) for _ in range(num_context_tracks)
         ])
 
-        # Sequence projection — exactly like Model B
+        # Sequence projection
         self.sequence_proj = nn.Linear(sequence_dim, hidden_dim)
         self.sequence_norm = nn.LayerNorm(hidden_dim)
 
-        # Context fusion — exactly like Model B: seq_hidden + all context tracks → context
-        context_concat_dim = hidden_dim * (1 + 2)  # sequence + hmc + atac
+        # Context fusion: seq_hidden + all context track hiddens
+        context_concat_dim = hidden_dim * (1 + num_context_tracks)
         self.context_proj = nn.Linear(context_concat_dim, hidden_dim)
         self.context_norm = nn.LayerNorm(hidden_dim)
 
         # Positional encoding
         self.position_encoding = SinusoidalPositionalEncoding(hidden_dim, seq_len) if use_positional_encoding else None
 
-        # StripedHyenaBlock blocks — identical to Model B
+        # StripedHyenaBlock blocks
         self.blocks = nn.ModuleList([
             StripedHyenaBlock(hidden_dim, seq_len, fusion_type=fusion_type) for _ in range(num_blocks)
         ])
 
         self.final_norm = nn.LayerNorm(hidden_dim)
 
-        # Three independent output heads (5mC, 5hmC, ATAC)
+        # Independent output heads: one per track (query + context tracks)
         self.heads = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.SiLU(),
                 nn.Linear(hidden_dim, 1),
-            ) for _ in range(3)
+            ) for _ in range(num_heads)
         ])
 
     def forward(self, track_tensors: list[torch.Tensor], sequence_tensor: torch.Tensor) -> list[torch.Tensor]:
         """
         Args:
-            track_tensors: [m5c_masked, h5mc_masked, atac_masked], each (N, seq_len, 1)
+            track_tensors: [query_track (5mC), *context_tracks], each (N, seq_len, 1)
             sequence_tensor: (N, seq_len, 4) one-hot DNA
         Returns:
-            [pred_5mc, pred_5hmc, pred_atac], each (N, seq_len, 1)
+            [pred_query, pred_context_1, ...], each (N, seq_len, 1)
         """
-        m5c, h5mc, atac = track_tensors
+        query_track = track_tensors[0]
+        context_tracks = track_tensors[1:]
 
-        # Query: 5mC (mirrors Model B forward)
-        hidden = self.query_norm(self.query_proj(m5c))
+        # Query: 5mC
+        hidden = self.query_norm(self.query_proj(query_track))
 
-        # Context tracks: 5hmC, ATAC — each through independent projection + norm
+        # Context tracks — each through independent projection + norm
         context_track_hidden = [
             norm(proj(track))
-            for norm, proj, track in zip(self.context_track_norms, self.context_track_projs, [h5mc, atac])
+            for norm, proj, track in zip(self.context_track_norms, self.context_track_projs, context_tracks)
         ]
 
-        # Sequence projection — mirrors Model B
+        # Sequence projection
         sequence_hidden = self.sequence_norm(self.sequence_proj(sequence_tensor))
 
-        # Context fusion: concat(sequence_hidden, h5mc_hidden, atac_hidden) → proj → norm
+        # Context fusion: concat(sequence_hidden, *context_track_hidden) → proj → norm
         context = self.context_norm(self.context_proj(torch.cat([sequence_hidden, *context_track_hidden], dim=-1)))
 
         # Positional encoding
@@ -559,7 +562,7 @@ class MaskedTrackPretrainingModelB(nn.Module):
             hidden = self.position_encoding(hidden)
             context = self.position_encoding(context)
 
-        # StripedHyenaBlock blocks — identical to Model B
+        # StripedHyenaBlock blocks
         for block in self.blocks:
             hidden = block(hidden, context)
 

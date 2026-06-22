@@ -20,7 +20,7 @@ from models import MaskedTrackPretrainingModelB
 from utils import set_random_seed
 
 
-TRACK_NAMES = ["5mc", "5hmc", "atac"]
+DEFAULT_TRACK_NAMES = ["5mc", "5hmc"]
 
 
 def masked_mse_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -105,7 +105,10 @@ def prepare_pretraining_data(
     mcg_tracks,
     hmcg_tracks,
     atac_tracks,
+    track_names: list[str] | None = None,
 ) -> PreparedPretrainingData:
+    if track_names is None:
+        track_names = DEFAULT_TRACK_NAMES
     if not mcg_tracks:
         raise ValueError("Pretraining requires 5mC tracks. Set --m5c-bedgraph to a valid path.")
 
@@ -115,9 +118,14 @@ def prepare_pretraining_data(
 
     track_arrays = get_track_arrays(args, mcg_tracks, hmcg_tracks, atac_tracks, usable_dmrs, seq_len)
     base_ids_tensor, sequence_tensor = build_sequence_tensor(seqs, usable_dmrs, seq_len)
-    m5c_tensor = tensorize_track_modality("5mc", track_arrays, args)
-    h5mc_tensor = tensorize_track_modality("5hmc", track_arrays, args)
-    atac_tensor = tensorize_track_modality("atac", track_arrays, args)
+
+    # Build all track tensors and select only the requested ones
+    all_track_map = {
+        "5mc": tensorize_track_modality("5mc", track_arrays, args),
+        "5hmc": tensorize_track_modality("5hmc", track_arrays, args),
+        "atac": tensorize_track_modality("atac", track_arrays, args),
+    }
+    track_tensors = [all_track_map[name] for name in track_names]
 
     split_regions_df = df_dmr.iloc[:usable_dmrs].copy().reset_index().rename(columns={"index": "original_idx"})
     split_regions_df["chr"] = split_regions_df["chr"].astype(str)
@@ -133,16 +141,12 @@ def prepare_pretraining_data(
     val_idx = torch.from_numpy(np.flatnonzero(~train_mask)).long()
 
     train_dataset = torch.utils.data.TensorDataset(
-        m5c_tensor[train_idx],
-        h5mc_tensor[train_idx],
-        atac_tensor[train_idx],
+        *[t[train_idx] for t in track_tensors],
         sequence_tensor[train_idx],
         base_ids_tensor[train_idx],
     )
     val_dataset = torch.utils.data.TensorDataset(
-        m5c_tensor[val_idx],
-        h5mc_tensor[val_idx],
-        atac_tensor[val_idx],
+        *[t[val_idx] for t in track_tensors],
         sequence_tensor[val_idx],
         base_ids_tensor[val_idx],
     )
@@ -158,9 +162,9 @@ def prepare_pretraining_data(
     )
 
 
-def sample_track_masks(base_ids_batch: torch.Tensor, mask_fraction: float) -> list[torch.Tensor]:
+def sample_track_masks(base_ids_batch: torch.Tensor, mask_fraction: float, num_tracks: int) -> list[torch.Tensor]:
     shared_mask = generate_pretraining_cpg_mask(base_ids_batch, mask_fraction=mask_fraction, seed=None)
-    return [shared_mask.clone() for _ in TRACK_NAMES]
+    return [shared_mask.clone() for _ in range(num_tracks)]
 
 
 def apply_masks_to_tracks(track_tensors: list[torch.Tensor], mask_tensors: list[torch.Tensor]) -> list[torch.Tensor]:
@@ -171,49 +175,85 @@ def compute_multitrack_masked_loss(
     preds: list[torch.Tensor],
     targets: list[torch.Tensor],
     masks: list[torch.Tensor],
+    track_names: list[str],
 ) -> tuple[torch.Tensor, dict[str, float]]:
     losses = {}
     total_loss = 0.0
-    for name, pred, target, mask in zip(TRACK_NAMES, preds, targets, masks):
+    for name, pred, target, mask in zip(track_names, preds, targets, masks):
         loss = masked_mse_loss(pred, target, mask)
         losses[name] = float(loss.detach().cpu().item())
         total_loss = total_loss + loss
-    total_loss = total_loss / len(TRACK_NAMES)
+    total_loss = total_loss / len(track_names)
     losses["total"] = float(total_loss.detach().cpu().item())
     return total_loss, losses
 
 
-def evaluate(model: nn.Module, loader, device: torch.device, mask_fraction: float) -> dict[str, float]:
+def evaluate(model: nn.Module, loader, device: torch.device, mask_fraction: float, track_names: list[str]) -> dict[str, float]:
     model.eval()
-    track_loss_sums = {name: 0.0 for name in TRACK_NAMES}
+    num_tracks = len(track_names)
+    track_loss_sums = {name: 0.0 for name in track_names}
     total_loss_sum = 0.0
     seen = 0
+    all_preds = {name: [] for name in track_names}
+    all_targets = {name: [] for name in track_names}
+    all_masks = {name: [] for name in track_names}
 
     with torch.no_grad():
-        for m5c_batch, h5mc_batch, atac_batch, sequence_batch, base_ids_batch in loader:
-            m5c_batch = m5c_batch.to(device)
-            h5mc_batch = h5mc_batch.to(device)
-            atac_batch = atac_batch.to(device)
-            sequence_batch = sequence_batch.to(device)
+        for batch in loader:
+            track_batches = [t.to(device) for t in batch[:num_tracks]]
+            sequence_batch = batch[num_tracks].to(device)
+            base_ids_batch = batch[num_tracks + 1]
 
-            masks = sample_track_masks(base_ids_batch, mask_fraction)
+            masks = sample_track_masks(base_ids_batch, mask_fraction, num_tracks)
             masks = [mask.to(device) for mask in masks]
 
-            original_tracks = [m5c_batch, h5mc_batch, atac_batch]
+            original_tracks = track_batches
             masked_tracks = apply_masks_to_tracks(original_tracks, masks)
             preds = model(masked_tracks, sequence_batch)
 
-            total_loss, losses = compute_multitrack_masked_loss(preds, original_tracks, masks)
+            total_loss, losses = compute_multitrack_masked_loss(preds, original_tracks, masks, track_names)
 
-            batch_size = m5c_batch.size(0)
+            batch_size = track_batches[0].size(0)
             seen += batch_size
             total_loss_sum += float(total_loss.item()) * batch_size
-            for name in TRACK_NAMES:
+            for name in track_names:
                 track_loss_sums[name] += losses[name] * batch_size
 
+            for name, pred, target, mask in zip(track_names, preds, original_tracks, masks):
+                all_preds[name].append(pred.detach().cpu())
+                all_targets[name].append(target.detach().cpu())
+                all_masks[name].append(mask.detach().cpu())
+
     denom = max(seen, 1)
-    result = {f"val_{name}_loss": track_loss_sums[name] / denom for name in TRACK_NAMES}
+    result = {f"val_{name}_loss": track_loss_sums[name] / denom for name in track_names}
     result["val_total_loss"] = total_loss_sum / denom
+
+    # Compute per-track R² and Pearson r over the entire validation set
+    for name in track_names:
+        pred_cat = torch.cat(all_preds[name], dim=0)
+        target_cat = torch.cat(all_targets[name], dim=0)
+        mask_cat = torch.cat(all_masks[name], dim=0)
+        mask_bool = mask_cat.bool()
+        masked_pred = pred_cat[mask_bool]
+        masked_target = target_cat[mask_bool]
+
+        if masked_pred.numel() < 2:
+            result[f"val_{name}_r2"] = float("nan")
+            result[f"val_{name}_pearsonr"] = float("nan")
+            continue
+
+        # R²
+        ss_res = ((masked_target - masked_pred) ** 2).sum()
+        target_mean = masked_target.mean()
+        ss_tot = ((masked_target - target_mean) ** 2).sum().clamp_min(1e-12)
+        result[f"val_{name}_r2"] = float((1.0 - ss_res / ss_tot).item())
+
+        # Pearson r
+        centered_target = masked_target - masked_target.mean()
+        centered_pred = masked_pred - masked_pred.mean()
+        denom_pearson = (centered_target.pow(2).sum() * centered_pred.pow(2).sum()).sqrt().clamp_min(1e-12)
+        result[f"val_{name}_pearsonr"] = float(((centered_target * centered_pred).sum() / denom_pearson).item())
+
     return result
 
 
@@ -225,20 +265,25 @@ class ExperimentResult:
     non_overlap_groups: int
     best_epoch: int
     final_lr: float
+    reconstruct_tracks: list[str]
     best_val_total_loss: float
-    best_val_5mc_loss: float
-    best_val_5hmc_loss: float
-    best_val_atac_loss: float
+    best_val_track_losses: dict[str, float]
+    best_val_r2: dict[str, float]
+    best_val_pearsonr: dict[str, float]
     final_val_total_loss: float
-    final_val_5mc_loss: float
-    final_val_5hmc_loss: float
-    final_val_atac_loss: float
+    final_val_track_losses: dict[str, float]
+    final_val_r2: dict[str, float]
+    final_val_pearsonr: dict[str, float]
     checkpoint_paths: dict
 
 
 def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks) -> ExperimentResult:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    prepared = prepare_pretraining_data(num_dmrs, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks)
+    track_names = args.reconstruct_tracks
+    num_tracks = len(track_names)
+    num_context_tracks = num_tracks - 1
+
+    prepared = prepare_pretraining_data(num_dmrs, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks, track_names)
 
     model = MaskedTrackPretrainingModelB(
         seq_len=prepared.seq_len,
@@ -246,6 +291,7 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
         use_positional_encoding=args.use_positional_encoding,
         num_blocks=args.num_blocks,
         fusion_type=args.fusion_type,
+        num_context_tracks=num_context_tracks,
     ).to(device)
 
     optimizer = build_optimizer(model, args)
@@ -254,9 +300,9 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
     best_epoch = 0
     best_metrics = {
         "val_total_loss": float("inf"),
-        "val_5mc_loss": float("inf"),
-        "val_5hmc_loss": float("inf"),
-        "val_atac_loss": float("inf"),
+        **{f"val_{name}_loss": float("inf") for name in track_names},
+        **{f"val_{name}_r2": float("-inf") for name in track_names},
+        **{f"val_{name}_pearsonr": float("-inf") for name in track_names},
     }
     best_state = None
     last_epoch = 0
@@ -270,41 +316,38 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
         last_epoch = epoch
         model.train()
 
-        train_track_loss_sums = {name: 0.0 for name in TRACK_NAMES}
+        train_track_loss_sums = {name: 0.0 for name in track_names}
         train_total_loss_sum = 0.0
         seen = 0
 
-        for m5c_batch, h5mc_batch, atac_batch, sequence_batch, base_ids_batch in prepared.train_loader:
-            m5c_batch = m5c_batch.to(device)
-            h5mc_batch = h5mc_batch.to(device)
-            atac_batch = atac_batch.to(device)
-            sequence_batch = sequence_batch.to(device)
+        for batch in prepared.train_loader:
+            track_batches = [t.to(device) for t in batch[:num_tracks]]
+            sequence_batch = batch[num_tracks].to(device)
+            base_ids_batch = batch[num_tracks + 1]
 
-            masks = sample_track_masks(base_ids_batch, args.mask_fraction)
+            masks = sample_track_masks(base_ids_batch, args.mask_fraction, num_tracks)
             masks = [mask.to(device) for mask in masks]
 
-            original_tracks = [m5c_batch, h5mc_batch, atac_batch]
+            original_tracks = track_batches
             masked_tracks = apply_masks_to_tracks(original_tracks, masks)
 
             optimizer.zero_grad()
             preds = model(masked_tracks, sequence_batch)
-            total_loss, losses = compute_multitrack_masked_loss(preds, original_tracks, masks)
+            total_loss, losses = compute_multitrack_masked_loss(preds, original_tracks, masks, track_names)
             total_loss.backward()
             optimizer.step()
 
-            batch_size = m5c_batch.size(0)
+            batch_size = track_batches[0].size(0)
             seen += batch_size
             train_total_loss_sum += float(total_loss.item()) * batch_size
-            for name in TRACK_NAMES:
+            for name in track_names:
                 train_track_loss_sums[name] += losses[name] * batch_size
 
         denom = max(seen, 1)
         train_total_loss = train_total_loss_sum / denom
-        train_5mc_loss = train_track_loss_sums["5mc"] / denom
-        train_5hmc_loss = train_track_loss_sums["5hmc"] / denom
-        train_atac_loss = train_track_loss_sums["atac"] / denom
+        train_track_losses = {name: train_track_loss_sums[name] / denom for name in track_names}
 
-        val_metrics = evaluate(model, prepared.val_loader, device, args.mask_fraction)
+        val_metrics = evaluate(model, prepared.val_loader, device, args.mask_fraction, track_names)
 
         if scheduler is not None:
             if args.scheduler == "plateau":
@@ -313,11 +356,14 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
                 scheduler.step()
 
         current_lr = optimizer.param_groups[0]["lr"]
+        track_detail = ", ".join(f"{n}={train_track_losses[n]:.4f}" for n in track_names)
+        val_track_detail = ", ".join(f"{n}={val_metrics[f'val_{n}_loss']:.4f}" for n in track_names)
+        val_r2_detail = ", ".join(f"{n}: R²={val_metrics[f'val_{n}_r2']:.4f} ρ={val_metrics[f'val_{n}_pearsonr']:.4f}" for n in track_names)
         print(
             f"[num_dmrs={prepared.usable_dmrs}] Epoch {epoch:02d} | "
-            f"train_total={train_total_loss:.4f} (5mC={train_5mc_loss:.4f}, 5hmC={train_5hmc_loss:.4f}, ATAC={train_atac_loss:.4f}) | "
-            f"val_total={val_metrics['val_total_loss']:.4f} (5mC={val_metrics['val_5mc_loss']:.4f}, "
-            f"5hmC={val_metrics['val_5hmc_loss']:.4f}, ATAC={val_metrics['val_atac_loss']:.4f}) | "
+            f"train_total={train_total_loss:.4f} ({track_detail}) | "
+            f"val_total={val_metrics['val_total_loss']:.4f} ({val_track_detail}) | "
+            f"{val_r2_detail} | "
             f"lr={current_lr:.6g}"
         )
 
@@ -325,20 +371,14 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
             best_metrics = val_metrics.copy()
             best_epoch = epoch
             best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+            checkpoint_metrics = {"train_total_loss": train_total_loss, **{f"train_{n}_loss": train_track_losses[n] for n in track_names}, **val_metrics, "is_best": True}
             save_checkpoint(
                 best_checkpoint_path,
                 model,
                 optimizer,
                 scheduler,
                 epoch,
-                {
-                    "train_total_loss": train_total_loss,
-                    "train_5mc_loss": train_5mc_loss,
-                    "train_5hmc_loss": train_5hmc_loss,
-                    "train_atac_loss": train_atac_loss,
-                    **val_metrics,
-                    "is_best": True,
-                },
+                checkpoint_metrics,
                 args,
                 prepared.usable_dmrs,
             )
@@ -348,7 +388,7 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
             if args.patience > 0 and patience_left <= 0:
                 break
 
-    final_val_metrics = evaluate(model, prepared.val_loader, device, args.mask_fraction)
+    final_val_metrics = evaluate(model, prepared.val_loader, device, args.mask_fraction, track_names)
 
     save_checkpoint(
         last_checkpoint_path,
@@ -366,7 +406,14 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
 
     if best_state is not None:
         model.load_state_dict(best_state)
-        final_val_metrics = evaluate(model, prepared.val_loader, device, args.mask_fraction)
+        final_val_metrics = evaluate(model, prepared.val_loader, device, args.mask_fraction, track_names)
+
+    best_track_losses = {name: float(best_metrics.get(f"val_{name}_loss", 0.0)) for name in track_names}
+    final_track_losses = {name: float(final_val_metrics.get(f"val_{name}_loss", 0.0)) for name in track_names}
+    best_track_r2 = {name: float(best_metrics.get(f"val_{name}_r2", float("nan"))) for name in track_names}
+    best_track_pearsonr = {name: float(best_metrics.get(f"val_{name}_pearsonr", float("nan"))) for name in track_names}
+    final_track_r2 = {name: float(final_val_metrics.get(f"val_{name}_r2", float("nan"))) for name in track_names}
+    final_track_pearsonr = {name: float(final_val_metrics.get(f"val_{name}_pearsonr", float("nan"))) for name in track_names}
 
     return ExperimentResult(
         num_dmrs=prepared.usable_dmrs,
@@ -375,14 +422,15 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
         non_overlap_groups=prepared.non_overlap_groups,
         best_epoch=best_epoch,
         final_lr=optimizer.param_groups[0]["lr"],
+        reconstruct_tracks=track_names,
         best_val_total_loss=best_metrics["val_total_loss"],
-        best_val_5mc_loss=best_metrics["val_5mc_loss"],
-        best_val_5hmc_loss=best_metrics["val_5hmc_loss"],
-        best_val_atac_loss=best_metrics["val_atac_loss"],
+        best_val_track_losses=best_track_losses,
+        best_val_r2=best_track_r2,
+        best_val_pearsonr=best_track_pearsonr,
         final_val_total_loss=final_val_metrics["val_total_loss"],
-        final_val_5mc_loss=final_val_metrics["val_5mc_loss"],
-        final_val_5hmc_loss=final_val_metrics["val_5hmc_loss"],
-        final_val_atac_loss=final_val_metrics["val_atac_loss"],
+        final_val_track_losses=final_track_losses,
+        final_val_r2=final_track_r2,
+        final_val_pearsonr=final_track_pearsonr,
         checkpoint_paths={
             "best": best_checkpoint_path,
             "last": last_checkpoint_path,
@@ -419,7 +467,7 @@ def subset_dataset_by_chromosome(df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tra
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Self-supervised masked pretraining with 15% CpG masking per track "
+            "Self-supervised masked pretraining with CpG masking per track "
             "(5mC, 5hmC, ATAC), reconstructing masked values."
         )
     )
@@ -439,6 +487,13 @@ def parse_args():
         "--atac-bw",
         nargs="+",
         default=["/data2st2/junyi/output/atac1112/tobiasbam/BULK/corrected/AMY_MC_track.bw"],
+    )
+    parser.add_argument(
+        "--reconstruct-tracks",
+        nargs="+",
+        choices=["5mc", "5hmc", "atac"],
+        default=DEFAULT_TRACK_NAMES,
+        help="Tracks to reconstruct. First track (5mC) is always the query. Default: 5mc 5hmc",
     )
     parser.add_argument("--sample-sizes", nargs="+", type=int, required=True)
     parser.add_argument("--chromosome", default=None)
@@ -486,6 +541,11 @@ def main():
 
     if not (0.0 < args.mask_fraction < 1.0):
         raise ValueError("--mask-fraction must be in (0, 1).")
+
+    if "5mc" not in args.reconstruct_tracks:
+        raise ValueError("--reconstruct-tracks must include '5mc' as the query track.")
+    if len(set(args.reconstruct_tracks)) != len(args.reconstruct_tracks):
+        raise ValueError("--reconstruct-tracks must not contain duplicates.")
 
     if args.chromosome is not None:
         args.chromosome = normalize_chromosome_label(args.chromosome)
