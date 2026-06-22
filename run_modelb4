@@ -1,0 +1,71 @@
+nohup: ignoring input
+============================================================
+Running experiment: AMY_MC
+Fusion type: cross_hyena
+Current time: 2026-06-03-16-07-04
+Log file: /data1st2/zhangyr/data/mmllm/modelb/modelb_blocks4/AMY_MC/2026-06-03-16-07-04_m5c_query_sequence_atac_crosshyena_modelb_cross_hyena.log
+============================================================
+Traceback (most recent call last):
+  File "/data1st2/zhangyr/code/mmllm/run_m5c_query_sequence_atac_crosshyena_experiments.py", line 635, in <module>
+    main()
+  File "/data1st2/zhangyr/code/mmllm/run_m5c_query_sequence_atac_crosshyena_experiments.py", line 625, in main
+    results.append(asdict(run_experiment(sample_size, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks)))
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data1st2/zhangyr/code/mmllm/run_m5c_query_sequence_atac_crosshyena_experiments.py", line 382, in run_experiment
+    pred = model(m5c_batch, sequence_batch, atac_batch)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/zhangyr/anaconda3/envs/evo2/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/zhangyr/anaconda3/envs/evo2/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data1st2/zhangyr/code/mmllm/models.py", line 429, in forward
+    hidden = block(hidden, context)
+             ^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/zhangyr/anaconda3/envs/evo2/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/zhangyr/anaconda3/envs/evo2/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data1st2/zhangyr/code/mmllm/models.py", line 386, in forward
+    hidden = self.hyena_block_2(hidden)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/zhangyr/anaconda3/envs/evo2/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/zhangyr/anaconda3/envs/evo2/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data1st2/zhangyr/code/mmllm/models.py", line 328, in forward
+    hidden = self.mid_branch(hidden)
+             ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/zhangyr/anaconda3/envs/evo2/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/zhangyr/anaconda3/envs/evo2/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data1st2/zhangyr/code/mmllm/models.py", line 310, in forward
+    branch_output = self.hyena(branch_input)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/zhangyr/anaconda3/envs/evo2/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/zhangyr/anaconda3/envs/evo2/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data1st2/zhangyr/code/mmllm/models.py", line 126, in forward
+    qkv = self.in_proj(x)
+          ^^^^^^^^^^^^^^^
+  File "/home/zhangyr/anaconda3/envs/evo2/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/zhangyr/anaconda3/envs/evo2/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/zhangyr/anaconda3/envs/evo2/lib/python3.12/site-packages/torch/nn/modules/linear.py", line 125, in forward
+    return F.linear(input, self.weight, self.bias)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 768.00 MiB. GPU 0 has a total capacity of 79.22 GiB of which 160.50 MiB is free. Process 2042034 has 58.72 GiB memory in use. Including non-PyTorch memory, this process has 20.31 GiB memory in use. Of the allocated memory 19.50 GiB is allocated by PyTorch, and 218.18 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
