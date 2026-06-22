@@ -21,6 +21,116 @@ from models import M5CQuerySequenceAtacCrossHyenaRegressor, M5CQuerySequenceAtac
 from utils import export_prediction_signals, plot_regression_predictions, set_random_seed
 
 
+def transfer_pretrained_weights(
+    model: M5CQuerySequenceAtacCrossHyenaRegressorModelB,
+    pretrained_path: str,
+    device: torch.device,
+) -> None:
+    """Transfer weights from MaskedTrackPretrainingModelB checkpoint to downstream model.
+
+    Mapping detail:
+      query_proj/query_norm        ← query_proj/query_norm
+      sequence_proj/sequence_norm  ← sequence_proj/sequence_norm
+      atac_proj/atac_norm          ← context_track_projs.1 / context_track_norms.1
+      context_proj                 ← context_proj (slice: drop middle 5hmC third)
+      context_norm                 ← context_norm
+      blocks.i.*                   ← blocks.i.* (first N blocks)
+      final_norm                   ← final_norm
+      head.*                       ← heads.1.* (5hmC prediction head)
+    """
+    checkpoint = torch.load(pretrained_path, map_location=device)
+    pretrained = checkpoint["model_state_dict"]
+    model_state = model.state_dict()
+
+    # Direct 1-to-1 mappings
+    direct_pairs = [
+        ("query_proj.weight", "query_proj.weight"),
+        ("query_proj.bias", "query_proj.bias"),
+        ("query_norm.weight", "query_norm.weight"),
+        ("query_norm.bias", "query_norm.bias"),
+        ("sequence_proj.weight", "sequence_proj.weight"),
+        ("sequence_proj.bias", "sequence_proj.bias"),
+        ("sequence_norm.weight", "sequence_norm.weight"),
+        ("sequence_norm.bias", "sequence_norm.bias"),
+        ("atac_proj.weight", "context_track_projs.1.weight"),
+        ("atac_proj.bias", "context_track_projs.1.bias"),
+        ("atac_norm.weight", "context_track_norms.1.weight"),
+        ("atac_norm.bias", "context_track_norms.1.bias"),
+        ("context_norm.weight", "context_norm.weight"),
+        ("context_norm.bias", "context_norm.bias"),
+        ("final_norm.weight", "final_norm.weight"),
+        ("final_norm.bias", "final_norm.bias"),
+        ("head.0.weight", "heads.1.0.weight"),
+        ("head.0.bias", "heads.1.0.bias"),
+        ("head.1.weight", "heads.1.1.weight"),
+        ("head.1.bias", "heads.1.1.bias"),
+        ("head.2.weight", "heads.1.2.weight"),
+        ("head.2.bias", "heads.1.2.bias"),
+    ]
+
+    loaded_keys = set()
+    for dst_key, src_key in direct_pairs:
+        if src_key in pretrained and dst_key in model_state:
+            model_state[dst_key].copy_(pretrained[src_key])
+            loaded_keys.add(src_key)
+
+    # context_proj.weight: pretrain has (hidden, (1+num_context_tracks)*hidden)
+    #   num_context_tracks=1: [seq | 5hmc]            → (hidden, 2*hidden) → copy directly
+    #   num_context_tracks=2: [seq | 5hmc | atac]     → (hidden, 3*hidden) → drop middle 5hmc
+    # downstream needs (hidden, 2*hidden) = [seq | atac]
+    if "context_proj.weight" in pretrained and "context_proj.weight" in model_state:
+        pretrained_w = pretrained["context_proj.weight"]  # (hidden, pretrain_in_dim)
+        downstream_w = model_state["context_proj.weight"]  # (hidden, 2*hidden)
+        if pretrained_w.size(1) == downstream_w.size(1):
+            # Same input dimension — copy directly
+            model_state["context_proj.weight"].copy_(pretrained_w)
+        elif pretrained_w.size(1) == 3 * downstream_w.size(0):
+            # Pretrain has 3 parts: [seq | 5hmc | atac] — drop the middle 5hmc part
+            hidden_dim = downstream_w.size(0)
+            seq_part = pretrained_w[:, :hidden_dim]
+            atac_part = pretrained_w[:, 2 * hidden_dim:]  # skip 5hmc in the middle
+            model_state["context_proj.weight"].copy_(torch.cat([seq_part, atac_part], dim=1))
+        else:
+            print(
+                f"[transfer_pretrained_weights] WARNING: context_proj.weight shape mismatch "
+                f"pretrained={pretrained_w.shape}, downstream={downstream_w.shape}. Skipping."
+            )
+        loaded_keys.add("context_proj.weight")
+    if "context_proj.bias" in pretrained and "context_proj.bias" in model_state:
+        model_state["context_proj.bias"].copy_(pretrained["context_proj.bias"])
+        loaded_keys.add("context_proj.bias")
+
+    # Blocks: transfer as many as downstream has
+    def _count_blocks(state_dict: dict) -> int:
+        indices = set()
+        for k in state_dict:
+            parts = k.split(".")
+            if len(parts) >= 2 and parts[0] == "blocks" and parts[1].isdigit():
+                indices.add(int(parts[1]))
+        return max(indices) + 1 if indices else 0
+
+    num_down_blocks = _count_blocks(model_state)
+    num_pre_blocks = _count_blocks(pretrained)
+    num_to_transfer = min(num_down_blocks, num_pre_blocks)
+    for i in range(num_to_transfer):
+        for key in list(model_state.keys()):
+            if key.startswith(f"blocks.{i}."):
+                src_key = key  # same name since both use "blocks.N."
+                if src_key in pretrained:
+                    model_state[key].copy_(pretrained[src_key])
+                    loaded_keys.add(src_key)
+
+    # Position encoding (SinusoidalPositionalEncoding) — not state_dict params, skip
+
+    loaded_count = len(loaded_keys)
+    total_pretrained = len(pretrained)
+    print(
+        f"[transfer_pretrained_weights] Loaded {loaded_count}/{total_pretrained} keys "
+        f"from {Path(pretrained_path).name} (epoch {checkpoint.get('epoch', '?')}, "
+        f"val_total_loss={checkpoint.get('metrics', {}).get('val_total_loss', '?'):.4f})"
+    )
+
+
 def masked_mse_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     squared_error = (pred - target).pow(2)
     return (squared_error * mask).sum() / mask.sum().clamp_min(1.0)
@@ -353,6 +463,13 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
             post_filter_len=prepared.post_filter_len,
             use_positional_encoding=args.use_positional_encoding,
         ).to(device)
+<<<<<<< HEAD
+=======
+
+    if args.pretrained_checkpoint and args.model_name == "model_b":
+        transfer_pretrained_weights(model, args.pretrained_checkpoint, device)
+
+>>>>>>> origin/dev
     optimizer = build_optimizer(model, args)
     scheduler = build_scheduler(optimizer, args, args.num_epochs)
 
@@ -536,7 +653,11 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Run 5mC-query sequence+ATAC-context -> 5hmC experiments with M5CQuerySequenceAtacCrossHyenaRegressor."
     )
+<<<<<<< HEAD
     parser.add_argument("--dmr-csv", default="/data2st2/junyi/dmr_with_sequences.csv")
+=======
+    parser.add_argument("--dmr-csv", default="output/dmr_with_sequences.csv")
+>>>>>>> origin/dev
     parser.add_argument("--genome-fasta", default="/data2st1/junyi/ref/GRCm38.p6.genome.fa")
     parser.add_argument(
         "--m5c-bedgraph",
@@ -573,6 +694,10 @@ def parse_args():
     parser.add_argument("--scheduler-patience", type=int, default=2)
     parser.add_argument("--scheduler-t-max", type=int, default=0)
     parser.add_argument("--atac-scaling", choices=["none", "minmax"], default="minmax")
+<<<<<<< HEAD
+=======
+    parser.add_argument("--pretrained-checkpoint", default=None, help="Path to a MaskedTrackPretrainingModelB checkpoint (.pt) to initialize model_b weights.")
+>>>>>>> origin/dev
     parser.add_argument("--mask-mode", choices=["cpg_both", "cpg_forward", "all"], default="cpg_both")
     parser.add_argument("--augment-reverse-complement", action="store_true")
     parser.add_argument("--use-all-input-groups", action="store_true")

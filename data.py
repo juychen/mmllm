@@ -304,6 +304,35 @@ def reverse_complement_sequence_tensor(sequence_tensor: torch.Tensor) -> torch.T
     return torch.flip(complemented, dims=[1])
 
 
+def generate_pretraining_cpg_mask(
+    base_ids_tensor: torch.Tensor,
+    mask_fraction: float = 0.15,
+    seed: int | None = None,
+) -> torch.Tensor:
+    """
+    For each sample independently, find all CpG positions and randomly select
+    mask_fraction of them to be masked. Returns a binary mask of shape (N, seq_len, 1).
+    """
+    cpg_positions = find_cpg_candidate_positions(base_ids_tensor)  # (N, seq_len) bool
+    cpg_mask = torch.zeros_like(cpg_positions, dtype=torch.float32)
+
+    rng = np.random.RandomState(seed)
+    for i in range(cpg_positions.shape[0]):
+        cpg_indices = torch.nonzero(cpg_positions[i], as_tuple=False).squeeze(-1)
+        if cpg_indices.numel() == 0:
+            continue
+        num_mask = max(1, int(cpg_indices.numel() * mask_fraction))
+        selected = rng.choice(cpg_indices.numpy(), size=num_mask, replace=False)
+        cpg_mask[i, selected] = 1.0
+
+    return cpg_mask.unsqueeze(-1)  # (N, seq_len, 1)
+
+
+def apply_mask_to_track(track_tensor: torch.Tensor, mask_tensor: torch.Tensor) -> torch.Tensor:
+    """Zero out track values at masked positions. mask_tensor: 1.0 = masked."""
+    return track_tensor * (1.0 - mask_tensor)
+
+
 def build_context_tensor(context_modalities: list[str], sequence_tensor: torch.Tensor, track_tensors: dict[str, torch.Tensor]) -> torch.Tensor:
     context_parts = []
     for modality in context_modalities:
