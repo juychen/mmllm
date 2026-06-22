@@ -463,13 +463,10 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
             post_filter_len=prepared.post_filter_len,
             use_positional_encoding=args.use_positional_encoding,
         ).to(device)
-<<<<<<< HEAD
-=======
 
     if args.pretrained_checkpoint and args.model_name == "model_b":
         transfer_pretrained_weights(model, args.pretrained_checkpoint, device)
 
->>>>>>> origin/dev
     optimizer = build_optimizer(model, args)
     scheduler = build_scheduler(optimizer, args, args.num_epochs)
 
@@ -653,11 +650,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Run 5mC-query sequence+ATAC-context -> 5hmC experiments with M5CQuerySequenceAtacCrossHyenaRegressor."
     )
-<<<<<<< HEAD
-    parser.add_argument("--dmr-csv", default="/data2st2/junyi/dmr_with_sequences.csv")
-=======
     parser.add_argument("--dmr-csv", default="output/dmr_with_sequences.csv")
->>>>>>> origin/dev
     parser.add_argument("--genome-fasta", default="/data2st1/junyi/ref/GRCm38.p6.genome.fa")
     parser.add_argument(
         "--m5c-bedgraph",
@@ -694,10 +687,7 @@ def parse_args():
     parser.add_argument("--scheduler-patience", type=int, default=2)
     parser.add_argument("--scheduler-t-max", type=int, default=0)
     parser.add_argument("--atac-scaling", choices=["none", "minmax"], default="minmax")
-<<<<<<< HEAD
-=======
     parser.add_argument("--pretrained-checkpoint", default=None, help="Path to a MaskedTrackPretrainingModelB checkpoint (.pt) to initialize model_b weights.")
->>>>>>> origin/dev
     parser.add_argument("--mask-mode", choices=["cpg_both", "cpg_forward", "all"], default="cpg_both")
     parser.add_argument("--augment-reverse-complement", action="store_true")
     parser.add_argument("--use-all-input-groups", action="store_true")
