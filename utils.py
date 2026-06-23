@@ -1,10 +1,29 @@
 import random
+import subprocess
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
+
+
+def get_freest_gpu() -> int:
+    """Return the index of the GPU with the most free memory (MiB).
+
+    Falls back to GPU 0 if nvidia-smi is unavailable or fails.
+    """
+    try:
+        output = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,nounits,noheader"],
+            encoding="utf-8",
+        )
+        free_mems = [int(line.strip()) for line in output.strip().split("\n") if line.strip()]
+        if not free_mems:
+            return 0
+        return free_mems.index(max(free_mems))
+    except (FileNotFoundError, subprocess.CalledProcessError, ValueError):
+        return 0
 
 
 def ensure_parent_dir(file_path: str) -> None:

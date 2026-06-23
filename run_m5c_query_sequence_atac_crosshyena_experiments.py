@@ -18,7 +18,7 @@ from data import (
     tensorize_track_modality,
 )
 from models import M5CQuerySequenceAtacCrossHyenaRegressor, M5CQuerySequenceAtacCrossHyenaRegressorModelB
-from utils import export_prediction_signals, plot_regression_predictions, set_random_seed
+from utils import export_prediction_signals, get_freest_gpu, plot_regression_predictions, set_random_seed
 
 
 def transfer_pretrained_weights(
@@ -445,7 +445,7 @@ class ExperimentResult:
 
 
 def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks) -> ExperimentResult:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(f"cuda:{get_freest_gpu()}" if torch.cuda.is_available() else "cpu")
     prepared = prepare_sequence_atac_crosshyena_data(num_dmrs, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks)
 
     if args.model_name == "model_b":
@@ -467,8 +467,36 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
     if args.pretrained_checkpoint and args.model_name == "model_b":
         transfer_pretrained_weights(model, args.pretrained_checkpoint, device)
 
+    # Gradient checkpointing: override forward to call torch.checkpoint on each block
+    if args.gradient_checkpointing:
+        try:
+            import torch.utils.checkpoint as ckpt
+            orig_forward = model.forward
+            def checkpointed_forward(m5c_track, sequence_track, atac_track):
+                x = model.query_norm(model.query_proj(m5c_track))
+                seq_h = model.sequence_norm(model.sequence_proj(sequence_track))
+                atac_h = model.atac_norm(model.atac_proj(atac_track))
+                ctx = model.context_norm(model.context_proj(torch.cat([seq_h, atac_h], dim=-1)))
+                if model.position_encoding is not None:
+                    x = model.position_encoding(x)
+                    ctx = model.position_encoding(ctx)
+                for blk in model.blocks:
+                    x = ckpt.checkpoint(blk, x, ctx, use_reentrant=False)
+                return model.head(model.final_norm(x))
+            model.forward = checkpointed_forward
+        except (ImportError, AttributeError) as e:
+            print(f"Warning: gradient checkpointing not available ({e}), falling back.")
+            args.gradient_checkpointing = False
+
     optimizer = build_optimizer(model, args)
     scheduler = build_scheduler(optimizer, args, args.num_epochs)
+
+    # Mixed precision scaler
+    try:
+        scaler = torch.amp.GradScaler("cuda", enabled=args.amp)
+    except TypeError:
+        scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
+    amp_dtype = torch.bfloat16 if args.amp else torch.float32
 
     best_epoch = 0
     best_val_loss = float("inf")
@@ -485,6 +513,9 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
         model.train()
         running_loss = 0.0
         seen = 0
+        optimizer.zero_grad()
+        accum_count = 0
+
         for m5c_batch, sequence_batch, atac_batch, target_batch, mask_batch in prepared.train_loader:
             m5c_batch = m5c_batch.to(device)
             sequence_batch = sequence_batch.to(device)
@@ -492,15 +523,23 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
             target_batch = target_batch.to(device)
             mask_batch = mask_batch.to(device)
 
-            optimizer.zero_grad()
-            pred = model(m5c_batch, sequence_batch, atac_batch)
-            loss = masked_mse_loss(pred, target_batch, mask_batch)
-            loss.backward()
-            optimizer.step()
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=args.amp):
+                pred = model(m5c_batch, sequence_batch, atac_batch)
+                loss = masked_mse_loss(pred, target_batch, mask_batch)
+                # Scale loss for gradient accumulation
+                loss = loss / args.gradient_accumulation_steps
+
+            scaler.scale(loss).backward()
+            accum_count += 1
 
             batch_count = m5c_batch.size(0)
-            running_loss += loss.item() * batch_count
+            running_loss += loss.item() * batch_count * args.gradient_accumulation_steps
             seen += batch_count
+
+            if accum_count % args.gradient_accumulation_steps == 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
 
         train_loss = running_loss / max(seen, 1)
         val_loss, val_r2, val_pearsonr = evaluate(model, prepared.val_loader, device)
@@ -688,6 +727,9 @@ def parse_args():
     parser.add_argument("--scheduler-t-max", type=int, default=0)
     parser.add_argument("--atac-scaling", choices=["none", "minmax"], default="minmax")
     parser.add_argument("--pretrained-checkpoint", default=None, help="Path to a MaskedTrackPretrainingModelB checkpoint (.pt) to initialize model_b weights.")
+    parser.add_argument("--amp", action="store_true", help="Enable automatic mixed precision (bfloat16) training. Reduces memory ~2x, recommended for long sequences.")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1, help="Accumulate gradients over N mini-batches before each optimizer step. Use with --batch-size 4-8 for long sequences.")
+    parser.add_argument("--gradient-checkpointing", action="store_true", help="Enable gradient checkpointing to trade compute for memory. Recommended for very long sequences (8k+).")
     parser.add_argument("--mask-mode", choices=["cpg_both", "cpg_forward", "all"], default="cpg_both")
     parser.add_argument("--augment-reverse-complement", action="store_true")
     parser.add_argument("--use-all-input-groups", action="store_true")
