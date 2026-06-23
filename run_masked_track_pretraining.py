@@ -17,7 +17,7 @@ from data import (
     tensorize_track_modality,
 )
 from models import MaskedTrackPretrainingModelB
-from utils import set_random_seed
+from utils import get_freest_gpu, set_random_seed
 
 
 DEFAULT_TRACK_NAMES = ["5mc", "5hmc"]
@@ -278,7 +278,7 @@ class ExperimentResult:
 
 
 def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks) -> ExperimentResult:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(f"cuda:{get_freest_gpu()}" if torch.cuda.is_available() else "cpu")
     track_names = args.reconstruct_tracks
     num_tracks = len(track_names)
     num_context_tracks = num_tracks - 1
