@@ -467,16 +467,35 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
     if args.pretrained_checkpoint and args.model_name == "model_b":
         transfer_pretrained_weights(model, args.pretrained_checkpoint, device)
 
-    # Gradient checkpointing: wrap each block's forward to trade compute for memory
+    # Gradient checkpointing: override forward to call torch.checkpoint on each block
     if args.gradient_checkpointing:
-        for block in model.blocks:
-            block.forward = torch.utils.checkpoint.checkpoint(block.forward)
+        try:
+            import torch.utils.checkpoint as ckpt
+            orig_forward = model.forward
+            def checkpointed_forward(m5c_track, sequence_track, atac_track):
+                x = model.query_norm(model.query_proj(m5c_track))
+                seq_h = model.sequence_norm(model.sequence_proj(sequence_track))
+                atac_h = model.atac_norm(model.atac_proj(atac_track))
+                ctx = model.context_norm(model.context_proj(torch.cat([seq_h, atac_h], dim=-1)))
+                if model.position_encoding is not None:
+                    x = model.position_encoding(x)
+                    ctx = model.position_encoding(ctx)
+                for blk in model.blocks:
+                    x = ckpt.checkpoint(blk, x, ctx, use_reentrant=False)
+                return model.head(model.final_norm(x))
+            model.forward = checkpointed_forward
+        except (ImportError, AttributeError) as e:
+            print(f"Warning: gradient checkpointing not available ({e}), falling back.")
+            args.gradient_checkpointing = False
 
     optimizer = build_optimizer(model, args)
     scheduler = build_scheduler(optimizer, args, args.num_epochs)
 
     # Mixed precision scaler
-    scaler = torch.amp.GradScaler(enabled=args.amp)
+    try:
+        scaler = torch.amp.GradScaler("cuda", enabled=args.amp)
+    except TypeError:
+        scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
     amp_dtype = torch.bfloat16 if args.amp else torch.float32
 
     best_epoch = 0
@@ -504,7 +523,7 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
             target_batch = target_batch.to(device)
             mask_batch = mask_batch.to(device)
 
-            with torch.amp.autocast(dtype=amp_dtype, enabled=args.amp):
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=args.amp):
                 pred = model(m5c_batch, sequence_batch, atac_batch)
                 loss = masked_mse_loss(pred, target_batch, mask_batch)
                 # Scale loss for gradient accumulation
