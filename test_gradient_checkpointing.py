@@ -2,6 +2,7 @@
 import sys
 import torch
 import torch.nn as nn
+from utils import get_freest_gpu
 
 sys.path.insert(0, ".")
 
@@ -27,7 +28,7 @@ def run_one_forward(model, x1, x2, x3, target, use_amp=False):
 
 
 def test():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(f"cuda:{get_freest_gpu()}" if torch.cuda.is_available() else "cpu")
     print(f"Running on {device}")
 
     seq_len = 16384
@@ -78,6 +79,64 @@ def test():
     mem_ckpt = torch.cuda.max_memory_allocated(device)
     print(f"AMP+ckpt: peak = {mem_ckpt / 1e9:.2f} GB")
     print(f"Saved: {(mem_fp32 - mem_ckpt) / 1e9:.2f} GB ({(1 - mem_ckpt / mem_fp32) * 100:.1f}%)")
+
+    # ── Test D: Gradient correctness (AMP vs AMP+ckpt) ──
+    print("\n=== Gradient Correctness (AMP vs AMP+ckpt) ===")
+
+    def make_amp_model(use_checkpoint: bool):
+        m = build_model(seq_len).to(device)
+        if use_checkpoint:
+            import torch.utils.checkpoint as ckpt
+            orig_fwd = m.forward
+            def ckpt_fwd(m5c_track, sequence_track, atac_track):
+                x = m.query_norm(m.query_proj(m5c_track))
+                seq_h = m.sequence_norm(m.sequence_proj(sequence_track))
+                atac_h = m.atac_norm(m.atac_proj(atac_track))
+                ctx = m.context_norm(m.context_proj(torch.cat([seq_h, atac_h], dim=-1)))
+                if m.position_encoding is not None:
+                    x = m.position_encoding(x)
+                    ctx = m.position_encoding(ctx)
+                for blk in m.blocks:
+                    x = ckpt.checkpoint(blk, x, ctx, use_reentrant=False)
+                return m.head(m.final_norm(x))
+            m.forward = ckpt_fwd
+        return m
+
+    torch.manual_seed(0)
+    model_a = make_amp_model(use_checkpoint=False)
+    seed_state = model_a.state_dict()
+
+    torch.manual_seed(0)
+    model_b = make_amp_model(use_checkpoint=True)
+    model_b.load_state_dict(seed_state)
+
+    x1b = torch.randn(2, seq_len, 1, device=device)
+    x2b = torch.randn(2, seq_len, 4, device=device)
+    x3b = torch.randn(2, seq_len, 1, device=device)
+    targetb = torch.randn(2, seq_len, 1, device=device)
+
+    out_a = model_a(x1b, x2b, x3b)
+    loss_a = ((out_a - targetb) ** 2).mean()
+    loss_a.backward()
+    grad_a = {k: v.grad.clone() for k, v in model_a.named_parameters() if v.grad is not None}
+
+    out_b = model_b(x1b, x2b, x3b)
+    loss_b = ((out_b - targetb) ** 2).mean()
+    loss_b.backward()
+    grad_b = {k: v.grad.clone() for k, v in model_b.named_parameters() if v.grad is not None}
+
+    all_close = True
+    for key in grad_a:
+        if not torch.allclose(grad_a[key], grad_b[key], atol=1e-5):
+            print(f"  MISMATCH: {key}")
+            print(f"    max diff = {(grad_a[key] - grad_b[key]).abs().max().item():.2e}")
+            all_close = False
+
+    if all_close:
+        print("  All gradients match (atol=1e-5) ✅")
+        print(f"  Forward outputs match: {torch.allclose(out_a, out_b, atol=1e-5)}")
+    else:
+        print("  ❌ Gradients differ!")
 
 
 if __name__ == "__main__":

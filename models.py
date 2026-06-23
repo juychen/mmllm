@@ -111,6 +111,7 @@ class HyenaLayer(nn.Module):
     def _fft_long_conv(self, u: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
         length = u.shape[-1]
         fft_size = 2 * length
+        # FFT on CUDA doesn't support bf16; cast to fp32 only for the FFT op.
         u_f = torch.fft.rfft(u.float(), n=fft_size)
         h_f = torch.fft.rfft(h.float(), n=fft_size)
         y = torch.fft.irfft(u_f * h_f, n=fft_size)[..., :length]
@@ -187,6 +188,7 @@ class CrossHyenaLayer(nn.Module):
     def _fft_long_conv(self, u: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
         length = u.shape[-1]
         fft_size = 2 * length
+        # FFT on CUDA doesn't support bf16; cast to fp32 only for the FFT op.
         u_f = torch.fft.rfft(u.float(), n=fft_size)
         h_f = torch.fft.rfft(h.float(), n=fft_size)
         y = torch.fft.irfft(u_f * h_f, n=fft_size)[..., :length]

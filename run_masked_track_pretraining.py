@@ -188,8 +188,9 @@ def compute_multitrack_masked_loss(
     return total_loss, losses
 
 
-def evaluate(model: nn.Module, loader, device: torch.device, mask_fraction: float, track_names: list[str]) -> dict[str, float]:
+def evaluate(model: nn.Module, loader, device: torch.device, mask_fraction: float, track_names: list[str], amp: bool = False) -> dict[str, float]:
     model.eval()
+    amp_dtype = torch.bfloat16 if amp else torch.float32
     num_tracks = len(track_names)
     track_loss_sums = {name: 0.0 for name in track_names}
     total_loss_sum = 0.0
@@ -209,9 +210,10 @@ def evaluate(model: nn.Module, loader, device: torch.device, mask_fraction: floa
 
             original_tracks = track_batches
             masked_tracks = apply_masks_to_tracks(original_tracks, masks)
-            preds = model(masked_tracks, sequence_batch)
 
-            total_loss, losses = compute_multitrack_masked_loss(preds, original_tracks, masks, track_names)
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp):
+                preds = model(masked_tracks, sequence_batch)
+                total_loss, losses = compute_multitrack_masked_loss(preds, original_tracks, masks, track_names)
 
             batch_size = track_batches[0].size(0)
             seen += batch_size
@@ -294,8 +296,41 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
         num_context_tracks=num_context_tracks,
     ).to(device)
 
+    # Gradient checkpointing: wrap blocks to trade compute for memory
+    if args.gradient_checkpointing:
+        try:
+            import torch.utils.checkpoint as ckpt
+            orig_fwd = model.forward
+            def ckpt_forward(track_tensors, sequence_tensor):
+                x = model.query_norm(model.query_proj(track_tensors[0]))
+                context_tracks = track_tensors[1:]
+                ctx_hidden = [
+                    norm(proj(t))
+                    for norm, proj, t in zip(model.context_track_norms, model.context_track_projs, context_tracks)
+                ]
+                seq_h = model.sequence_norm(model.sequence_proj(sequence_tensor))
+                ctx = model.context_norm(model.context_proj(torch.cat([seq_h, *ctx_hidden], dim=-1)))
+                if model.position_encoding is not None:
+                    x = model.position_encoding(x)
+                    ctx = model.position_encoding(ctx)
+                for blk in model.blocks:
+                    x = ckpt.checkpoint(blk, x, ctx, use_reentrant=False)
+                hidden = model.final_norm(x)
+                return [head(hidden) for head in model.heads]
+            model.forward = ckpt_forward
+        except (ImportError, AttributeError) as e:
+            print(f"Warning: gradient checkpointing not available ({e}), falling back.")
+            args.gradient_checkpointing = False
+
     optimizer = build_optimizer(model, args)
     scheduler = build_scheduler(optimizer, args, args.num_epochs)
+
+    # Mixed precision scaler
+    try:
+        scaler = torch.amp.GradScaler("cuda", enabled=args.amp)
+    except TypeError:
+        scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
+    amp_dtype = torch.bfloat16 if args.amp else torch.float32
 
     best_epoch = 0
     best_metrics = {
@@ -319,6 +354,8 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
         train_track_loss_sums = {name: 0.0 for name in track_names}
         train_total_loss_sum = 0.0
         seen = 0
+        optimizer.zero_grad()
+        accum_count = 0
 
         for batch in prepared.train_loader:
             track_batches = [t.to(device) for t in batch[:num_tracks]]
@@ -331,23 +368,30 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
             original_tracks = track_batches
             masked_tracks = apply_masks_to_tracks(original_tracks, masks)
 
-            optimizer.zero_grad()
-            preds = model(masked_tracks, sequence_batch)
-            total_loss, losses = compute_multitrack_masked_loss(preds, original_tracks, masks, track_names)
-            total_loss.backward()
-            optimizer.step()
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=args.amp):
+                preds = model(masked_tracks, sequence_batch)
+                total_loss, losses = compute_multitrack_masked_loss(preds, original_tracks, masks, track_names)
+                total_loss = total_loss / args.gradient_accumulation_steps
+
+            scaler.scale(total_loss).backward()
+            accum_count += 1
 
             batch_size = track_batches[0].size(0)
             seen += batch_size
-            train_total_loss_sum += float(total_loss.item()) * batch_size
+            train_total_loss_sum += float(total_loss.item()) * batch_size * args.gradient_accumulation_steps
             for name in track_names:
                 train_track_loss_sums[name] += losses[name] * batch_size
+
+            if accum_count % args.gradient_accumulation_steps == 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
 
         denom = max(seen, 1)
         train_total_loss = train_total_loss_sum / denom
         train_track_losses = {name: train_track_loss_sums[name] / denom for name in track_names}
 
-        val_metrics = evaluate(model, prepared.val_loader, device, args.mask_fraction, track_names)
+        val_metrics = evaluate(model, prepared.val_loader, device, args.mask_fraction, track_names, amp=args.amp)
 
         if scheduler is not None:
             if args.scheduler == "plateau":
@@ -388,7 +432,7 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
             if args.patience > 0 and patience_left <= 0:
                 break
 
-    final_val_metrics = evaluate(model, prepared.val_loader, device, args.mask_fraction, track_names)
+    final_val_metrics = evaluate(model, prepared.val_loader, device, args.mask_fraction, track_names, amp=args.amp)
 
     save_checkpoint(
         last_checkpoint_path,
@@ -406,7 +450,7 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
 
     if best_state is not None:
         model.load_state_dict(best_state)
-        final_val_metrics = evaluate(model, prepared.val_loader, device, args.mask_fraction, track_names)
+        final_val_metrics = evaluate(model, prepared.val_loader, device, args.mask_fraction, track_names, amp=args.amp)
 
     best_track_losses = {name: float(best_metrics.get(f"val_{name}_loss", 0.0)) for name in track_names}
     final_track_losses = {name: float(final_val_metrics.get(f"val_{name}_loss", 0.0)) for name in track_names}
@@ -519,6 +563,9 @@ def parse_args():
     parser.add_argument("--scheduler-t-max", type=int, default=0)
     parser.add_argument("--atac-scaling", choices=["none", "minmax"], default="minmax")
     parser.add_argument("--mask-fraction", type=float, default=0.15)
+    parser.add_argument("--amp", action="store_true", help="Enable automatic mixed precision (bfloat16).")
+    parser.add_argument("--gradient-checkpointing", action="store_true", help="Enable gradient checkpointing to trade compute for memory.")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1, help="Accumulate gradients over N mini-batches before optimizer step.")
     parser.add_argument("--use-all-input-groups", action="store_true")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--output-csv", default="output/masked_track_pretraining_results.csv")
