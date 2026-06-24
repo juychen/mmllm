@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+#from flashfftconv import FlashFFTConv
 
 
 def _resolve_hyena_filter_lengths(seq_len: int) -> tuple[int, int, int]:
@@ -92,8 +93,10 @@ class HyenaLayer(nn.Module):
         if self.long_mixer == "hyena":
             self.filter = HyenaFilter(d_model, seq_len, filter_len=self.filter_len)
             self.long_conv = None
+            #self.flash_fft = FlashFFTConv(2 * seq_len, dtype=torch.float16)
         elif self.long_mixer == "conv":
             self.filter = None
+            self.flash_fft = None
             self.long_conv = nn.Conv1d(
                 d_model,
                 d_model,
@@ -107,7 +110,8 @@ class HyenaLayer(nn.Module):
 
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
         self.act = nn.SiLU()
-
+    # def _fft_long_conv(self, u: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+    #     return self.flash_fft(u.half().contiguous(), h.half().contiguous())
     def _fft_long_conv(self, u: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
         length = u.shape[-1]
         fft_size = 2 * length
@@ -169,8 +173,10 @@ class CrossHyenaLayer(nn.Module):
         if self.long_mixer == "hyena":
             self.filter = HyenaFilter(d_model, seq_len, filter_len=self.filter_len)
             self.long_conv = None
+            #self.flash_fft = FlashFFTConv(2 * seq_len, dtype=torch.float16)
         elif self.long_mixer == "conv":
             self.filter = None
+            #self.flash_fft = None
             self.long_conv = nn.Conv1d(
                 d_model,
                 d_model,
@@ -185,6 +191,9 @@ class CrossHyenaLayer(nn.Module):
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
         self.act = nn.SiLU()
 
+    # def _fft_long_conv(self, u: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+    #     return self.flash_fft(u.half().contiguous(), h.half().contiguous())
+    
     def _fft_long_conv(self, u: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
         length = u.shape[-1]
         fft_size = 2 * length
@@ -193,7 +202,7 @@ class CrossHyenaLayer(nn.Module):
         h_f = torch.fft.rfft(h.float(), n=fft_size)
         y = torch.fft.irfft(u_f * h_f, n=fft_size)[..., :length]
         return y.to(u.dtype)
-
+    
     def _apply_long_mixer(self, u: torch.Tensor) -> torch.Tensor:
         if self.long_mixer == "hyena":
             return self._fft_long_conv(u, self.filter())
