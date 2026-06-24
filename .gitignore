@@ -1,5 +1,5 @@
 output/
-.vscode/
+.vscode/*
 *.pyc
 __pycache__/
 output
@@ -37,4 +37,4 @@ Thumbs.db
 # Local env/config
 .env
 .env.*
-settings.json
+.vscode/settings.json
