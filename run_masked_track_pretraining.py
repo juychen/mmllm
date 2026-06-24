@@ -471,7 +471,7 @@ def parse_args():
             "(5mC, 5hmC, ATAC), reconstructing masked values."
         )
     )
-    parser.add_argument("--dmr-csv", default="output/dmr_with_sequences.csv")
+    parser.add_argument("--dmr-csv", default="/data2st2/junyi/dmr_with_sequences.csv")
     parser.add_argument("--genome-fasta", default="/data2st1/junyi/ref/GRCm38.p6.genome.fa")
     parser.add_argument(
         "--m5c-bedgraph",

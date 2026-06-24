@@ -32,9 +32,9 @@ fi
 run_experiment() {
   current_time=$(date "+%Y-%m-%d-%H-%M-%S")
   if [[ "$region" == "ALL" ]]; then
-    output_dir="/data1st2/zhangyr/data/mmllm/pretraining/target_length_2048"
+    output_dir="/data1st2/zhangyr/data/mmllm/pretraining/target_length_8192"
   else
-    output_dir="/data1st2/zhangyr/data/mmllm/pretraining/target_length_2048/${region}_${condition}"
+    output_dir="/data1st2/zhangyr/data/mmllm/pretraining/target_length_8192/${region}_${condition}"
   fi
 
   echo "[$region/${condition}] Current time: $current_time"
@@ -45,7 +45,7 @@ run_experiment() {
     --scheduler cosine
     --num-epochs 100
     --batch-size 64
-    --target-length 2048
+    --target-length 8192
     --scheduler-patience 10
     --timestamp "$current_time"
     --scheduler-min-lr 1e-5

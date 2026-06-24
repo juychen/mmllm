@@ -1,5 +1,5 @@
 #!/bin/bash
-cd /data2st2/junyi/output/atac1112/tobiasbam
+cd /data1st2/zhangyr/data/mmllm/data_processing32
 for folder in /data2st2/junyi/output/atac1112/tobiasbam/*; do
   echo $folder
   sample_name=$(basename $folder)
@@ -9,7 +9,10 @@ for folder in /data2st2/junyi/output/atac1112/tobiasbam/*; do
     if [[ $file == *.csv ]]; then
       celltype=$(basename $folder)
       echo "Processing celltype: $celltype"
-      out_bam="${file%.csv}.bam"
+      out_dir="/data1st2/zhangyr/data/mmllm/data_processing32"
+      mkdir -p "$out_dir"
+      csv_name=$(basename "$file" .csv)
+      out_bam="$out_dir/${sample_name}_${csv_name}.bam"
       echo "Output BAM: $out_bam"
       # if out_bam already exists, skip
       if [[ -f $out_bam ]]; then
