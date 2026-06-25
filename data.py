@@ -177,8 +177,31 @@ def reorder_regions_by_genomic_position(
     return ordered, reorder_payload(seqs), reorder_payload(mcg_tracks), reorder_payload(hmcg_tracks), reorder_payload(atac_tracks)
 
 
+def _read_dmr_file(path: str) -> pd.DataFrame:
+    """Read a DMR file in either CSV (with chr/start/end/length/center columns)
+    or BED format (chr, start, end as first three columns, plus optional name/score/strand).
+
+    For BED files, length and center are computed from start/end.
+    """
+    path_lower = path.lower()
+    is_bed = path_lower.endswith(".bed") or path_lower.endswith(".bed.gz")
+
+    if is_bed:
+        # BED: chr, start(0-based), end(1-based), [name, score, strand, ...]
+        bed_cols = ["chr", "start", "end"]
+        df = pd.read_csv(path, sep="\t", header=None, comment="#", usecols=[0, 1, 2], names=bed_cols)
+        # BED start is 0-based, end is 1-based exclusive → convert to 1-based inclusive
+        df["start"] = df["start"].astype(int) + 1
+        df["end"] = df["end"].astype(int)
+        df["length"] = df["end"] - df["start"] + 1
+        df["center"] = (df["start"] + df["end"]) // 2
+    else:
+        df = pd.read_csv(path)
+    return df
+
+
 def load_data(args):
-    df_dmr = pd.read_csv(args.dmr_csv)
+    df_dmr = _read_dmr_file(args.dmr_csv)
     target_length = args.target_length
     half_window = target_length // 2
     df_dmr["start_expanded"] = df_dmr["start"]

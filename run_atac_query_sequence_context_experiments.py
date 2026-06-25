@@ -351,7 +351,8 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Run non-overlap ATAC-query and sequence-context experiments for predicting 5hmC."
     )
-    parser.add_argument("--dmr-csv", default="output/dmr_with_sequences.csv")
+    parser.add_argument("--dmr-csv", default="output/dmr_with_sequences.csv",
+                        help="Path to DMR file. Supports CSV or BED (chr, start, end).")
     parser.add_argument("--genome-fasta", default="/data2st1/junyi/ref/GRCm38.p6.genome.fa")
     parser.add_argument("--hm5c-bedgraph", default="/data2st1/junyi/output/llm0401/processed_meth/MC_AMY.CG.h.bedGraph.gz")
     parser.add_argument("--atac-bw", default="/data2st2/junyi/output/atac1112/tobiasbam/BULK/corrected/AMY_MC_track.bw")

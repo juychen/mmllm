@@ -689,7 +689,8 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Run 5mC-query sequence+ATAC-context -> 5hmC experiments with M5CQuerySequenceAtacCrossHyenaRegressor."
     )
-    parser.add_argument("--dmr-csv", default="output/dmr_with_sequences.csv")
+    parser.add_argument("--dmr-csv", default="output/dmr_with_sequences.csv",
+                        help="Path to DMR file. Supports CSV (chr/start/end/length/center columns) or BED (chr, start, end as first three columns).")
     parser.add_argument("--genome-fasta", default="/data2st1/junyi/ref/GRCm38.p6.genome.fa")
     parser.add_argument(
         "--m5c-bedgraph",

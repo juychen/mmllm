@@ -279,7 +279,8 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run non-overlap 5mC+Sequence+ATAC to 5hmC experiments at different sample sizes.")
-    parser.add_argument("--dmr-csv", default="output/dmr_with_sequences.csv")
+    parser.add_argument("--dmr-csv", default="output/dmr_with_sequences.csv",
+                        help="Path to DMR file. Supports CSV or BED (chr, start, end).")
     parser.add_argument("--genome-fasta", default="/data2st1/junyi/ref/GRCm38.p6.genome.fa")
     parser.add_argument("--m5c-bedgraph", default="/data2st1/junyi/output/llm0401/processed_meth/MC_AMY.CG.m.bedGraph.gz")
     parser.add_argument("--hm5c-bedgraph", default="/data2st1/junyi/output/llm0401/processed_meth/MC_AMY.CG.h.bedGraph.gz")
