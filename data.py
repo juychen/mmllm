@@ -270,13 +270,15 @@ def load_data(args):
         tbx_5mc = tbx_5mc_list[group_idx] if should_load_5mc else None
         atac_bw = atac_bw_list[group_idx]
         for _, row in df_dmr.iterrows():
-            chrom = "chr" + str(row["chr"])
+            # Normalize: strip existing "chr" prefix if present, then re-add consistently
+            chrom_name = str(row["chr"]).removeprefix("chr")
+            chrom = "chr" + chrom_name
             start = int(row["start_expanded"])
             end = int(row["end_expanded"])
             seqs.append(get_sequence(chrom, start, end, genome))
             if tbx_5mc is not None:
-                mcg_tracks.append(fast_tabix_to_track(tbx_5mc, chrom.replace("chr", ""), start, end))
-            hmcg_tracks.append(fast_tabix_to_track(tbx_5hmc, chrom.replace("chr", ""), start, end))
+                mcg_tracks.append(fast_tabix_to_track(tbx_5mc, chrom_name, start, end))
+            hmcg_tracks.append(fast_tabix_to_track(tbx_5hmc, chrom_name, start, end))
             atac_tracks.append(np.nan_to_num(atac_bw.values(chrom, start, end + 1), nan=0.0))
 
     combined_df_dmr = pd.concat(dmr_frames, ignore_index=True)

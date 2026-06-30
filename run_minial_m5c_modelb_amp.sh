@@ -53,7 +53,8 @@ run_experiment() {
   echo "[$region/${condition}] Log file: $log_file"
 
   common_args=(
-    --sample-sizes 500000
+    --sample-sizes 2000
+    --dmr-csv /data2st1/junyi/generegion_vM23/cCRE_cpg.bed
     --model-name model_b
     --model-b-blocks 2
     --model-b-fusion "$fusion_type"
@@ -108,7 +109,7 @@ run_experiment() {
       "${common_args[@]}" \
       --m5c-bedgraph "/data2st1/junyi/output/llm0401/processed_meth/${condition}_${region}.CG.m.bedGraph.gz" \
       --hm5c-bedgraph "/data2st1/junyi/output/llm0401/processed_meth/${condition}_${region}.CG.h.bedGraph.gz" \
-      --atac-bw "/data2st2/junyi/output/atac1112/tobiasbam/BULK/corrected/${region}_${condition}_track.bw" \
+      --atac-bw "/data1st1/junyi/methdata/atac/${region}_${condition}_track.bw" \
       2>&1 | tee "$log_file"
   fi
 }

@@ -13,6 +13,7 @@ output
 .ruff_cache/
 .coverage
 .coverage.*
+.*/
 htmlcov/
 build/
 dist/
