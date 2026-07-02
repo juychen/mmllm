@@ -12,7 +12,7 @@ if [[ "$fusion_type" != "cross_hyena" && "$fusion_type" != "cross_attention" ]];
   exit 1
 fi
 
-regions=("AMY" "HIP" "PFC")
+regions=("HIP" "PFC")
 conditions=("MC" "MW")
 
 run_experiment() {
