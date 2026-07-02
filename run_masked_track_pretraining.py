@@ -17,7 +17,7 @@ from data import (
     tensorize_track_modality,
 )
 from models import MaskedTrackPretrainingModelB
-from utils import get_freest_gpu, set_random_seed
+from utils import get_freest_gpu, resolve_sample_sizes, set_random_seed
 
 
 DEFAULT_TRACK_NAMES = ["5mc", "5hmc"]
@@ -540,7 +540,7 @@ def parse_args():
         default=DEFAULT_TRACK_NAMES,
         help="Tracks to reconstruct. First track (5mC) is always the query. Default: 5mc 5hmc",
     )
-    parser.add_argument("--sample-sizes", nargs="+", type=int, required=True)
+    parser.add_argument("--sample-sizes", nargs="+", type=str, required=True)
     parser.add_argument("--chromosome", default=None)
     parser.add_argument("--target-length", type=int, default=1024)
     parser.add_argument("--train-ratio", type=float, default=0.8)
@@ -585,6 +585,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    args.sample_sizes = resolve_sample_sizes(args.sample_sizes, args)
     args.use_m5c = True
 
     if not (0.0 < args.mask_fraction < 1.0):

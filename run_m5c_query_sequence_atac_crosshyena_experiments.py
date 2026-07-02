@@ -18,7 +18,13 @@ from data import (
     tensorize_track_modality,
 )
 from models import M5CQuerySequenceAtacCrossHyenaRegressor, M5CQuerySequenceAtacCrossHyenaRegressorModelB
-from utils import export_prediction_signals, get_freest_gpu, plot_regression_predictions, set_random_seed
+from utils import (
+    export_prediction_signals,
+    get_freest_gpu,
+    plot_regression_predictions,
+    resolve_sample_sizes,
+    set_random_seed,
+)
 
 
 def transfer_pretrained_weights(
@@ -707,7 +713,7 @@ def parse_args():
         nargs="+",
         default=["/data2st2/junyi/output/atac1112/tobiasbam/BULK/corrected/AMY_MC_track.bw"],
     )
-    parser.add_argument("--sample-sizes", nargs="+", type=int, required=True)
+    parser.add_argument("--sample-sizes", nargs="+", type=str, required=True)
     parser.add_argument("--chromosome", default=None)
     parser.add_argument("--target-length", type=int, default=1024)
     parser.add_argument("--train-ratio", type=float, default=0.8)
@@ -759,6 +765,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    args.sample_sizes = resolve_sample_sizes(args.sample_sizes, args)
     args.use_m5c = True
     if args.chromosome is not None:
         args.chromosome = normalize_chromosome_label(args.chromosome)

@@ -8,7 +8,12 @@ import torch.nn as nn
  
 from data import load_data, prepare_experiment_data
 from models import MinimalCrossHyenaRegressor
-from utils import export_prediction_signals, plot_regression_predictions, set_random_seed
+from utils import (
+    export_prediction_signals,
+    plot_regression_predictions,
+    resolve_sample_sizes,
+    set_random_seed,
+)
 
 
 def masked_mse_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -293,7 +298,7 @@ def parse_args():
     parser.add_argument("--no-use-sequence", dest="use_sequence", action="store_false", help="Disable DNA sequence in the context input.")
     parser.add_argument("--use-atac", dest="use_atac", action="store_true", help="Use ATAC signal in the context input.")
     parser.add_argument("--no-use-atac", dest="use_atac", action="store_false", help="Disable ATAC signal in the context input.")
-    parser.add_argument("--sample-sizes", nargs="+", type=int, required=True)
+    parser.add_argument("--sample-sizes", nargs="+", type=str, required=True)
     parser.add_argument("--target-length", type=int, default=1024)
     parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--batch-size", type=int, default=128)
@@ -332,6 +337,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    args.sample_sizes = resolve_sample_sizes(args.sample_sizes, args)
     set_random_seed(args.seed)
     df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks = load_data(args)
     results = []

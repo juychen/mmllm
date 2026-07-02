@@ -18,7 +18,12 @@ from data import (
 )
 from data import augment_with_reverse_complement, prepare_multimodal_multitask_data
 from models import MinimalCrossHyenaRegressor
-from utils import export_prediction_signals, plot_regression_predictions, set_random_seed
+from utils import (
+    export_prediction_signals,
+    plot_regression_predictions,
+    resolve_sample_sizes,
+    set_random_seed,
+)
 
 @dataclass
 class ExperimentResult:
@@ -489,7 +494,7 @@ def parse_args():
         default=["/data2st2/junyi/output/atac1112/tobiasbam/BULK/corrected/AMY_MC_track.bw"],
         help="One or more ATAC bigWig paths. With --use-all-input-groups, all provided paths are combined into one training set.",
     )
-    parser.add_argument("--sample-sizes", nargs="+", type=int, required=True)
+    parser.add_argument("--sample-sizes", nargs="+", type=str, required=True)
     parser.add_argument(
         "--chromosome",
         default=None,
@@ -568,6 +573,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    args.sample_sizes = resolve_sample_sizes(args.sample_sizes, args)
     if args.chromosome is not None:
         args.chromosome = normalize_chromosome_label(args.chromosome)
     Path(args.output_csv).parent.mkdir(parents=True, exist_ok=True)

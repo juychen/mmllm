@@ -9,7 +9,12 @@ import torch.nn as nn
 
 from data import CONTEXT_MODALITIES, TRACK_MODALITIES, load_data, prepare_modality_experiment_data
 from models import MinimalCrossHyenaRegressor
-from utils import export_prediction_signals, plot_regression_predictions, set_random_seed
+from utils import (
+    export_prediction_signals,
+    plot_regression_predictions,
+    resolve_sample_sizes,
+    set_random_seed,
+)
 
 
 def masked_mse_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -409,7 +414,7 @@ def parse_args():
         default=["/data2st2/junyi/output/atac1112/tobiasbam/BULK/corrected/AMY_MC_track.bw"],
         help="One or more ATAC bigWig paths. With --use-all-input-groups, all provided paths are combined into one training set.",
     )
-    parser.add_argument("--sample-sizes", nargs="+", type=int, required=True)
+    parser.add_argument("--sample-sizes", nargs="+", type=str, required=True)
     parser.add_argument("--input-modality", choices=sorted(TRACK_MODALITIES), required=True)
     parser.add_argument("--target-modality", choices=sorted(TRACK_MODALITIES), required=True)
     parser.add_argument(
@@ -483,6 +488,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    args.sample_sizes = resolve_sample_sizes(args.sample_sizes, args)
     set_random_seed(args.seed)
     args.context_modalities = list(dict.fromkeys(args.context_modalities))
     df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks = load_data(args)

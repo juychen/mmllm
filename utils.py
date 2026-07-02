@@ -8,6 +8,53 @@ import pandas as pd
 import torch
 
 
+def resolve_sample_sizes(sample_sizes, args):
+    """Resolve ``all`` in sample_sizes to the line count of the input file.
+
+    If any element of *sample_sizes* is the string ``"all"``, it is replaced
+    by the number of data rows in the primary input file.  Priority:
+    ``--dmr-csv`` > first ``--m5c-bedgraph`` > first ``--hm5c-bedgraph``.
+    For ``.csv`` files the header line is subtracted; for BED/bedGraph files
+    (which have no header and use ``#`` for comments) the raw line count is
+    used.
+    """
+    resolved = []
+    if "all" not in sample_sizes:
+        return [int(s) for s in sample_sizes]
+
+    # Pick the best available input file
+    input_file = None
+    if hasattr(args, "dmr_csv") and args.dmr_csv:
+        input_file = args.dmr_csv
+    elif hasattr(args, "m5c_bedgraph") and args.m5c_bedgraph:
+        paths = args.m5c_bedgraph if isinstance(args.m5c_bedgraph, list) else [args.m5c_bedgraph]
+        input_file = paths[0]
+    elif hasattr(args, "hm5c_bedgraph") and args.hm5c_bedgraph:
+        paths = args.hm5c_bedgraph if isinstance(args.hm5c_bedgraph, list) else [args.hm5c_bedgraph]
+        input_file = paths[0]
+
+    if input_file is None:
+        raise ValueError(
+            "Cannot resolve 'all' sample size: no input file found. "
+            "Provide --dmr-csv, --m5c-bedgraph, or --hm5c-bedgraph."
+        )
+
+    result = subprocess.run(["wc", "-l", input_file], capture_output=True, text=True, check=True)
+    total_lines = int(result.stdout.split()[0])
+
+    # CSV files have a header line; BED/bedGraph files do not
+    is_csv = input_file.lower().endswith(".csv") or input_file.lower().endswith(".csv.gz")
+    if is_csv:
+        total_lines -= 1
+
+    for s in sample_sizes:
+        if s == "all":
+            resolved.append(total_lines)
+        else:
+            resolved.append(int(s))
+    return resolved
+
+
 def get_freest_gpu() -> int:
     """Return the index of the GPU with the most free memory (MiB).
 

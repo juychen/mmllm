@@ -16,7 +16,12 @@ from data import (
     sequence_to_base_ids,
 )
 from models import MinimalCrossHyenaRegressor
-from utils import export_prediction_signals, plot_regression_predictions, set_random_seed
+from utils import (
+    export_prediction_signals,
+    plot_regression_predictions,
+    resolve_sample_sizes,
+    set_random_seed,
+)
 
 
 @dataclass
@@ -356,7 +361,7 @@ def parse_args():
     parser.add_argument("--genome-fasta", default="/data2st1/junyi/ref/GRCm38.p6.genome.fa")
     parser.add_argument("--hm5c-bedgraph", default="/data2st1/junyi/output/llm0401/processed_meth/MC_AMY.CG.h.bedGraph.gz")
     parser.add_argument("--atac-bw", default="/data2st2/junyi/output/atac1112/tobiasbam/BULK/corrected/AMY_MC_track.bw")
-    parser.add_argument("--sample-sizes", nargs="+", type=int, required=True)
+    parser.add_argument("--sample-sizes", nargs="+", type=str, required=True)
     parser.add_argument("--target-length", type=int, default=1024)
     parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--batch-size", type=int, default=128)
@@ -397,6 +402,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    args.sample_sizes = resolve_sample_sizes(args.sample_sizes, args)
     set_random_seed(args.seed)
     df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks = load_data(args)
     results = []
