@@ -12,7 +12,7 @@ if [[ "$fusion_type" != "cross_hyena" && "$fusion_type" != "cross_attention" ]];
   exit 1
 fi
 
-regions=("HIP" "PFC")
+regions=("AMY" "HIP" "PFC")
 conditions=("MC" "MW")
 
 run_experiment() {
@@ -21,16 +21,22 @@ run_experiment() {
   local fusion_type="$3"
 
   current_time=$(date "+%Y-%m-%d-%H-%M-%S")
+
+  # Extract a short BED identifier from --dmr-csv
+  local dmr_csv="/data2st1/junyi/generegion_vM23/cCREs_mm10encode.bed"
+  local bed_name
+  bed_name="$(basename "$dmr_csv" .bed | sed 's/\.bed\.gz//')"
+
   run_label="m5c_query_sequence_atac_crosshyena_modelb_${fusion_type}"
-  output_dir="output/${region}_${condition}"
+  output_dir="output/${region}_${condition}/${bed_name}"
   mkdir -p "$output_dir"
   log_file="${output_dir}/${current_time}_${run_label}.log"
 
-  echo "[$(date)] [${region}_${condition}] Starting..." | tee -a "$log_file"
+  echo "[$(date)] [${region}_${condition}] Starting... (BED: ${bed_name})" | tee -a "$log_file"
 
   python run_m5c_query_sequence_atac_crosshyena_experiments.py \
-    --sample-sizes 100000 \
-    --dmr-csv /data2st1/junyi/generegion_vM23/cCRE_cpg.bed \
+    --sample-sizes all \
+    --dmr-csv "$dmr_csv" \
     --model-name model_b \
     --model-b-blocks 2 \
     --model-b-fusion "$fusion_type" \
