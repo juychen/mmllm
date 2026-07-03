@@ -200,7 +200,7 @@ def _read_dmr_file(path: str) -> pd.DataFrame:
     return df
 
 
-def load_data(args):
+def load_data(args, lazy: bool = False):
     df_dmr = _read_dmr_file(args.dmr_csv)
     # Early truncation: if sample_sizes is specified, only load up to the max needed rows.
     # This avoids loading the entire DMR file (which can be hundreds of thousands of
@@ -209,10 +209,6 @@ def load_data(args):
         max_needed = max(args.sample_sizes)
         if len(df_dmr) > max_needed:
             df_dmr = df_dmr.iloc[:max_needed].copy()
-    # ^ early truncation: loads only up to max sample-size rows from the DMR file,
-    #   matching the downstream usable_dmrs cap in prepare_*() (which also takes
-    #   the min across seqs/tracks).  The final usable count is still the same min
-    #   logic in prepare_*(), but this avoids loading the entire BED/CSV into memory.
     target_length = args.target_length
     half_window = target_length // 2
     df_dmr["start_expanded"] = df_dmr["start"]
@@ -220,6 +216,21 @@ def load_data(args):
     short_mask = df_dmr["length"] < target_length
     df_dmr.loc[short_mask, "start_expanded"] = df_dmr.loc[short_mask, "center"] - half_window
     df_dmr.loc[short_mask, "end_expanded"] = df_dmr.loc[short_mask, "center"] + half_window - 1
+
+    # In lazy mode, skip loading sequences and tracks — they will be fetched
+    # on-the-fly by LazyM5cSequenceAtacDataset.  Return minimal placeholder lists
+    # long enough to pass downstream length checks in prepare_*().
+    if lazy:
+        num_rows = len(df_dmr)
+        dummy_seq = "A" * target_length
+        dummy_track = np.zeros(target_length, dtype=np.float32)
+        return (
+            df_dmr,
+            [dummy_seq] * num_rows,
+            [dummy_track] * num_rows,   # mcg (5mC)
+            [dummy_track] * num_rows,   # hmcg (5hmC)
+            [dummy_track] * num_rows,   # atac
+        )
 
     genome = pyfaidx.Fasta(args.genome_fasta)
     hm5c_paths = ensure_path_list(getattr(args, "hm5c_bedgraph", None))
@@ -721,6 +732,92 @@ def toy_test_non_overlap_split(train_ratio: float = 0.8) -> tuple[pd.DataFrame, 
         print(overlap_frame)
 
     return grouped, train_regions, val_regions
+
+
+class LazyM5cSequenceAtacDataset(torch.utils.data.Dataset):
+    """PyTorch Dataset that fetches sequence / 5mC / 5hmC / ATAC on-the-fly.
+
+    Only the BED metadata (chr/start/end, small) is stored in memory.
+    Genome FASTA, Tabix, and bigWig handles are shared and queried per-sample.
+    """
+
+    def __init__(
+        self,
+        indices: list[int],
+        df_dmr: pd.DataFrame,
+        genome: pyfaidx.Fasta,
+        tbx_5mc: pysam.TabixFile | None,
+        tbx_5hmc: pysam.TabixFile,
+        atac_bw: pyBigWig.pyBigWig,
+        target_length: int,
+        mask_mode: str,
+        atac_scaling: str,
+        augment_rc: bool = False,
+    ):
+        self.indices = indices
+        self.df_dmr = df_dmr
+        self.genome = genome
+        self.tbx_5mc = tbx_5mc
+        self.tbx_5hmc = tbx_5hmc
+        self.atac_bw = atac_bw
+        self.target_length = target_length
+        self.mask_mode = mask_mode
+        self.atac_scaling = atac_scaling
+        self.augment_rc = augment_rc
+        self.N = len(indices)
+        self._base_to_index = {"A": 0, "C": 1, "G": 2, "T": 3, "N": 0}
+
+    def __len__(self):
+        return self.N * (2 if self.augment_rc else 1)
+
+    def __getitem__(self, idx):
+        is_rc = self.augment_rc and idx >= self.N
+        real_idx = self.indices[idx % self.N]
+
+        row = self.df_dmr.iloc[real_idx]
+        chrom_name = str(row["chr"]).removeprefix("chr")
+        chrom = "chr" + chrom_name
+        start = int(row["start_expanded"])
+        end = int(row["end_expanded"])
+
+        # --- fetch on the fly ---
+        seq_str = get_sequence(chrom, start, end, self.genome)
+        hm5c = fast_tabix_to_track(self.tbx_5hmc, chrom_name, start, end)
+        atac = np.nan_to_num(self.atac_bw.values(chrom, start, end + 1), nan=0.0)
+        m5c = fast_tabix_to_track(self.tbx_5mc, chrom_name, start, end)
+
+        # --- determine common length ---
+        seq_len = min(self.target_length, len(seq_str), len(hm5c), len(atac), len(m5c))
+
+        # --- build tensors ---
+        base_ids = sequence_to_base_ids(seq_str, seq_len, self._base_to_index)
+        sequence_onehot = F.one_hot(base_ids, num_classes=4).float()
+
+        m5c_t = torch.tensor(m5c[:seq_len], dtype=torch.float32).unsqueeze(-1)
+        hm5c_t = torch.tensor(hm5c[:seq_len], dtype=torch.float32).unsqueeze(-1)
+        atac_t = torch.tensor(atac[:seq_len], dtype=torch.float32).unsqueeze(-1)
+
+        # ATAC scaling (per-sample minmax)
+        if self.atac_scaling == "minmax":
+            a_min = atac_t.amin(dim=0, keepdim=True)
+            a_max = atac_t.amax(dim=0, keepdim=True)
+            a_range = (a_max - a_min).clamp_min(1e-6)
+            atac_t = (atac_t - a_min) / a_range
+
+        # loss mask (add batch dim, resolve, then squeeze)
+        loss_mask = resolve_loss_mask(self.mask_mode, base_ids.unsqueeze(0))[0]
+
+        if is_rc:
+            m5c_t = torch.flip(m5c_t, dims=[0])
+            sequence_onehot = torch.flip(sequence_onehot, dims=[0])
+            complement_index = BASE_COMPLEMENT_INDEX.to(sequence_onehot.device)
+            sequence_onehot = sequence_onehot.index_select(dim=-1, index=complement_index)
+            atac_t = torch.flip(atac_t, dims=[0])
+            hm5c_t = torch.flip(hm5c_t, dims=[0])
+            base_ids_rc = torch.argmax(sequence_onehot, dim=-1)
+            loss_mask = resolve_loss_mask(self.mask_mode, base_ids_rc.unsqueeze(0))[0]
+
+        return m5c_t, sequence_onehot, atac_t, hm5c_t, loss_mask
 
 
 if __name__ == "__main__":

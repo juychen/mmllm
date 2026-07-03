@@ -8,14 +8,18 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
+import pyBigWig
+import pyfaidx
+import pysam
+
 from data import (
     BASE_COMPLEMENT_INDEX,
+    LazyM5cSequenceAtacDataset,
     assign_non_overlapping_groups,
-    build_sequence_tensor,
-    get_track_arrays,
+    ensure_path_list,
+    get_sequence,
     load_data,
     resolve_loss_mask,
-    tensorize_track_modality,
 )
 from models import M5CQuerySequenceAtacCrossHyenaRegressor, M5CQuerySequenceAtacCrossHyenaRegressorModelB
 from utils import (
@@ -269,69 +273,70 @@ def prepare_sequence_atac_crosshyena_data(
     if not mcg_tracks:
         raise ValueError("M5CQuerySequenceAtacCrossHyenaRegressor requires 5mC tracks. Set --m5c-bedgraph to a valid path.")
 
-    track_lengths = [len(hmcg_tracks[0]), len(atac_tracks[0]), len(seqs[0]), len(mcg_tracks[0])]
     usable_dmrs = min(num_dmrs, len(df_dmr), len(seqs), len(mcg_tracks), len(hmcg_tracks), len(atac_tracks))
-    seq_len = min(track_lengths)
+    seq_len = args.target_length
     post_filter_len = min(seq_len, 4)
 
-    track_arrays = get_track_arrays(args, mcg_tracks, hmcg_tracks, atac_tracks, usable_dmrs, seq_len)
-    base_ids_tensor, sequence_tensor = build_sequence_tensor(seqs, usable_dmrs, seq_len)
-    m5c_tensor = tensorize_track_modality("5mc", track_arrays, args)
-    atac_tensor = tensorize_track_modality("atac", track_arrays, args)
-    target_tensor = tensorize_track_modality("5hmc", track_arrays, args)
-    loss_mask = resolve_loss_mask(args.mask_mode, base_ids_tensor)
+    # Fetch real sequences from genome for val metadata (seqs list may be dummy in lazy mode)
+    genome = pyfaidx.Fasta(args.genome_fasta)
 
     split_regions_df = df_dmr.iloc[:usable_dmrs].copy().reset_index().rename(columns={"index": "original_idx"})
     split_regions_df["chr"] = split_regions_df["chr"].astype(str)
     split_regions_df["start_expanded"] = split_regions_df["start_expanded"].astype(int)
     split_regions_df["end_expanded"] = split_regions_df["end_expanded"].astype(int)
-    split_regions_df["sequence"] = [str(seqs[idx])[:seq_len].upper() for idx in range(usable_dmrs)]
     split_regions_df = assign_non_overlapping_groups(split_regions_df, "chr", "start_expanded", "end_expanded")
 
     group_ids = split_regions_df["overlap_group"].drop_duplicates().to_numpy()
     num_train_groups = max(1, int(len(group_ids) * args.train_ratio))
     train_group_ids = set(group_ids[:num_train_groups].tolist())
     train_mask = split_regions_df["overlap_group"].isin(train_group_ids).to_numpy()
-    train_idx = torch.from_numpy(np.flatnonzero(train_mask)).long()
-    val_idx = torch.from_numpy(np.flatnonzero(~train_mask)).long()
+    train_indices = np.flatnonzero(train_mask).tolist()
+    val_indices = np.flatnonzero(~train_mask).tolist()
 
-    train_region_metadata = split_regions_df.iloc[train_idx.numpy()].reset_index(drop=True)
-    val_region_metadata = split_regions_df.iloc[val_idx.numpy()].reset_index(drop=True)
+    # Build val_region_metadata with real sequences fetched from genome
+    # (seqs list may be dummy placeholders in lazy mode)
+    val_subset = split_regions_df.iloc[val_indices].copy().reset_index(drop=True)
+    val_seqs = []
+    for _, row in val_subset.iterrows():
+        chrom_name = str(row["chr"]).removeprefix("chr")
+        chrom = "chr" + chrom_name
+        s = int(row["start_expanded"])
+        e = int(row["end_expanded"])
+        val_seqs.append(get_sequence(chrom, s, e, genome))
+    val_subset["sequence"] = [str(s)[:seq_len].upper() for s in val_seqs]
+    val_region_metadata = val_subset
 
-    train_m5c_tensor, train_sequence_tensor, train_atac_tensor, train_target_tensor, train_loss_mask, train_region_metadata = augment_three_modalities(
-        m5c_tensor[train_idx],
-        sequence_tensor[train_idx],
-        atac_tensor[train_idx],
-        target_tensor[train_idx],
-        loss_mask[train_idx],
-        base_ids_tensor[train_idx],
-        train_region_metadata,
-        args,
-    )
-    val_m5c_tensor, val_sequence_tensor, val_atac_tensor, val_target_tensor, val_loss_mask, val_region_metadata = augment_three_modalities(
-        m5c_tensor[val_idx],
-        sequence_tensor[val_idx],
-        atac_tensor[val_idx],
-        target_tensor[val_idx],
-        loss_mask[val_idx],
-        base_ids_tensor[val_idx],
-        val_region_metadata,
-        args,
-    )
+    # Shared file handles for lazy dataset
+    hm5c_paths = ensure_path_list(getattr(args, "hm5c_bedgraph", None))
+    m5c_paths = ensure_path_list(getattr(args, "m5c_bedgraph", None))
+    atac_paths = ensure_path_list(getattr(args, "atac_bw", None))
+    tbx_5hmc = pysam.TabixFile(hm5c_paths[0])
+    tbx_5mc = pysam.TabixFile(m5c_paths[0])
+    atac_bw = pyBigWig.open(atac_paths[0])
 
-    train_dataset = torch.utils.data.TensorDataset(
-        train_m5c_tensor,
-        train_sequence_tensor,
-        train_atac_tensor,
-        train_target_tensor,
-        train_loss_mask,
+    train_dataset = LazyM5cSequenceAtacDataset(
+        indices=train_indices,
+        df_dmr=split_regions_df,
+        genome=genome,
+        tbx_5mc=tbx_5mc,
+        tbx_5hmc=tbx_5hmc,
+        atac_bw=atac_bw,
+        target_length=args.target_length,
+        mask_mode=args.mask_mode,
+        atac_scaling=args.atac_scaling,
+        augment_rc=getattr(args, "augment_reverse_complement", False),
     )
-    val_dataset = torch.utils.data.TensorDataset(
-        val_m5c_tensor,
-        val_sequence_tensor,
-        val_atac_tensor,
-        val_target_tensor,
-        val_loss_mask,
+    val_dataset = LazyM5cSequenceAtacDataset(
+        indices=val_indices,
+        df_dmr=split_regions_df,
+        genome=genome,
+        tbx_5mc=tbx_5mc,
+        tbx_5hmc=tbx_5hmc,
+        atac_bw=atac_bw,
+        target_length=args.target_length,
+        mask_mode=args.mask_mode,
+        atac_scaling=args.atac_scaling,
+        augment_rc=False,
     )
 
     return PreparedSequenceAtacData(
@@ -740,6 +745,11 @@ def parse_args():
     parser.add_argument("--mask-mode", choices=["cpg_both", "cpg_forward", "all"], default="cpg_both")
     parser.add_argument("--augment-reverse-complement", action="store_true")
     parser.add_argument("--use-all-input-groups", action="store_true")
+    parser.add_argument(
+        "--lazy",
+        action="store_true",
+        help="Enable lazy loading: fetch sequence/track data on-the-fly per batch instead of loading everything into memory upfront.",
+    )
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--output-csv", default="output/m5c_query_sequence_atac_crosshyena_results.csv")
     parser.add_argument("--output-json", default="output/m5c_query_sequence_atac_crosshyena_results.json")
@@ -774,7 +784,7 @@ def main():
     Path(args.output_json).parent.mkdir(parents=True, exist_ok=True)
     set_random_seed(args.seed)
 
-    df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks = load_data(args)
+    df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks = load_data(args, lazy=getattr(args, "lazy", False))
     if args.chromosome is not None:
         df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks = subset_dataset_by_chromosome(
             df_dmr,

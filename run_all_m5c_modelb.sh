@@ -50,6 +50,7 @@ run_experiment() {
     --scheduler-patience 15 \
     --amp \
     --gradient-checkpointing \
+    --lazy \
     --timestamp "$current_time" \
     --scheduler-min-lr 1e-5 \
     --m5c-bedgraph "/data2st1/junyi/output/llm0401/processed_meth/${condition}_${region}.CG.m.bedGraph.gz" \
@@ -72,7 +73,7 @@ run_experiment() {
   return $exit_code
 }
 
-MAX_CONCURRENT=2
+MAX_CONCURRENT=4
 
 echo ""
 echo "============================================"
