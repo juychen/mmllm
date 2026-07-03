@@ -72,33 +72,42 @@ run_experiment() {
   return $exit_code
 }
 
+MAX_CONCURRENT=2
+
 echo ""
 echo "============================================"
-echo "[$(date)] Submitting all experiments in parallel..."
+echo "[$(date)] Submitting experiments (max ${MAX_CONCURRENT} concurrent)..."
 echo "============================================"
 
-pids=()
+failed=0
+total=0
+running=0
+
 for region in "${regions[@]}"; do
   for condition in "${conditions[@]}"; do
+    # Wait if we already have MAX_CONCURRENT jobs running
+    if [ "$running" -ge "$MAX_CONCURRENT" ]; then
+      wait -n
+      running=$((running - 1))
+    fi
+
     run_experiment "$region" "$condition" "$fusion_type" &
-    pids+=($!)
+    running=$((running + 1))
+    total=$((total + 1))
   done
 done
 
-echo "[$(date)] Submitted ${#pids[@]} jobs. Waiting for all to complete..."
-echo ""
-
-# Wait for all background jobs and track exit codes
-failed=0
-for i in "${!pids[@]}"; do
-  wait "${pids[$i]}" || { failed=$((failed + 1)); }
+# Wait for remaining background jobs and track exit codes
+echo "[$(date)] Waiting for the last ${running} job(s) to complete..."
+for job in $(jobs -p); do
+  wait "$job" || { failed=$((failed + 1)); }
 done
 
 echo ""
 echo "============================================"
 if [ $failed -eq 0 ]; then
-  echo "[$(date)] All ${#pids[@]} experiments completed successfully!"
+  echo "[$(date)] All ${total} experiments completed successfully!"
 else
-  echo "[$(date)] $failed out of ${#pids[@]} experiments FAILED!"
+  echo "[$(date)] $failed out of ${total} experiments FAILED!"
 fi
 echo "============================================"

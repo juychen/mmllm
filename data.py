@@ -202,6 +202,17 @@ def _read_dmr_file(path: str) -> pd.DataFrame:
 
 def load_data(args):
     df_dmr = _read_dmr_file(args.dmr_csv)
+    # Early truncation: if sample_sizes is specified, only load up to the max needed rows.
+    # This avoids loading the entire DMR file (which can be hundreds of thousands of
+    # regions) into memory before the sample-size filter is applied downstream.
+    if hasattr(args, "sample_sizes") and args.sample_sizes:
+        max_needed = max(args.sample_sizes)
+        if len(df_dmr) > max_needed:
+            df_dmr = df_dmr.iloc[:max_needed].copy()
+    # ^ early truncation: loads only up to max sample-size rows from the DMR file,
+    #   matching the downstream usable_dmrs cap in prepare_*() (which also takes
+    #   the min across seqs/tracks).  The final usable count is still the same min
+    #   logic in prepare_*(), but this avoids loading the entire BED/CSV into memory.
     target_length = args.target_length
     half_window = target_length // 2
     df_dmr["start_expanded"] = df_dmr["start"]
