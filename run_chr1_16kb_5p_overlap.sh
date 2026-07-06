@@ -22,7 +22,7 @@ run_experiment() {
 
   current_time=$(date "+%Y-%m-%d-%H-%M-%S")
 
-  local dmr_csv="/home/junyichen/code/mmllm/output/whole_genome_16kb_5p_overlap_beds/chr1_16kb_5p_overlap.bed"
+  local dmr_csv="/data1st1/junyi/output/mmllm/whole_genome_16kb_nonoverlap_beds/chr1_16kb_nonoverlap.bed"
   local bed_name="chr1_16kb_5p_overlap"
 
   run_label="m5c_chr1_modelb_${fusion_type}"

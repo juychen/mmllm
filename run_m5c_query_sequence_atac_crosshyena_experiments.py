@@ -8,9 +8,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
-import pyBigWig
 import pyfaidx
-import pysam
 
 from data import (
     BASE_COMPLEMENT_INDEX,
@@ -306,21 +304,18 @@ def prepare_sequence_atac_crosshyena_data(
     val_subset["sequence"] = [str(s)[:seq_len].upper() for s in val_seqs]
     val_region_metadata = val_subset
 
-    # Shared file handles for lazy dataset
+    # Store file paths (handles opened per-worker inside the Dataset)
     hm5c_paths = ensure_path_list(getattr(args, "hm5c_bedgraph", None))
     m5c_paths = ensure_path_list(getattr(args, "m5c_bedgraph", None))
     atac_paths = ensure_path_list(getattr(args, "atac_bw", None))
-    tbx_5hmc = pysam.TabixFile(hm5c_paths[0])
-    tbx_5mc = pysam.TabixFile(m5c_paths[0])
-    atac_bw = pyBigWig.open(atac_paths[0])
 
     train_dataset = LazyM5cSequenceAtacDataset(
         indices=train_indices,
         df_dmr=split_regions_df,
-        genome=genome,
-        tbx_5mc=tbx_5mc,
-        tbx_5hmc=tbx_5hmc,
-        atac_bw=atac_bw,
+        genome_fasta=args.genome_fasta,
+        m5c_bedgraph=m5c_paths[0],
+        hm5c_bedgraph=hm5c_paths[0],
+        atac_bw_path=atac_paths[0],
         target_length=args.target_length,
         mask_mode=args.mask_mode,
         atac_scaling=args.atac_scaling,
@@ -329,10 +324,10 @@ def prepare_sequence_atac_crosshyena_data(
     val_dataset = LazyM5cSequenceAtacDataset(
         indices=val_indices,
         df_dmr=split_regions_df,
-        genome=genome,
-        tbx_5mc=tbx_5mc,
-        tbx_5hmc=tbx_5hmc,
-        atac_bw=atac_bw,
+        genome_fasta=args.genome_fasta,
+        m5c_bedgraph=m5c_paths[0],
+        hm5c_bedgraph=hm5c_paths[0],
+        atac_bw_path=atac_paths[0],
         target_length=args.target_length,
         mask_mode=args.mask_mode,
         atac_scaling=args.atac_scaling,
@@ -340,8 +335,8 @@ def prepare_sequence_atac_crosshyena_data(
     )
 
     return PreparedSequenceAtacData(
-        train_loader=torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True),
-        val_loader=torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False),
+        train_loader=torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, prefetch_factor=2, persistent_workers=True),
+        val_loader=torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, prefetch_factor=2, persistent_workers=True),
         usable_dmrs=usable_dmrs,
         seq_len=seq_len,
         post_filter_len=post_filter_len,

@@ -738,17 +738,27 @@ class LazyM5cSequenceAtacDataset(torch.utils.data.Dataset):
     """PyTorch Dataset that fetches sequence / 5mC / 5hmC / ATAC on-the-fly.
 
     Only the BED metadata (chr/start/end, small) is stored in memory.
-    Genome FASTA, Tabix, and bigWig handles are shared and queried per-sample.
+    Genome FASTA, Tabix, and bigWig file handles are opened **per worker** so that
+    multi-process DataLoader (num_workers > 0) works correctly with fork.
     """
+
+    def _open_handles(self):
+        import pyBigWig
+        import pyfaidx
+        import pysam
+        self._genome = pyfaidx.Fasta(self.genome_fasta)
+        self._tbx_5mc = pysam.TabixFile(self.m5c_bedgraph)
+        self._tbx_5hmc = pysam.TabixFile(self.hm5c_bedgraph)
+        self._atac_bw = pyBigWig.open(self.atac_bw_path)
 
     def __init__(
         self,
         indices: list[int],
         df_dmr: pd.DataFrame,
-        genome: pyfaidx.Fasta,
-        tbx_5mc: pysam.TabixFile | None,
-        tbx_5hmc: pysam.TabixFile,
-        atac_bw: pyBigWig.pyBigWig,
+        genome_fasta: str,
+        m5c_bedgraph: str,
+        hm5c_bedgraph: str,
+        atac_bw_path: str,
         target_length: int,
         mask_mode: str,
         atac_scaling: str,
@@ -756,21 +766,29 @@ class LazyM5cSequenceAtacDataset(torch.utils.data.Dataset):
     ):
         self.indices = indices
         self.df_dmr = df_dmr
-        self.genome = genome
-        self.tbx_5mc = tbx_5mc
-        self.tbx_5hmc = tbx_5hmc
-        self.atac_bw = atac_bw
+        self.genome_fasta = genome_fasta
+        self.m5c_bedgraph = m5c_bedgraph
+        self.hm5c_bedgraph = hm5c_bedgraph
+        self.atac_bw_path = atac_bw_path
         self.target_length = target_length
         self.mask_mode = mask_mode
         self.atac_scaling = atac_scaling
         self.augment_rc = augment_rc
         self.N = len(indices)
         self._base_to_index = {"A": 0, "C": 1, "G": 2, "T": 3, "N": 0}
+        self._genome = None
+        self._tbx_5mc = None
+        self._tbx_5hmc = None
+        self._atac_bw = None
 
     def __len__(self):
         return self.N * (2 if self.augment_rc else 1)
 
     def __getitem__(self, idx):
+        # Lazily open handles on first call (each worker does this once)
+        if self._genome is None:
+            self._open_handles()
+
         is_rc = self.augment_rc and idx >= self.N
         real_idx = self.indices[idx % self.N]
 
@@ -781,10 +799,10 @@ class LazyM5cSequenceAtacDataset(torch.utils.data.Dataset):
         end = int(row["end_expanded"])
 
         # --- fetch on the fly ---
-        seq_str = get_sequence(chrom, start, end, self.genome)
-        hm5c = fast_tabix_to_track(self.tbx_5hmc, chrom_name, start, end)
-        atac = np.nan_to_num(self.atac_bw.values(chrom, start, end + 1), nan=0.0)
-        m5c = fast_tabix_to_track(self.tbx_5mc, chrom_name, start, end)
+        seq_str = get_sequence(chrom, start, end, self._genome)
+        hm5c = fast_tabix_to_track(self._tbx_5hmc, chrom_name, start, end)
+        atac = np.nan_to_num(self._atac_bw.values(chrom, start, end + 1), nan=0.0)
+        m5c = fast_tabix_to_track(self._tbx_5mc, chrom_name, start, end)
 
         # --- determine common length ---
         seq_len = min(self.target_length, len(seq_str), len(hm5c), len(atac), len(m5c))
