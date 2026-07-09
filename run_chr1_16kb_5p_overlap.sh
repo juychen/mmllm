@@ -4,6 +4,9 @@ source /home/junyichen/anaconda3/etc/profile.d/conda.sh
 conda activate evo2
 cd /home/junyichen/code/mmllm/ || exit 1
 
+# Disable Python output buffering so logs appear in real-time
+export PYTHONUNBUFFERED=1
+
 fusion_type="${1:-cross_hyena}"
 
 if [[ "$fusion_type" != "cross_hyena" && "$fusion_type" != "cross_attention" ]]; then

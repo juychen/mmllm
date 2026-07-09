@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import threading
 
 import numpy as np
 import pandas as pd
@@ -740,6 +741,9 @@ class LazyM5cSequenceAtacDataset(torch.utils.data.Dataset):
     Only the BED metadata (chr/start/end, small) is stored in memory.
     Genome FASTA, Tabix, and bigWig file handles are opened **per worker** so that
     multi-process DataLoader (num_workers > 0) works correctly with fork.
+
+    Thread-safety: lazy handle initialization is protected by a reentrant lock
+    to prevent concurrent first-call races in multi-threaded DataLoader workers.
     """
 
     def _open_handles(self):
@@ -750,6 +754,17 @@ class LazyM5cSequenceAtacDataset(torch.utils.data.Dataset):
         self._tbx_5mc = pysam.TabixFile(self.m5c_bedgraph)
         self._tbx_5hmc = pysam.TabixFile(self.hm5c_bedgraph)
         self._atac_bw = pyBigWig.open(self.atac_bw_path)
+
+    def _close_handles(self):
+        """Close all open file handles. Safe to call multiple times."""
+        for attr in ("_genome", "_tbx_5mc", "_tbx_5hmc", "_atac_bw"):
+            handle = getattr(self, attr, None)
+            if handle is not None:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+                setattr(self, attr, None)
 
     def __init__(
         self,
@@ -780,14 +795,38 @@ class LazyM5cSequenceAtacDataset(torch.utils.data.Dataset):
         self._tbx_5mc = None
         self._tbx_5hmc = None
         self._atac_bw = None
+        self._lock = threading.RLock()
 
     def __len__(self):
         return self.N * (2 if self.augment_rc else 1)
 
+    def __getstate__(self):
+        """Strip file handles for pickling across worker processes."""
+        state = self.__dict__.copy()
+        state["_genome"] = None
+        state["_tbx_5mc"] = None
+        state["_tbx_5hmc"] = None
+        state["_atac_bw"] = None
+        state["_lock"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._lock = threading.RLock()
+        self._genome = None
+        self._tbx_5mc = None
+        self._tbx_5hmc = None
+        self._atac_bw = None
+
+    def __del__(self):
+        self._close_handles()
+
     def __getitem__(self, idx):
-        # Lazily open handles on first call (each worker does this once)
-        if self._genome is None:
-            self._open_handles()
+        # Thread-safe lazy handle initialization (once per worker)
+        with self._lock:
+            if self._genome is None:
+                self._close_handles()  # belt-and-suspenders: close any stale handles first
+                self._open_handles()
 
         is_rc = self.augment_rc and idx >= self.N
         real_idx = self.indices[idx % self.N]

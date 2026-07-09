@@ -276,6 +276,9 @@ def prepare_sequence_atac_crosshyena_data(
     post_filter_len = min(seq_len, 4)
 
     # Fetch real sequences from genome for val metadata (seqs list may be dummy in lazy mode)
+    # IMPORTANT: Open and CLOSE genome BEFORE creating DataLoaders.
+    # If genome is left open when workers fork(), the inherited file descriptor
+    # conflicts with per-worker pyfaidx handles, causing deadlocks.
     genome = pyfaidx.Fasta(args.genome_fasta)
 
     split_regions_df = df_dmr.iloc[:usable_dmrs].copy().reset_index().rename(columns={"index": "original_idx"})
@@ -303,6 +306,12 @@ def prepare_sequence_atac_crosshyena_data(
         val_seqs.append(get_sequence(chrom, s, e, genome))
     val_subset["sequence"] = [str(s)[:seq_len].upper() for s in val_seqs]
     val_region_metadata = val_subset
+
+    # CLOSE genome before forking workers to prevent file descriptor conflicts
+    try:
+        genome.close()
+    except Exception:
+        pass  # pyfaidx might not have a close() method in all versions
 
     # Store file paths (handles opened per-worker inside the Dataset)
     hm5c_paths = ensure_path_list(getattr(args, "hm5c_bedgraph", None))
@@ -335,8 +344,16 @@ def prepare_sequence_atac_crosshyena_data(
     )
 
     return PreparedSequenceAtacData(
-        train_loader=torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, prefetch_factor=2, persistent_workers=True),
-        val_loader=torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, prefetch_factor=2, persistent_workers=True),
+        train_loader=torch.utils.data.DataLoader(
+            train_dataset, batch_size=args.batch_size, shuffle=True,
+            num_workers=2, prefetch_factor=2, persistent_workers=False,
+            pin_memory=True,
+        ),
+        val_loader=torch.utils.data.DataLoader(
+            val_dataset, batch_size=args.batch_size, shuffle=False,
+            num_workers=2, prefetch_factor=2, persistent_workers=False,
+            pin_memory=True,
+        ),
         usable_dmrs=usable_dmrs,
         seq_len=seq_len,
         post_filter_len=post_filter_len,

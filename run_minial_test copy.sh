@@ -3,6 +3,9 @@ source /home/junyichen/anaconda3/etc/profile.d/conda.sh
 conda activate evo2
 cd /home/junyichen/code/mmllm/ || exit 1
 
+# Disable Python output buffering so logs appear in real-time
+export PYTHONUNBUFFERED=1
+
 region="${1:-AMY}"
 condition="${2:-MC}"
 
