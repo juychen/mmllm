@@ -15,7 +15,7 @@ if [[ "$fusion_type" != "cross_hyena" && "$fusion_type" != "cross_attention" ]];
   exit 1
 fi
 
-regions=("HIP" "PFC")
+regions=("PFC")
 conditions=("MW")
 
 run_experiment() {
@@ -47,7 +47,7 @@ run_experiment() {
     --mask-mode cpg_forward \
     --scheduler cosine \
     --num-epochs 100 \
-    --batch-size 2 \
+    --batch-size 4 \
     --target-length 16384 \
     --gradient-accumulation-steps 64 \
     --scheduler-patience 15 \
