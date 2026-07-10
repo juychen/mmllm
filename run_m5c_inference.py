@@ -37,6 +37,7 @@ from utils import (
     export_prediction_signals,
     get_freest_gpu,
     plot_regression_predictions,
+    resolve_sample_sizes,
     set_random_seed,
 )
 
@@ -153,9 +154,11 @@ class PreparedInferenceData:
     region_metadata: pd.DataFrame
 
 
-def prepare_inference_data(args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks):
+def prepare_inference_data(args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks, sample_size=None):
     """Build a single Dataset / DataLoader covering all regions for inference."""
     usable = min(len(df_dmr), len(seqs), len(mcg_tracks), len(hmcg_tracks), len(atac_tracks))
+    if sample_size is not None:
+        usable = min(usable, sample_size)
     seq_len = args.target_length
 
     # fetch real sequences for metadata  (open / close before forking workers)
@@ -275,6 +278,9 @@ def build_arg_parser():
                    default=["/data2st2/junyi/output/atac1112/tobiasbam/BULK/corrected/AMY_MC_track.bw"])
     p.add_argument("--chromosome", default=None)
     p.add_argument("--target-length", type=int, default=1024)
+    p.add_argument("--sample-sizes", nargs="+", type=str, default=["all"],
+                   help="Number of regions to use for inference. Use 'all' for all regions, "
+                        "or specify integers like 1000 2000. Default: all.")
     p.add_argument("--train-ratio", type=float, default=0.8)
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--hidden-dim", type=int, default=64)
@@ -350,6 +356,14 @@ def main():
 
     set_random_seed(args.seed)
 
+    # --- resolve sample sizes ---
+    sample_sizes = resolve_sample_sizes(args.sample_sizes, args)
+    sample_size = sample_sizes[0]  # use the first sample size for inference
+    print(f"Using sample size: {sample_size if sample_size != float('inf') else 'all'}")
+
+    # IMPORTANT: update args so load_data sees integer sample sizes (avoids TypeError in max())
+    args.sample_sizes = sample_sizes
+
     # --- load data ---
     args.use_m5c = True
     if args.chromosome is not None:
@@ -364,7 +378,7 @@ def main():
             df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks, args.chromosome,
         )
 
-    prepared = prepare_inference_data(args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks)
+    prepared = prepare_inference_data(args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks, sample_size=sample_size)
 
     # --- build model ---
     if args.model_name == "model_b":
