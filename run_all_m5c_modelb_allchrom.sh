@@ -15,8 +15,8 @@ if [[ "$fusion_type" != "cross_hyena" && "$fusion_type" != "cross_attention" ]];
   exit 1
 fi
 
-regions=("AMY")
-conditions=("MC")
+regions=("PFC" "HIP")
+conditions=("MC" "MW")
 
 run_experiment() {
   local region="$1"
@@ -76,7 +76,7 @@ run_experiment() {
   return $exit_code
 }
 
-MAX_CONCURRENT=4
+MAX_CONCURRENT=3
 
 echo ""
 echo "============================================"
