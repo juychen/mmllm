@@ -14,8 +14,8 @@ shopt -s nullglob
 
 for condition in MC MW; do
     for region in HIP AMY PFC; do
-        for context in CH CG; do
-            for suffix in m h; do
+        for context in CH; do
+            for suffix in h; do
                 pattern="${condition}*-${region}.6mA_5mC5hmC.${context}.pileup.${suffix}.bigwig"
                 files=($pattern)
 
