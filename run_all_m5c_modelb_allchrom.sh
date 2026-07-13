@@ -15,7 +15,7 @@ if [[ "$fusion_type" != "cross_hyena" && "$fusion_type" != "cross_attention" ]];
   exit 1
 fi
 
-regions=("PFC" "HIP")
+regions=("AMY")
 conditions=("MC" "MW")
 
 run_experiment() {
@@ -51,6 +51,7 @@ run_experiment() {
     --target-length 16384 \
     --gradient-accumulation-steps 64 \
     --scheduler-patience 15 \
+    --patience 15 \
     --amp \
     --gradient-checkpointing \
     --lazy \
@@ -104,7 +105,7 @@ done
 # Wait for remaining background jobs and track exit codes
 echo "[$(date)] Waiting for the last ${running} job(s) to complete..."
 for job in $(jobs -p); do
-  wait "$job" || { failed=$((failed + 1)); }
+  wait "$job" || failed=$((failed + 1))
 done
 
 echo ""
