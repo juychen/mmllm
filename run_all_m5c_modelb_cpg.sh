@@ -15,8 +15,8 @@ if [[ "$fusion_type" != "cross_hyena" && "$fusion_type" != "cross_attention" ]];
   exit 1
 fi
 
-regions=("PFC")
-conditions=("MW")
+regions=("AMY")
+conditions=("MC")
 
 run_experiment() {
   local region="$1"
@@ -51,6 +51,7 @@ run_experiment() {
     --target-length 16384 \
     --gradient-accumulation-steps 64 \
     --scheduler-patience 15 \
+    --patience 15 \
     --amp \
     --gradient-checkpointing \
     --lazy \
