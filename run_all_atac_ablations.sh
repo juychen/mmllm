@@ -44,7 +44,7 @@ TRAINING_FLAGS=(
   --mask-mode cpg_forward
   --augment-reverse-complement
   --num-epochs 100
-  --scheduler-patience 10
+  --scheduler-patience 15
   --patience 10
   --scheduler cosine
   --learning-rate 1e-3
