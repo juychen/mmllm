@@ -580,3 +580,85 @@ class MaskedTrackPretrainingModelB(nn.Module):
         hidden = self.final_norm(hidden)
 
         return [head(hidden) for head in self.heads]
+
+# ---------------------------------------------------------------------------
+# Ablation models: flexible query/context for ATAC ablation experiments
+# ---------------------------------------------------------------------------
+
+class FlexibleQueryRegressorModelB(nn.Module):
+    """Flexible Model-B architecture supporting any combination of query/context inputs.
+
+    Designed for ablation experiments. Allows the user to specify:
+      - which modality plays the role of "query" (the track fed into the
+        cross-attention/hyena branch)
+      - which modalities play the role of "context" (concatenated with sequence)
+
+    Forward signature: forward(query_track, sequence_track, context_tracks)
+    where context_tracks is a list of additional context tensors (e.g. [atac]).
+
+    The original M5CQuerySequenceAtacCrossHyenaRegressorModelB is equivalent to
+    using query_track=m5c and context_tracks=[atac].
+    """
+    def __init__(
+        self,
+        seq_len: int,
+        query_dim: int = 1,
+        sequence_dim: int = 4,
+        context_track_dim: int = 1,
+        num_context_tracks: int = 1,
+        hidden_dim: int = 64,
+        use_positional_encoding: bool = False,
+        num_blocks: int = 2,
+        fusion_type: str = "cross_hyena",
+    ):
+        super().__init__()
+        self.query_proj = nn.Linear(query_dim, hidden_dim)
+        self.query_norm = nn.LayerNorm(hidden_dim)
+        self.sequence_proj = nn.Linear(sequence_dim, hidden_dim)
+        self.sequence_norm = nn.LayerNorm(hidden_dim)
+        # Independent projections per context track (like MaskedTrackPretrainingModelB)
+        self.context_track_projs = nn.ModuleList([
+            nn.Linear(context_track_dim, hidden_dim) for _ in range(num_context_tracks)
+        ])
+        self.context_track_norms = nn.ModuleList([
+            nn.LayerNorm(hidden_dim) for _ in range(num_context_tracks)
+        ])
+        # Context fusion: seq + all context tracks
+        context_concat_dim = hidden_dim * (1 + num_context_tracks)
+        self.context_proj = nn.Linear(context_concat_dim, hidden_dim)
+        self.context_norm = nn.LayerNorm(hidden_dim)
+        self.position_encoding = (
+            SinusoidalPositionalEncoding(hidden_dim, seq_len) if use_positional_encoding else None
+        )
+        self.blocks = nn.ModuleList([
+            StripedHyenaBlock(hidden_dim, seq_len, fusion_type=fusion_type)
+            for _ in range(num_blocks)
+        ])
+        self.final_norm = nn.LayerNorm(hidden_dim)
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(
+        self,
+        query_track: torch.Tensor,
+        sequence_track: torch.Tensor,
+        context_tracks: list[torch.Tensor],
+    ) -> torch.Tensor:
+        hidden = self.query_norm(self.query_proj(query_track))
+        sequence_hidden = self.sequence_norm(self.sequence_proj(sequence_track))
+        context_track_hidden = [
+            norm(proj(t))
+            for norm, proj, t in zip(self.context_track_norms, self.context_track_projs, context_tracks)
+        ]
+        context = self.context_norm(
+            self.context_proj(torch.cat([sequence_hidden, *context_track_hidden], dim=-1))
+        )
+        if self.position_encoding is not None:
+            hidden = self.position_encoding(hidden)
+            context = self.position_encoding(context)
+        for block in self.blocks:
+            hidden = block(hidden, context)
+        return self.head(self.final_norm(hidden))
