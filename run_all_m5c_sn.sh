@@ -8,6 +8,7 @@
 #
 # Usage: ./run_all_m5c_phascon.sh [fusion_type]
 #   fusion_type: cross_hyena (default) | cross_attention
+#   MAX_CONCURRENT: 3 by default
 
 source /home/junyichen/anaconda3/etc/profile.d/conda.sh
 conda activate evo2
@@ -23,6 +24,8 @@ if [[ "$fusion_type" != "cross_hyena" && "$fusion_type" != "cross_attention" ]];
   exit 1
 fi
 
+# ---- config ----
+PHASTCONS_BW="/data2st1/junyi/output/sn0615/BULK_AMY/AMY_MC.bw"
 
 if [[ ! -f "$PHASTCONS_BW" ]]; then
   echo "ERROR: phastCons bigWig not found: $PHASTCONS_BW"
@@ -31,8 +34,6 @@ fi
 
 regions=("AMY")
 conditions=("MC")
-PHASTCONS_BW="/data2st1/junyi/output/sn0615/BULK_AMY/AMY_MC.bw"
-
 
 run_experiment() {
   local region="$1"
@@ -45,7 +46,7 @@ run_experiment() {
   bed_name="$(basename "$dmr_csv" .bed | sed 's/\.bed\.gz//')"
 
   local run_label="m5c_query_sequence_phascon_modelb_${fusion_type}"
-  local output_dir="output/${region}_${condition}/${bed_name}/phascon"
+  local output_dir="output/${region}_${condition}/${bed_name}/sn"
   mkdir -p "$output_dir"
   local log_file="${output_dir}/${current_time}_${run_label}.log"
 
