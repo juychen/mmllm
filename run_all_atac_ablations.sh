@@ -32,7 +32,7 @@ DATASET_FLAGS=(
   --dmr-csv /data2st1/junyi/generegion_vM23/cCRE_cpg.bed
   --m5c-bedgraph /data2st1/junyi/output/llm0401/processed_meth/MC_AMY.CG.m.bedGraph.gz
   --hm5c-bedgraph /data2st1/junyi/output/llm0401/processed_meth/MC_AMY.CG.h.bedGraph.gz
-  --atac-bw /data2st2/junyi/output/atac1112/tobiasbam/BULK/corrected/AMY_MC_track.bw
+  --atac-bw /data1st1/junyi/methdata/atac/AMY_MC_track.bw
   --genome-fasta /data2st1/junyi/ref/GRCm38.p6.genome.fa
 )
 

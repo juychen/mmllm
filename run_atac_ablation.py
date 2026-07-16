@@ -300,7 +300,7 @@ def main():
     # Build base Dataset (LazyM5cSequenceAtacDataset) + flexible wrapper
     if args.lazy:
         # Build per-split indices using the non-overlap-group split
-        split_regions_df = df_dmr.copy()
+        split_regions_df = df_dmr.copy().reset_index().rename(columns={"index": "original_idx"})
         split_regions_df["start_expanded"] = split_regions_df["start_expanded"].astype(int)
         split_regions_df["end_expanded"] = split_regions_df["end_expanded"].astype(int)
         split_regions_df = assign_non_overlapping_groups(
