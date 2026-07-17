@@ -139,6 +139,88 @@ def transfer_pretrained_weights(
     )
 
 
+def load_model_from_checkpoint(
+    model: nn.Module,
+    checkpoint_path: str,
+    device: torch.device,
+    freeze_backbone_epochs: int = 0,
+) -> int:
+    """Initialize a model_b (or baseline) from a previous downstream checkpoint.
+
+    Unlike `transfer_pretrained_weights`, this assumes the checkpoint was saved
+    by the SAME model class (so state_dict keys match exactly), and only loads
+    the model weights — optimizer/scheduler/epoch are NOT restored.
+
+    Use this for curriculum-style fine-tuning: train on a simpler subset (e.g.
+    cpg_only mask), then warm-start on a harder dataset (e.g. mask=all) by
+    reloading the weights but resetting the optimizer.
+
+    Args:
+        model: target model to load weights into.
+        checkpoint_path: path to a `.pt` saved by `save_checkpoint` above.
+        device: target device.
+        freeze_backbone_epochs: if > 0, freeze all parameters except the
+            prediction `head` for this many epochs. Set via the optimizer
+            after construction (call `unfreeze_backbone()` when done).
+
+    Returns the epoch number from the checkpoint (informational only — the
+    outer training loop should start at epoch 1).
+    """
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    pretrained = checkpoint["model_state_dict"]
+    model_state = model.state_dict()
+
+    # Load only matching keys; warn about mismatches so silent shape errors
+    # don't hide bugs.
+    own_keys = set(model_state.keys())
+    pre_keys = set(pretrained.keys())
+    missing_in_ckpt = own_keys - pre_keys
+    unexpected_in_ckpt = pre_keys - own_keys
+    if missing_in_ckpt:
+        print(f"[load_model_from_checkpoint] WARNING: missing in checkpoint: "
+              f"{sorted(missing_in_ckpt)}")
+    if unexpected_in_ckpt:
+        print(f"[load_model_from_checkpoint] WARNING: unexpected in checkpoint: "
+              f"{sorted(unexpected_in_ckpt)}")
+    if missing_in_ckpt or unexpected_in_ckpt:
+        # Strict by default — names that don't match almost always indicate a
+        # model architecture mismatch. Fall back to non-strict load of the
+        # intersection so we don't crash before the user can read the warning.
+        inter = own_keys & pre_keys
+        print(f"[load_model_from_checkpoint] Loading {len(inter)} matching keys "
+              f"(non-strict).")
+        missing_in_ckpt = sorted(missing_in_ckpt)
+        unexpected_in_ckpt = sorted(unexpected_in_ckpt)
+        ok_state = {k: pretrained[k] for k in inter}
+        ret = model.load_state_dict(ok_state, strict=False)
+        if ret.missing_keys or ret.unexpected_keys:
+            print(f"[load_model_from_checkpoint] After load_state_dict: "
+                  f"missing={ret.missing_keys}, unexpected={ret.unexpected_keys}")
+    else:
+        model.load_state_dict(pretrained, strict=True)
+
+    ckpt_epoch = int(checkpoint.get("epoch", 0))
+    print(
+        f"[load_model_from_checkpoint] Loaded weights from "
+        f"{Path(checkpoint_path).name} (epoch {ckpt_epoch}, "
+        f"val_loss={checkpoint.get('metrics', {}).get('val_loss', float('nan')):.4f})."
+    )
+
+    if freeze_backbone_epochs > 0:
+        # Freeze everything except the head so the new task's loss doesn't
+        # immediately destroy pretrained features.
+        for name, p in model.named_parameters():
+            if "head" not in name:
+                p.requires_grad = False
+        n_frozen = sum(1 for p in model.parameters() if not p.requires_grad)
+        n_trainable = sum(1 for p in model.parameters() if p.requires_grad)
+        print(f"[load_model_from_checkpoint] Froze backbone: "
+              f"{n_frozen} params frozen, {n_trainable} trainable (head only). "
+              f"Will unfreeze after epoch {freeze_backbone_epochs}.")
+
+    return ckpt_epoch
+
+
 def masked_mse_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     squared_error = (pred - target).pow(2)
     return (squared_error * mask).sum() / mask.sum().clamp_min(1.0)
@@ -490,6 +572,19 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
     if args.pretrained_checkpoint and args.model_name == "model_b":
         transfer_pretrained_weights(model, args.pretrained_checkpoint, device)
 
+    if getattr(args, "init_from_checkpoint", None):
+        # Curriculum warm-start: load weights from a previously-trained
+        # downstream checkpoint. Optimizer / scheduler / epoch are NOT
+        # restored — fresh training begins from epoch 1.
+        ckpt_epoch = load_model_from_checkpoint(
+            model,
+            args.init_from_checkpoint,
+            device,
+            freeze_backbone_epochs=getattr(args, "freeze_backbone_epochs", 0),
+        )
+        print(f"[run_experiment] Warm-started from {Path(args.init_from_checkpoint).name} "
+              f"(was at epoch {ckpt_epoch}, now retraining from epoch 1)")
+
     # Gradient checkpointing: override forward to call torch.checkpoint on each block
     if args.gradient_checkpointing:
         try:
@@ -514,6 +609,12 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
     optimizer = build_optimizer(model, args)
     scheduler = build_scheduler(optimizer, args, args.num_epochs)
 
+    # If we froze the backbone on load, the optimizer was built BEFORE the
+    # freeze. Re-create it now so it only sees trainable parameters.
+    if getattr(args, "init_from_checkpoint", None) and getattr(args, "freeze_backbone_epochs", 0) > 0:
+        optimizer = build_optimizer(model, args)
+        scheduler = build_scheduler(optimizer, args, args.num_epochs)
+
     # Mixed precision scaler
     try:
         scaler = torch.amp.GradScaler("cuda", enabled=args.amp)
@@ -533,6 +634,21 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
 
     for epoch in range(1, args.num_epochs + 1):
         last_epoch = epoch
+
+        # Unfreeze the backbone after the requested freeze epochs (curriculum).
+        if (
+            getattr(args, "init_from_checkpoint", None)
+            and getattr(args, "freeze_backbone_epochs", 0) > 0
+            and epoch == args.freeze_backbone_epochs + 1
+        ):
+            for p in model.parameters():
+                p.requires_grad = True
+            # Rebuild optimizer so newly-unfrozen params get proper weight_decay.
+            optimizer = build_optimizer(model, args)
+            scheduler = build_scheduler(optimizer, args, args.num_epochs)
+            n_trainable = sum(1 for p in model.parameters() if p.requires_grad)
+            print(f"[epoch {epoch}] Unfroze backbone: {n_trainable} params trainable.")
+
         model.train()
         running_loss = 0.0
         seen = 0
