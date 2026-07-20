@@ -15,7 +15,7 @@ Ablation presets (use --ablation):
   m5c_atac_q   : concat-q   — query=concat(m5c,atac), context=[]
   seq_only     : seq-only   — query=sequence, context=[]               (text-only baseline)
   atac_seq     : alt        — query=atac, context=[sequence]
-  all_three    : all        — query=concat(m5c,atac), context=[sequence]
+  all_three    : all        — query=concat(m5c,atac), context=[]           (DNA via dedicated track; was context=[sequence], but ModelB hardcodes context_track_dim=1)
 """
 
 import argparse
@@ -62,7 +62,7 @@ ABLATIONS = {
     "m5c_atac_q":    ("m5c_atac", []),                # concat(m5c, atac) as query
     "seq_only":      ("sequence", []),
     "atac_seq":      ("atac",   ["sequence"]),
-    "all_three":     ("m5c_atac", ["sequence"]),      # concat query, seq as context
+    "all_three":     ("m5c_atac", []),                # concat(m5c,atac) as query, sequence via dedicated track
 }
 
 
