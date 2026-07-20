@@ -18,6 +18,7 @@ from data import (
     get_sequence,
     load_data,
     resolve_loss_mask,
+    write_train_val_beds,
 )
 from models import M5CQuerySequenceAtacCrossHyenaRegressor, M5CQuerySequenceAtacCrossHyenaRegressorModelB
 from utils import (
@@ -375,6 +376,18 @@ def prepare_sequence_atac_crosshyena_data(
     train_mask = split_regions_df["overlap_group"].isin(train_group_ids).to_numpy()
     train_indices = np.flatnonzero(train_mask).tolist()
     val_indices = np.flatnonzero(~train_mask).tolist()
+
+    # Write train / val region BED files to output dir for inspection.
+    # Output dir is derived from --output-csv's parent directory.
+    from pathlib import Path as _Path
+    bed_out_dir = _Path(args.output_csv).parent
+    write_train_val_beds(
+        split_regions_df,
+        train_indices,
+        val_indices,
+        output_dir=bed_out_dir,
+        timestamp=args.timestamp,
+    )
 
     # Build val_region_metadata with real sequences fetched from genome
     # (seqs list may be dummy placeholders in lazy mode)

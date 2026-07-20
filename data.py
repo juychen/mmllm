@@ -139,6 +139,41 @@ def assign_non_overlapping_groups(region_frame: pd.DataFrame, chrom_col: str, st
     return ordered.sort_values("original_idx").reset_index(drop=True)
 
 
+def write_train_val_beds(
+    split_regions_df: pd.DataFrame,
+    train_indices: list[int],
+    val_indices: list[int],
+    output_dir: "str | os.PathLike | None" = None,
+    timestamp: str = "",
+    tag: str = "",
+) -> tuple["Path | None", "Path | None"]:
+    """Write train / val region BED files to ``output_dir``.
+
+    Writes 5 columns: chr / start_expanded / end_expanded / original_idx / overlap_group.
+    Returns the (train_bed_path, val_bed_path) tuple.  If ``output_dir`` is None,
+    nothing is written and (None, None) is returned.
+    """
+    if output_dir is None:
+        return None, None
+    from pathlib import Path
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    bed_cols = ["chr", "start_expanded", "end_expanded", "original_idx", "overlap_group"]
+    suffix = f"_{tag}" if tag else ""
+    ts = f"{timestamp}_" if timestamp else ""
+    train_path = out_dir / f"{ts}train_regions{suffix}.bed"
+    val_path = out_dir / f"{ts}val_regions{suffix}.bed"
+    split_regions_df.iloc[train_indices][bed_cols].to_csv(
+        train_path, sep="\t", index=False, header=False,
+    )
+    split_regions_df.iloc[val_indices][bed_cols].to_csv(
+        val_path, sep="\t", index=False, header=False,
+    )
+    print(f"  train regions : {len(train_indices)}  -> {train_path}")
+    print(f"  val regions   : {len(val_indices)}  -> {val_path}")
+    return train_path, val_path
+
+
 def _chromosome_sort_key(chrom_value) -> tuple[int, int | str]:
     chrom_str = str(chrom_value)
     chrom_body = chrom_str[3:] if chrom_str.lower().startswith("chr") else chrom_str

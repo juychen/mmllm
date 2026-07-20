@@ -7,15 +7,20 @@ Usage:
   python run_atac_ablation.py --ablation atac_query_only [other args]
 
 Ablation presets (use --ablation):
-  m5c_atac     : baseline   — query=m5c, context=[atac]                (matches Model-B baseline)
-  atac_m5c     : swapped    — query=atac, context=[m5c]
-  atac_only    : ATAC-only  — query=atac, context=[]                   (no 5mC input)
-  m5c_only     : 5mC-only   — query=m5c, context=[]                   (no ATAC input)
-  seq_query    : seq-as-q   — query=sequence, context=[atac, m5c]
-  m5c_atac_q   : concat-q   — query=concat(m5c,atac), context=[]
-  seq_only     : seq-only   — query=sequence, context=[]               (text-only baseline)
-  atac_seq     : alt        — query=atac, context=[sequence]
-  all_three    : all        — query=concat(m5c,atac), context=[]           (DNA via dedicated track; was context=[sequence], but ModelB hardcodes context_track_dim=1)
+  m5c_atac       : baseline    — query=m5c, context=[atac]                  (cross-hyena fusion by default)
+  m5c_atac_attn  : attn-only   — query=m5c, context=[atac]                  (forces --model-b-fusion=cross_attention)
+  atac_m5c       : swapped     — query=atac, context=[m5c]
+  atac_only      : ATAC-only   — query=atac, context=[]                      (no 5mC input)
+  m5c_only       : 5mC-only    — query=m5c, context=[]                      (no ATAC input)
+  seq_query      : seq-as-q    — query=sequence, context=[atac, m5c]
+  m5c_atac_q     : concat-q    — query=concat(m5c,atac), context=[]
+  seq_only       : seq-only    — query=sequence, context=[]                  (text-only baseline)
+  atac_seq       : alt         — query=atac, context=[sequence]
+  all_three      : all         — query=concat(m5c,atac), context=[]          (DNA via dedicated track; was context=[sequence], but ModelB hardcodes context_track_dim=1)
+
+Note: ablations whose name ends in ``_attn`` force ``cross_attention`` fusion
+regardless of ``--model-b-fusion``. Add new ones by appending to
+``ABLATIONS`` and (optionally) ``ABLATION_FUSION_OVERRIDES``.
 """
 
 import argparse
@@ -37,6 +42,7 @@ from data import (
     get_sequence,
     load_data,
     resolve_loss_mask,
+    write_train_val_beds,
 )
 from models import FlexibleQueryRegressorModelB
 from utils import (
@@ -55,6 +61,7 @@ from utils import (
 ABLATIONS = {
     # name            : (query_modality, list-of-context-modalities)
     "m5c_atac":      ("m5c",    ["atac"]),
+    "m5c_atac_attn": ("m5c",    ["atac"]),       # same as m5c_atac but forces cross_attention fusion
     "atac_m5c":      ("atac",   ["m5c"]),
     "atac_only":     ("atac",   []),
     "m5c_only":      ("m5c",    []),
@@ -64,6 +71,28 @@ ABLATIONS = {
     "atac_seq":      ("atac",   ["sequence"]),
     "all_three":     ("m5c_atac", []),                # concat(m5c,atac) as query, sequence via dedicated track
 }
+
+
+# Ablations whose name ends in "_attn" force cross_attention fusion,
+# overriding --model-b-fusion.  Keys here take precedence over the convention.
+ABLATION_FUSION_OVERRIDES = {
+    "m5c_atac_attn": "cross_attention",
+}
+
+
+def get_ablation_fusion(ablation_name: str, default_fusion: str) -> str:
+    """Return the fusion type for ``ablation_name``.
+
+    Priority:
+      1. explicit entry in ``ABLATION_FUSION_OVERRIDES``
+      2. ``_attn`` suffix → cross_attention
+      3. ``default_fusion`` (from --model-b-fusion)
+    """
+    if ablation_name in ABLATION_FUSION_OVERRIDES:
+        return ABLATION_FUSION_OVERRIDES[ablation_name]
+    if ablation_name.endswith("_attn"):
+        return "cross_attention"
+    return default_fusion
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +342,16 @@ def main():
         train_indices = np.flatnonzero(train_mask).tolist()
         val_indices = np.flatnonzero(~train_mask).tolist()
 
+        # Write train / val region BED files to output dir for inspection
+        bed_out_dir = Path(args.output_dir) / ablation_name
+        write_train_val_beds(
+            split_regions_df,
+            train_indices,
+            val_indices,
+            output_dir=bed_out_dir,
+            timestamp=args.timestamp,
+        )
+
         hm5c_paths = ensure_path_list(args.hm5c_bedgraph)
         m5c_paths = ensure_path_list(args.m5c_bedgraph)
         atac_paths = ensure_path_list(args.atac_bw)
@@ -374,6 +413,10 @@ def main():
     # Model
     device = torch.device(f"cuda:{get_freest_gpu()}" if torch.cuda.is_available() else "cpu")
     num_ctx_tracks = len(ctx_mods)
+    fusion_type = get_ablation_fusion(ablation_name, args.model_b_fusion)
+    if fusion_type != args.model_b_fusion:
+        print(f"  [fusion override] {args.model_b_fusion} -> {fusion_type} (from ablation '{ablation_name}')")
+    args.model_b_fusion = fusion_type  # persist resolved value into checkpoint + metrics
     model = FlexibleQueryRegressorModelB(
         seq_len=seq_len,
         query_dim=get_query_dim(ablation_name),
@@ -383,10 +426,10 @@ def main():
         hidden_dim=args.hidden_dim,
         use_positional_encoding=args.use_positional_encoding,
         num_blocks=args.model_b_blocks,
-        fusion_type=args.model_b_fusion,
+        fusion_type=fusion_type,
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"Model: FlexibleQueryRegressorModelB  |  query={q_mod}  ctx={ctx_mods}  |  params: {n_params:,}")
+    print(f"Model: FlexibleQueryRegressorModelB  |  query={q_mod}  ctx={ctx_mods}  |  fusion={fusion_type}  |  params: {n_params:,}")
 
     # Optimizer / scheduler / AMP
     decay_params = [p for n, p in model.named_parameters() if p.ndim > 1 and "norm" not in n.lower()]
@@ -484,6 +527,7 @@ def main():
         "ablation": ablation_name,
         "query_modality": q_mod,
         "context_modalities": ctx_mods,
+        "fusion_type": fusion_type,
         "best_epoch": best_epoch,
         "best_val_loss": best_val_loss,
         "best_val_r2": final_val_r2,    # last-loaded best state metrics
