@@ -880,6 +880,8 @@ def parse_args():
     parser.add_argument("--scheduler-t-max", type=int, default=0)
     parser.add_argument("--atac-scaling", choices=["none", "minmax"], default="minmax")
     parser.add_argument("--pretrained-checkpoint", default=None, help="Path to a MaskedTrackPretrainingModelB checkpoint (.pt) to initialize model_b weights.")
+    parser.add_argument("--init-from-checkpoint", default=None, help="Path to a downstream model_b checkpoint (.pt) for warm-start / curriculum fine-tuning. Loads only model weights, resets optimizer/scheduler.")
+    parser.add_argument("--freeze-backbone-epochs", type=int, default=0, help="If >0, freeze all params except head for this many epochs after warm-start from --init-from-checkpoint.")
     parser.add_argument("--amp", action="store_true", help="Enable automatic mixed precision (bfloat16) training. Reduces memory ~2x, recommended for long sequences.")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1, help="Accumulate gradients over N mini-batches before each optimizer step. Use with --batch-size 4-8 for long sequences.")
     parser.add_argument("--gradient-checkpointing", action="store_true", help="Enable gradient checkpointing to trade compute for memory. Recommended for very long sequences (8k+).")
