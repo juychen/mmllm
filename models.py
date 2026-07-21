@@ -359,16 +359,50 @@ class CrossHyenaResidualBranch(nn.Module):
 
 
 class CrossAttentionResidualBranch(nn.Module):
-    def __init__(self, hidden_dim: int, num_heads: int = 4):
+    def __init__(self, hidden_dim: int, num_heads: int = 4, head_dim: int | None = None):
         super().__init__()
         self.query_norm = nn.LayerNorm(hidden_dim)
         self.context_norm = nn.LayerNorm(hidden_dim)
-        self.attention = nn.MultiheadAttention(hidden_dim, num_heads=num_heads, batch_first=True)
+        # Pick a (num_heads, head_dim) pair that satisfies:
+        #   - head_dim >= 16 (smaller splits lose too much rank per head
+        #     and the softmax over a 16k-token context collapses toward
+        #     uniform on a freshly-initialized model, which is what froze
+        #     training before).
+        #   - hidden_dim == num_heads * head_dim (required by nn.MultiheadAttention).
+        # We prefer 32 per head; if hidden_dim is not divisible by 32 we
+        # fall back to 16; if even that fails we use a single head (i.e.
+        # head_dim == hidden_dim) so the user can still run the ablation.
+        if head_dim is None:
+            if hidden_dim % 32 == 0:
+                head_dim = 32
+            elif hidden_dim % 16 == 0:
+                head_dim = 16
+            else:
+                head_dim = hidden_dim
+        assert hidden_dim % head_dim == 0, (
+            f"hidden_dim={hidden_dim} not divisible by head_dim={head_dim}"
+        )
+        self.num_heads = hidden_dim // head_dim
+        self.attention = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=self.num_heads,
+            batch_first=True,
+        )
         self.gate = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
+        # Solution A: zero-init the last layer of the gate so that
+        # gate(branch_output) starts at exactly 0 → the residual branch is a
+        # strict identity at initialization. This prevents the freshly
+        # initialized attention output (which is ≈0 because softmax over a
+        # 16k-token context collapses to near-uniform on random weights)
+        # from polluting the hidden state, and lets the gate learn to open
+        # only where it actually helps. Without this, the cross-attention
+        # path was stuck at R²≈0.04 (predicting the constant training mean).
+        nn.init.zeros_(self.gate[2].weight)
+        nn.init.zeros_(self.gate[2].bias)
 
     def forward(self, hidden: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
         normalized_hidden = self.query_norm(hidden)
