@@ -114,6 +114,10 @@ def main():
         "--no-gzip", action="store_true",
         help="Write plain .bedGraph instead of .bedGraph.gz",
     )
+    parser.add_argument(
+        "--skip-existing", action="store_true",
+        help="Skip if output file already exists",
+    )
     args = parser.parse_args()
 
     input_dir = Path(args.input_dir)
@@ -141,6 +145,11 @@ def main():
                         ch_path = ch_gz
 
                 output_path = output_dir / f"{condition}_{region}.C.{modality}.bedGraph{gz_suffix}"
+
+                if args.skip_existing and output_path.exists():
+                    print(f"  [{label}] skipped: {output_path} already exists")
+                    continue
+
                 n = merge_pair(cg_path, ch_path, output_path, label)
                 total += n
 

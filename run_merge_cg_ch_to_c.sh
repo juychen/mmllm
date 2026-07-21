@@ -29,9 +29,9 @@ echo "Sample of available bedGraph files:"
 ls "$INPUT_DIR" | grep -E '\.(CG|CH)\.(m|h)\.bedGraph' | head -8
 echo ""
 
-# ---- run merge (5mC only: CG.m + CH.m → .C.m) ----
+# ---- run merge (5hmC only: CG.h + CH.h → .C.h) ----
 echo "============================================"
-echo "[$(date)] Merging CG + CH 5mC bedGraphs → .C.m tracks"
+echo "[$(date)] Merging CG + CH 5hmC bedGraphs → .C.h tracks"
 echo "  Input:  $INPUT_DIR"
 echo "  Output: $OUTPUT_DIR"
 echo "============================================"
@@ -39,7 +39,8 @@ echo "============================================"
 python merge_cg_ch_to_c.py \
   --input-dir "$INPUT_DIR" \
   --output-dir "$OUTPUT_DIR" \
-  --modalities m
+  --modalities h \
+  --skip-existing
 
 exit_code=$?
 
@@ -47,8 +48,8 @@ echo ""
 echo "============================================"
 if [ $exit_code -eq 0 ]; then
   echo "[$(date)] Merge finished successfully!"
-  echo "Generated .C.m.bedGraph.gz files:"
-  ls -lh "$OUTPUT_DIR"/*.C.m.bedGraph.gz 2>/dev/null | awk '{printf "  %-12s  %s\n", $5, $9}'
+  echo "Generated .C.h.bedGraph.gz files:"
+  ls -lh "$OUTPUT_DIR"/*.C.h.bedGraph.gz 2>/dev/null | awk '{printf "  %-12s  %s\n", $5, $9}'
 else
   echo "[$(date)] Merge FAILED with exit code $exit_code"
 fi
