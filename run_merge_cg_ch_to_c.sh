@@ -7,7 +7,7 @@
 # Edit INPUT_DIR / OUTPUT_DIR below if your files live elsewhere.
 #
 source /home/junyichen/anaconda3/etc/profile.d/conda.sh
-conda activate evo2
+conda activate snapatac2
 cd /home/junyichen/code/mmllm/ || exit 1
 
 export PYTHONUNBUFFERED=1
