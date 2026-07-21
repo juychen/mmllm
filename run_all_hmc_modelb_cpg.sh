@@ -15,8 +15,8 @@ if [[ "$fusion_type" != "cross_hyena" && "$fusion_type" != "cross_attention" ]];
   exit 1
 fi
 
-regions=("AMY")
-conditions=("MC")
+regions=("PFC" "HIP")
+conditions=("MC" "MW")
 
 run_experiment() {
   local region="$1"
@@ -33,11 +33,12 @@ run_experiment() {
   # This run use hm5c bedgraph for methylation and m5c bedgraph for hydroxymethylation
   # Us 5mc as the target and hm5c as the input for the model
   run_label="hm5c_query_sequence_atac_crosshyena_modelb_${fusion_type}"
-  output_dir="output/${region}_${condition}/${bed_name}"
+  output_dir="/data3/junyi/mmllm/output/${region}_${condition}/${bed_name}"
   mkdir -p "$output_dir"
   log_file="${output_dir}/${current_time}_${run_label}.log"
 
   echo "[$(date)] [${region}_${condition}] Starting... (BED: ${bed_name})" | tee -a "$log_file"
+  echo "Output directory: $output_dir" | tee -a "$log_file"
 
   python run_m5c_query_sequence_atac_crosshyena_experiments.py \
     --sample-sizes all \
