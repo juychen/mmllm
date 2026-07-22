@@ -195,25 +195,8 @@ def export_prediction_signals_h5ad(
     t_sp = csc_matrix((tgt_vals, (rows, cols)), shape=shape, dtype=np.float32)
     m_sp = csc_matrix((msk_vals, (rows, cols)), shape=shape, dtype=np.int8)
 
-    # .var: position-level metadata
-    # Use the first region's sequence as reference base for each column.
-    ref_seq = str(seqs[0])[:L].upper()
-    bases = list(ref_seq)
-    motifs = []
-    for j in range(L):
-        if bases[j] == "C":
-            if j + 1 < L and ref_seq[j + 1] == "G":
-                motifs.append("CG")
-            else:
-                motifs.append("CH")
-        else:
-            motifs.append("")
-
-    var_df = pd.DataFrame({
-        "position_idx": range(L),
-        "base": bases,
-        "motif": motifs,
-    })
+    # .var: position-level metadata (global index only, no per-region info)
+    var_df = pd.DataFrame({"position_idx": range(L)})
     var_df.index = [f"pos_{j}" for j in range(L)]
 
     # .obs: region metadata (select relevant columns)
@@ -228,9 +211,31 @@ def export_prediction_signals_h5ad(
         for _, row in obs_df.iterrows()
     ]
 
+    # .varm / .layers: per-region-per-position metadata (region-dependent)
+    #   base_encoded: (N, L) sparse int8   → 1=A, 2=C, 3=G, 4=T, 0=other
+    #   motif:        (N, L) sparse int8   → 1=CG, 2=CH, 0=non-C
+    base_map = {"A": 1, "C": 2, "G": 3, "T": 4}
+    base_vals = np.zeros(nnz, dtype=np.int8)
+    motif_vals = np.zeros(nnz, dtype=np.int8)
+    for i, (r, c) in enumerate(zip(rows, cols)):
+        seq = str(seqs[r])[:L].upper()
+        base_map_val = base_map.get(seq[c], 0)
+        base_vals[i] = base_map_val
+        if base_map_val == 2:  # C
+            if c + 1 < L and seq[c + 1] == "G":
+                motif_vals[i] = 1  # CG
+            else:
+                motif_vals[i] = 2  # CH
+
     adata = ad.AnnData(X=X_sp, obs=obs_df, var=var_df)
     adata.layers["targets"] = t_sp
     adata.layers["masks"] = m_sp
+    adata.layers["base_encoded"] = csc_matrix(
+        (base_vals, (rows, cols)), shape=shape, dtype=np.int8
+    )
+    adata.layers["motif"] = csc_matrix(
+        (motif_vals, (rows, cols)), shape=shape, dtype=np.int8
+    )
 
     # Gzipped compression — still fast to read back
     adata.write(output_path, compression="gzip")
