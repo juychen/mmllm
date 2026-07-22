@@ -249,7 +249,7 @@ def parse_args():
     p.add_argument("--sample-sizes", nargs="+", default=["all"])
     p.add_argument("--train-ratio", type=float, default=0.8)
     p.add_argument("--batch-size", type=int, default=4)
-    p.add_argument("--mask-mode", choices=["cpg_both", "cpg_forward", "all"], default="cpg_forward")
+    p.add_argument("--mask-mode", choices=["cpg_both", "cpg_forward", "c_only", "all"], default="cpg_forward")
     p.add_argument("--atac-scaling", choices=["none", "minmax"], default="minmax")
 
     # model

@@ -435,6 +435,9 @@ def resolve_loss_mask(mask_mode: str, base_ids_tensor: torch.Tensor) -> torch.Te
         mask = find_cpg_candidate_positions(base_ids_tensor)
     elif mask_mode == "cpg_forward":
         mask = find_forward_cpg_positions(base_ids_tensor)
+    elif mask_mode == "c_only":
+        # Only cytosine positions are eligible (both strands count via the C/G mapping).
+        mask = base_ids_tensor == 1
     elif mask_mode == "all":
         mask = torch.ones_like(base_ids_tensor, dtype=torch.bool)
     else:

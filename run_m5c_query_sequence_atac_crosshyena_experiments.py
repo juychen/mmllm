@@ -885,7 +885,7 @@ def parse_args():
     parser.add_argument("--amp", action="store_true", help="Enable automatic mixed precision (bfloat16) training. Reduces memory ~2x, recommended for long sequences.")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1, help="Accumulate gradients over N mini-batches before each optimizer step. Use with --batch-size 4-8 for long sequences.")
     parser.add_argument("--gradient-checkpointing", action="store_true", help="Enable gradient checkpointing to trade compute for memory. Recommended for very long sequences (8k+).")
-    parser.add_argument("--mask-mode", choices=["cpg_both", "cpg_forward", "all"], default="cpg_both")
+    parser.add_argument("--mask-mode", choices=["cpg_both", "cpg_forward", "c_only", "all"], default="cpg_both")
     parser.add_argument("--augment-reverse-complement", action="store_true")
     parser.add_argument("--use-all-input-groups", action="store_true")
     parser.add_argument(

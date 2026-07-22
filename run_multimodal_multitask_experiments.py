@@ -554,7 +554,7 @@ def parse_args():
     )
     parser.add_argument(
         "--mask-mode",
-        choices=["cpg_both", "cpg_forward", "all"],
+        choices=["cpg_both", "cpg_forward", "c_only", "all"],
         default="cpg_both",
         help="Loss mask to apply over positions.",
     )
