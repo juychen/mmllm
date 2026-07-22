@@ -33,7 +33,7 @@ python run_m5c_query_sequence_atac_crosshyena_experiments.py \
   --atac-bw /data1st1/junyi/methdata/atac/AMY_MC_track.bw \
   --output-csv "${output_dir}/${current_time}_test_results.csv" \
   --output-json "${output_dir}/${current_time}_test_results.json" \
-  --prediction-signal-csv "${output_dir}/${current_time}_test_{sample_size}.csv" \
+  --prediction-signal-h5ad "${output_dir}/${current_time}_test_{sample_size}.h5ad" \
   --regression-plot-path "${output_dir}/${current_time}_test_{sample_size}.png" \
   --best-checkpoint-path "${output_dir}/${current_time}_test_best_{sample_size}.pt" \
   --last-checkpoint-path "${output_dir}/${current_time}_test_last_{sample_size}.pt" \

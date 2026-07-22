@@ -87,7 +87,7 @@ python run_m5c_query_sequence_atac_crosshyena_experiments.py \
   --timestamp "$current_time" \
   --output-csv "${output_dir}/${current_time}_m5c_query_sequence_atac_crosshyena_modelb_cross_hyena_results.csv" \
   --output-json "${output_dir}/${current_time}_m5c_query_sequence_atac_crosshyena_modelb_cross_hyena_results.json" \
-  --prediction-signal-csv "${output_dir}/${current_time}_m5c_query_sequence_atac_crosshyena_modelb_cross_hyena_{sample_size}.csv" \
+  --prediction-signal-h5ad "${output_dir}/${current_time}_m5c_query_sequence_atac_crosshyena_modelb_cross_hyena_{sample_size}.h5ad" \
   --regression-plot-path "${output_dir}/${current_time}_m5c_query_sequence_atac_crosshyena_modelb_cross_hyena_{sample_size}.png" \
   --best-checkpoint-path "${output_dir}/${current_time}_m5c_query_sequence_atac_crosshyena_modelb_cross_hyena_best_{sample_size}.pt" \
   --last-checkpoint-path "${output_dir}/${current_time}_m5c_query_sequence_atac_crosshyena_modelb_cross_hyena_last_{sample_size}.pt"

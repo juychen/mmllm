@@ -21,7 +21,7 @@ python run_sample_size_experiments.py \
   --scheduler-min-lr 1e-5 \
   --output-csv output/${current_time}_${region}_mc_hmc_results.csv \
   --output-json output/${current_time}_${region}_mc_hmc_results.json \
-  --prediction-signal-csv output/${current_time}_${region}_prediction_mchmc_{sample_size}.csv \
+  --prediction-signal-h5ad output/${current_time}_${region}_prediction_mchmc_{sample_size}.csv \
   --regression-plot-path output/${current_time}_${region}_regression_mchmc_{sample_size}.png
 
 current_time=$(date "+%Y-%m-%d-%H-%M-%S")
@@ -38,7 +38,7 @@ python run_atac_query_sequence_context_experiments.py \
   --timestamp "$current_time" \
   --output-csv output/${current_time}_${region}_atac_5mc_results.csv \
   --output-json output/${current_time}_${region}_atac_5mc_results.json \
-  --prediction-signal-csv output/${current_time}_${region}_prediction_5mc_{sample_size}.csv \
+  --prediction-signal-h5ad output/${current_time}_${region}_prediction_5mc_{sample_size}.csv \
   --regression-plot-path output/${current_time}_${region}_regression_5mc_{sample_size}.png
 
 current_time=$(date "+%Y-%m-%d-%H-%M-%S")
@@ -55,5 +55,5 @@ python run_atac_query_sequence_context_experiments.py \
   --timestamp "$current_time" \
   --output-csv output/${current_time}_${region}_atac_5h_results.csv \
   --output-json output/${current_time}_${region}_atac_5h_results.json \
-  --prediction-signal-csv output/${current_time}_${region}_prediction_5h_{sample_size}.csv \
+  --prediction-signal-h5ad output/${current_time}_${region}_prediction_5h_{sample_size}.csv \
   --regression-plot-path output/${current_time}_${region}_regression_5h_{sample_size}.png

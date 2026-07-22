@@ -138,6 +138,108 @@ def export_prediction_signals(
     return prediction_frame
 
 
+def export_prediction_signals_h5ad(
+    output_path: str,
+    region_metadata: pd.DataFrame,
+    predictions: np.ndarray,
+    targets: np.ndarray,
+    masks: np.ndarray,
+) -> None:
+    """Export predictions, targets, and masks to sparse .h5ad (AnnData).
+
+    Only C positions (where methylation can occur) are stored as CSC sparse
+    matrices; non-C positions are implicitly 0, achieving ~75-80% compression
+    vs a dense matrix.
+
+    .X                = predicted signal (CSC float32, non-C → 0)
+    .layers['targets'] = ground-truth signal (CSC float32, non-C → 0)
+    .layers['masks']   = loss mask (CSC bool)
+    .obs              = region-level metadata
+    .var              = position-level metadata: position_idx, base (A/C/G/T),
+                        motif (CG/CH if base=C, otherwise "")
+    """
+    import anndata as ad
+    from scipy.sparse import csc_matrix
+
+    output_path = str(output_path)
+    if not output_path.endswith(".h5ad"):
+        output_path += ".h5ad"
+
+    ensure_parent_dir(output_path)
+
+    N, L = predictions.shape
+    seqs = region_metadata["sequence"].values
+
+    # Build boolean mask of C positions only (non-C → implicit 0 in sparse)
+    seq_chars = np.array([list(str(s)[:L]) for s in seqs])   # (N, L), dtype='<U1'
+    c_mask = seq_chars == "C"                                 # (N, L)
+    del seq_chars
+
+    rows, cols = np.where(c_mask)   # indices of C positions
+    nnz = len(rows)
+
+    if nnz == 0:
+        print(f"[export_prediction_signals_h5ad] WARNING: no C positions found → "
+              f"{output_path.replace('.h5ad', '.empty.info')}")
+        Path(output_path.replace(".h5ad", ".empty.info")).touch()
+        return
+
+    pred_vals = np.asarray(predictions)[rows, cols].astype(np.float32)
+    tgt_vals = np.asarray(targets)[rows, cols].astype(np.float32)
+    msk_vals = np.asarray(masks)[rows, cols].astype(np.int8)
+
+    shape = (N, L)
+
+    # Build sparse matrices (CSC) — non-C positions are implicitly 0
+    X_sp = csc_matrix((pred_vals, (rows, cols)), shape=shape, dtype=np.float32)
+    t_sp = csc_matrix((tgt_vals, (rows, cols)), shape=shape, dtype=np.float32)
+    m_sp = csc_matrix((msk_vals, (rows, cols)), shape=shape, dtype=np.int8)
+
+    # .var: position-level metadata
+    # Use the first region's sequence as reference base for each column.
+    ref_seq = str(seqs[0])[:L].upper()
+    bases = list(ref_seq)
+    motifs = []
+    for j in range(L):
+        if bases[j] == "C":
+            if j + 1 < L and ref_seq[j + 1] == "G":
+                motifs.append("CG")
+            else:
+                motifs.append("CH")
+        else:
+            motifs.append("")
+
+    var_df = pd.DataFrame({
+        "position_idx": range(L),
+        "base": bases,
+        "motif": motifs,
+    })
+    var_df.index = [f"pos_{j}" for j in range(L)]
+
+    # .obs: region metadata (select relevant columns)
+    obs_cols = ["chr", "start_expanded", "end_expanded", "strand_view"]
+    available = [c for c in obs_cols if c in region_metadata.columns]
+    obs_df = region_metadata[available].reset_index(drop=True).copy()
+    if "original_idx" in region_metadata.columns:
+        obs_df["original_idx"] = region_metadata["original_idx"].values
+    # .obs_names = "chr:start-end"
+    obs_df.index = [
+        f"{row['chr']}:{int(row['start_expanded'])}-{int(row['end_expanded'])}"
+        for _, row in obs_df.iterrows()
+    ]
+
+    adata = ad.AnnData(X=X_sp, obs=obs_df, var=var_df)
+    adata.layers["targets"] = t_sp
+    adata.layers["masks"] = m_sp
+
+    # Gzipped compression — still fast to read back
+    adata.write(output_path, compression="gzip")
+    density_pct = 100.0 * nnz / max(N * L, 1)
+    print(f"[export_prediction_signals_h5ad] {N:,} regions × {L:,} positions, "
+          f"{nnz:,} C positions ({density_pct:.1f}% density, ~{100/density_pct:.0f}× sparse vs dense) "
+          f"→ {output_path}")
+
+
 def plot_regression_predictions(
     output_path: str,
     predictions,

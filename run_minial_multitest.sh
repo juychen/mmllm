@@ -50,5 +50,5 @@ python run_multimodal_multitask_experiments.py \
   --scheduler-min-lr 1e-5 \
   --output-csv ${output_dir}/${current_time}_multi3_results.csv \
   --output-json ${output_dir}/${current_time}_multi3_results.json \
-  --prediction-signal-csv ${output_dir}/${current_time}_multi3_{sample_size}.csv \
+  --prediction-signal-h5ad ${output_dir}/${current_time}_multi3_{sample_size}.csv \
   --regression-plot-path ${output_dir}/${current_time}_multi3_{sample_size}.png

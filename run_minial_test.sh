@@ -53,7 +53,7 @@ python run_multimodal_track_experiments.py \
   --scheduler-min-lr 1e-5 \
   --output-csv ${output_dir}/${current_time}_atac_to_5hmc_results.csv \
   --output-json ${output_dir}/${current_time}_atac_to_5hmc_results.json \
-  --prediction-signal-csv ${output_dir}/${current_time}_atac_to_5hmc_{sample_size}.csv \
+  --prediction-signal-h5ad ${output_dir}/${current_time}_atac_to_5hmc_{sample_size}.csv \
   --regression-plot-path ${output_dir}/${current_time}_atac_to_5hmc_{sample_size}.png
 
 current_time=$(date "+%Y-%m-%d-%H-%M-%S")
@@ -76,7 +76,7 @@ python run_multimodal_track_experiments.py \
   --timestamp "$current_time" \
   --output-csv ${output_dir}/${current_time}_5mc_to_5hmc_results.csv \
   --output-json ${output_dir}/${current_time}_5mc_to_5hmc_results.json \
-  --prediction-signal-csv ${output_dir}/${current_time}_5mc_to_5hmc_{sample_size}.csv \
+  --prediction-signal-h5ad ${output_dir}/${current_time}_5mc_to_5hmc_{sample_size}.csv \
   --regression-plot-path ${output_dir}/${current_time}_5mc_to_5hmc_{sample_size}.png
 
 current_time=$(date "+%Y-%m-%d-%H-%M-%S")
@@ -99,7 +99,7 @@ python run_multimodal_track_experiments.py \
   --timestamp "$current_time" \
   --output-csv ${output_dir}/${current_time}_5hmc_to_5mc_results.csv \
   --output-json ${output_dir}/${current_time}_5hmc_to_5mc_results.json \
-  --prediction-signal-csv ${output_dir}/${current_time}_5hmc_to_5mc_{sample_size}.csv \
+  --prediction-signal-h5ad ${output_dir}/${current_time}_5hmc_to_5mc_{sample_size}.csv \
   --regression-plot-path ${output_dir}/${current_time}_5hmc_to_5mc_{sample_size}.png
 
 current_time=$(date "+%Y-%m-%d-%H-%M-%S")
@@ -122,5 +122,5 @@ python run_multimodal_track_experiments.py \
   --timestamp "$current_time" \
   --output-csv ${output_dir}/${current_time}_atac_to_5mc_results.csv \
   --output-json ${output_dir}/${current_time}_atac_to_5mc_results.json \
-  --prediction-signal-csv ${output_dir}/${current_time}_atac_to_5mc_{sample_size}.csv \
+  --prediction-signal-h5ad ${output_dir}/${current_time}_atac_to_5mc_{sample_size}.csv \
   --regression-plot-path ${output_dir}/${current_time}_atac_to_5mc_{sample_size}.png

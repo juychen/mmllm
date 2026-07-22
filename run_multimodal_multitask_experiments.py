@@ -19,7 +19,7 @@ from data import (
 from data import augment_with_reverse_complement, prepare_multimodal_multitask_data
 from models import MinimalCrossHyenaRegressor
 from utils import (
-    export_prediction_signals,
+    export_prediction_signals_h5ad,
     plot_regression_predictions,
     resolve_sample_sizes,
     set_random_seed,
@@ -42,7 +42,7 @@ class ExperimentResult:
     final_val_loss: float
     final_val_r2: float
     final_val_pearsonr: float
-    signal_csvs: dict
+    signal_h5ads: dict
     regression_plots: dict
     checkpoint_paths: dict
     final_val_loss_per_task: dict
@@ -362,7 +362,7 @@ def run_experiment(num_dmrs, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_t
     final_val_r2_per_task = {task: per_r2s[i] for i, task in enumerate(task_names)}
     final_val_pearsonr_per_task = {task: per_pearsons[i] for i, task in enumerate(task_names)}
     # Base templates (used to derive per-task paths)
-    signal_csv = args.prediction_signal_csv.format(sample_size=prepared["usable_dmrs"], timestamp=args.timestamp)
+    signal_h5ad = args.prediction_signal_h5ad.format(sample_size=prepared["usable_dmrs"], timestamp=args.timestamp)
     regression_plot = args.regression_plot_path.format(sample_size=prepared["usable_dmrs"], timestamp=args.timestamp)
     input_group_files = []
     if "input_group" in df_dmr.columns:
@@ -392,22 +392,21 @@ def run_experiment(num_dmrs, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_t
         )
     # Export predictions and plots per task dimension. dim 0 -> 5mc, dim 1 -> 5hmc
     task_names = ["5mc", "5hmc", "c"]
-    signal_csvs = {}
+    signal_h5ads = {}
     regression_plots = {}
     for dim, task in enumerate(task_names):
         preds_dim = final_preds[..., dim].numpy()
         targets_dim = final_targets[..., dim].numpy()
         masks_dim = final_masks[..., dim].numpy()
         # create per-task file paths by inserting task name before extension
-        if signal_csv.endswith(".csv"):
-            #task_signal_csv = signal_csv.replace("multi_", f"multi3_{task}_")
-            task_signal_csv = args.prediction_signal_csv.format(
+        if signal_h5ad.endswith(".h5ad"):
+            task_signal_h5ad = args.prediction_signal_h5ad.format(
                 sample_size=f"{task}_{prepared['usable_dmrs']}",
                 timestamp=args.timestamp,
             )
 
         else:
-            task_signal_csv = f"{signal_csv}_{task}.csv"
+            task_signal_h5ad = f"{signal_h5ad}_{task}.h5ad"
         if regression_plot.endswith(".png"):
             #task_plot = regression_plot.replace("multi_", f"multi3_{task}_")
             task_plot = args.regression_plot_path.format(
@@ -417,8 +416,8 @@ def run_experiment(num_dmrs, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_t
         else:
             task_plot = f"{regression_plot}_{task}.png"
 
-        export_prediction_signals(
-            task_signal_csv,
+        export_prediction_signals_h5ad(
+            task_signal_h5ad,
             prepared["val_region_metadata"],
             preds_dim,
             targets_dim,
@@ -431,7 +430,7 @@ def run_experiment(num_dmrs, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_t
             masks_dim,
             title=f"ATAC+sequence multitask {task} (n={prepared['usable_dmrs']})",
         )
-        signal_csvs[task] = task_signal_csv
+        signal_h5ads[task] = task_signal_h5ad
         regression_plots[task] = task_plot
     return ExperimentResult(
         num_dmrs=prepared["usable_dmrs"],
@@ -440,7 +439,7 @@ def run_experiment(num_dmrs, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_t
         output_files={
             "results_csv": args.output_csv,
             "results_json": args.output_json,
-            "signal_csvs": signal_csvs,
+            "signal_h5ads": signal_h5ads,
             "regression_plots": regression_plots,
             "checkpoints": {
                 "best": best_checkpoint_path,
@@ -458,7 +457,7 @@ def run_experiment(num_dmrs, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_t
         final_val_loss=final_val_loss,
         final_val_r2=final_val_r2,
         final_val_pearsonr=final_val_pearsonr,
-        signal_csvs=signal_csvs,
+        signal_h5ads=signal_h5ads,
         regression_plots=regression_plots,
         checkpoint_paths={
             "best": best_checkpoint_path,
@@ -527,9 +526,9 @@ def parse_args():
     parser.add_argument("--output-json", default="output/multimodal_multitask_results.json")
     parser.add_argument("--timestamp", default="", help="Optional timestamp string for output path templates.")
     parser.add_argument(
-        "--prediction-signal-csv",
-        default="output/{timestamp}_multimodal_multitask_prediction_signals_{sample_size}.csv",
-        help="Per-sample-size CSV export path template for predicted and true methylation signals.",
+        "--prediction-signal-h5ad",
+        default="output/{timestamp}_multimodal_multitask_prediction_signals_{sample_size}.h5ad",
+        help="Per-sample-size h5ad export path template for predicted and true methylation signals.",
     )
     parser.add_argument(
         "--regression-plot-path",
@@ -606,9 +605,9 @@ def main():
         mod_results = []
         for r in results:
             mod_r = r.copy()
-            signal = mod_r.pop("signal_csvs", {}).get(task)
+            signal = mod_r.pop("signal_h5ads", {}).get(task)
             plot = mod_r.pop("regression_plots", {}).get(task)
-            mod_r["signal_csv"] = signal
+            mod_r["signal_h5ad"] = signal
             mod_r["regression_plot"] = plot
             # replace aggregated final metrics with per-task metrics for this modality
             mod_r["final_val_loss"] = mod_r.pop("final_val_loss_per_task", {}).get(task)

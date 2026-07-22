@@ -9,7 +9,7 @@ import torch.nn as nn
 from data import load_data, prepare_experiment_data
 from models import MinimalCrossHyenaRegressor
 from utils import (
-    export_prediction_signals,
+    export_prediction_signals_h5ad,
     plot_regression_predictions,
     resolve_sample_sizes,
     set_random_seed,
@@ -142,7 +142,7 @@ class ExperimentResult:
     final_val_loss: float
     final_val_r2: float
     final_val_pearsonr: float
-    signal_csv: str
+    signal_h5ad: str
     regression_plot: str
 
 
@@ -244,10 +244,10 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
     final_val_loss, final_val_r2, final_val_pearsonr = evaluate(model, prepared.val_loader, device)
     final_preds, final_targets, final_masks = collect_predictions(model, prepared.val_loader, device)
 
-    signal_csv = args.prediction_signal_csv.format(sample_size=prepared.usable_dmrs, timestamp=args.timestamp)
+    signal_h5ad = args.prediction_signal_h5ad.format(sample_size=prepared.usable_dmrs, timestamp=args.timestamp)
     regression_plot = args.regression_plot_path.format(sample_size=prepared.usable_dmrs, timestamp=args.timestamp)
-    export_prediction_signals(
-        signal_csv,
+    export_prediction_signals_h5ad(
+        signal_h5ad,
         prepared.val_region_metadata,
         final_preds.numpy(),
         final_targets.numpy(),
@@ -277,7 +277,7 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
         final_val_loss=final_val_loss,
         final_val_r2=final_val_r2,
         final_val_pearsonr=final_val_pearsonr,
-        signal_csv=signal_csv,
+        signal_h5ad=signal_h5ad,
         regression_plot=regression_plot,
     )
 
@@ -323,9 +323,9 @@ def parse_args():
     parser.add_argument("--output-json", default="output/sample_size_results.json")
     parser.add_argument("--timestamp", default="", help="Optional timestamp string for output path templates.")
     parser.add_argument(
-        "--prediction-signal-csv",
-        default="output/{timestamp}_prediction_signals_{sample_size}.csv",
-        help="Per-sample-size CSV export path template for predicted and true methylation signals.",
+        "--prediction-signal-h5ad",
+        default="output/{timestamp}_prediction_signals_{sample_size}.h5ad",
+        help="Per-sample-size h5ad export path template for predicted and true methylation signals.",
     )
     parser.add_argument(
         "--regression-plot-path",

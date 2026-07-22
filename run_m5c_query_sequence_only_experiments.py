@@ -37,7 +37,7 @@ from data import (
 from data_sequence_only import LazyM5cSequenceOnlyDataset
 from models_sequence_only import M5CQuerySequenceOnlyCrossHyenaRegressorModelB
 from utils import (
-    export_prediction_signals,
+    export_prediction_signals_h5ad,
     get_freest_gpu,
     plot_regression_predictions,
     resolve_sample_sizes,
@@ -310,7 +310,7 @@ class ExperimentResult:
     final_val_loss: float
     final_val_r2: float
     final_val_pearsonr: float
-    signal_csv: str
+    signal_h5ad: str
     regression_plot: str
     checkpoint_paths: dict
 
@@ -449,14 +449,14 @@ def run_experiment(num_dmrs, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_t
     final_val_loss, final_val_r2, final_val_pearsonr = evaluate(model, prepared.val_loader, device)
     final_preds, final_targets, final_masks = collect_predictions(model, prepared.val_loader, device)
 
-    signal_csv = args.prediction_signal_csv.format(
+    signal_h5ad = args.prediction_signal_h5ad.format(
         sample_size=prepared.usable_dmrs, timestamp=args.timestamp
     )
     regression_plot = args.regression_plot_path.format(
         sample_size=prepared.usable_dmrs, timestamp=args.timestamp
     )
-    export_prediction_signals(
-        signal_csv,
+    export_prediction_signals_h5ad(
+        signal_h5ad,
         prepared.val_region_metadata,
         final_preds.squeeze(-1).numpy(),
         final_targets.squeeze(-1).numpy(),
@@ -485,7 +485,7 @@ def run_experiment(num_dmrs, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_t
         output_files={
             "results_csv": args.output_csv,
             "results_json": args.output_json,
-            "signal_csv": signal_csv,
+            "signal_h5ad": signal_h5ad,
             "regression_plot": regression_plot,
             "checkpoints": {"best": best_checkpoint_path, "last": last_checkpoint_path},
         },
@@ -500,7 +500,7 @@ def run_experiment(num_dmrs, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_t
         final_val_loss=final_val_loss,
         final_val_r2=final_val_r2,
         final_val_pearsonr=final_val_pearsonr,
-        signal_csv=signal_csv,
+        signal_h5ad=signal_h5ad,
         regression_plot=regression_plot,
         checkpoint_paths={"best": best_checkpoint_path, "last": last_checkpoint_path},
     )
@@ -561,8 +561,8 @@ def parse_args():
     parser.add_argument("--output-json", default="output/m5c_query_sequence_only_results.json")
     parser.add_argument("--timestamp", default="")
     parser.add_argument(
-        "--prediction-signal-csv",
-        default="output/{timestamp}_m5c_query_sequence_only_prediction_signals_{sample_size}.csv",
+        "--prediction-signal-h5ad",
+        default="output/{timestamp}_m5c_query_sequence_only_prediction_signals_{sample_size}.h5ad",
     )
     parser.add_argument(
         "--regression-plot-path",

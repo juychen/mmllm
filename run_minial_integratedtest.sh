@@ -84,7 +84,7 @@ run_experiment() {
     --scheduler-min-lr 1e-5
     --output-csv "${output_dir}/${current_time}_multi_integrated_results.csv"
     --output-json "${output_dir}/${current_time}_multi_integrated_results.json"
-    --prediction-signal-csv "${output_dir}/${current_time}_${chrom}_multi_integrated_{sample_size}.csv"
+    --prediction-signal-h5ad "${output_dir}/${current_time}_${chrom}_multi_integrated_{sample_size}.h5ad"
     --regression-plot-path "${output_dir}/${current_time}_${chrom}_multi_integrated_{sample_size}.png"
     --best-checkpoint-path "${output_dir}/${current_time}_${chrom}_multi_integrated_best_{sample_size}.pt"
     --last-checkpoint-path "${output_dir}/${current_time}_${chrom}_multi_integrated_last_{sample_size}.pt"

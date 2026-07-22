@@ -34,7 +34,7 @@ from models import (
     M5CQuerySequenceAtacCrossHyenaRegressorModelB,
 )
 from utils import (
-    export_prediction_signals,
+    export_prediction_signals_h5ad,
     get_freest_gpu,
     plot_regression_predictions,
     resolve_sample_sizes,
@@ -415,17 +415,17 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     ckpt_stem = ckpt_path.stem  # e.g. "2025-01-01-12-00-00_...best_500000"
 
-    signal_csv = out_dir / f"{ckpt_stem}_inference_predictions.csv"
+    signal_h5ad = out_dir / f"{ckpt_stem}_inference_predictions.h5ad"
     regression_plot = out_dir / f"{ckpt_stem}_inference_regression.png"
 
-    export_prediction_signals(
-        str(signal_csv),
+    export_prediction_signals_h5ad(
+        str(signal_h5ad),
         prepared.region_metadata,
         all_preds.squeeze(-1).numpy(),
         all_targets.squeeze(-1).numpy(),
         all_masks.squeeze(-1).numpy(),
     )
-    print(f"Predictions saved to: {signal_csv}")
+    print(f"Predictions saved to: {signal_h5ad}")
 
     plot_regression_predictions(
         str(regression_plot),

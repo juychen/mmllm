@@ -63,7 +63,7 @@ run_experiment() {
     --atac-bw "/data1st1/junyi/methdata/atac/${region}_${condition}_track.bw" \
     --output-csv "${output_dir}/${current_time}_${run_label}_results.csv" \
     --output-json "${output_dir}/${current_time}_${run_label}_results.json" \
-    --prediction-signal-csv "${output_dir}/${current_time}_${run_label}_{sample_size}.csv" \
+    --prediction-signal-h5ad "${output_dir}/${current_time}_${run_label}_{sample_size}.h5ad" \
     --regression-plot-path "${output_dir}/${current_time}_${run_label}_{sample_size}.png" \
     --best-checkpoint-path "${output_dir}/${current_time}_${run_label}_best_{sample_size}.pt" \
     --last-checkpoint-path "${output_dir}/${current_time}_${run_label}_last_{sample_size}.pt" \
