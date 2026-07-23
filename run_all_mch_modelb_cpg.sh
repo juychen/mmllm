@@ -30,7 +30,7 @@ run_experiment() {
   local bed_name
   bed_name="$(basename "$dmr_csv" .bed | sed 's/\.bed\.gz//')"
 
-  run_label="m5ch_query_sequence_atac_crosshyena_modelb_${fusion_type}"
+  run_label="mch_query_sequence_atac_crosshyena_modelb_${fusion_type}"
   output_dir="output/${region}_${condition}/${bed_name}"
   mkdir -p "$output_dir"
   log_file="${output_dir}/${current_time}_${run_label}.log"
