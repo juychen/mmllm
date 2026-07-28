@@ -62,6 +62,28 @@ def fast_tabix_to_track(tbx: pysam.TabixFile, chrom: str, start_1based: int, end
     return track
 
 
+def _detect_track_format(path: str) -> str:
+    """Detect whether a track file is bigWig or bedGraph based on extension."""
+    lower = path.lower()
+    if lower.endswith(".bw") or lower.endswith(".bigwig"):
+        return "bigwig"
+    return "bedgraph"
+
+
+def _open_track_handle(path: str, fmt: str):
+    """Open a track file handle. ``fmt`` is 'bigwig' or 'bedgraph'."""
+    if fmt == "bigwig":
+        return pyBigWig.open(path)
+    return pysam.TabixFile(path)
+
+
+def read_track_region(handle, fmt: str, chrom: str, start: int, end: int) -> np.ndarray:
+    """Read a track region as a 1D numpy array. ``fmt`` is 'bigwig' or 'bedgraph'."""
+    if fmt == "bigwig":
+        return np.nan_to_num(handle.values(chrom, start, end + 1), nan=0.0)
+    return fast_tabix_to_track(handle, chrom, start, end)
+
+
 # def find_cpg_candidate_positions(base_ids: torch.Tensor) -> torch.Tensor:
 #     is_c = base_ids == 1
 #     is_g = base_ids == 2
@@ -306,9 +328,14 @@ def load_data(args, lazy: bool = False):
                 "When --use-all-input-groups is enabled, --m5c-bedgraph must have the same number of paths as --hm5c-bedgraph."
             )
 
-    tbx_5hmc_list = [pysam.TabixFile(path) for path in hm5c_paths]
-    tbx_5mc_list = [pysam.TabixFile(path) for path in m5c_paths] if should_load_5mc else []
-    atac_bw_list = [pyBigWig.open(path) for path in atac_paths]
+    # Detect formats once (cached — no per-region overhead)
+    hm5c_formats = [_detect_track_format(p) for p in hm5c_paths]
+    m5c_formats = [_detect_track_format(p) for p in m5c_paths] if should_load_5mc else []
+    atac_formats = [_detect_track_format(p) for p in atac_paths]
+
+    tbx_5hmc_list = [_open_track_handle(p, f) for p, f in zip(hm5c_paths, hm5c_formats)]
+    tbx_5mc_list = [_open_track_handle(p, f) for p, f in zip(m5c_paths, m5c_formats)] if should_load_5mc else []
+    atac_bw_list = [_open_track_handle(p, f) for p, f in zip(atac_paths, atac_formats)]
 
     seqs = []
     mcg_tracks = []
@@ -327,6 +354,9 @@ def load_data(args, lazy: bool = False):
         tbx_5hmc = tbx_5hmc_list[group_idx]
         tbx_5mc = tbx_5mc_list[group_idx] if should_load_5mc else None
         atac_bw = atac_bw_list[group_idx]
+        hm5c_fmt = hm5c_formats[group_idx]
+        m5c_fmt = m5c_formats[group_idx] if should_load_5mc else None
+        atac_fmt = atac_formats[group_idx]
         for _, row in df_dmr.iterrows():
             # Normalize: strip existing "chr" prefix if present, then re-add consistently
             chrom_name = str(row["chr"]).removeprefix("chr")
@@ -335,9 +365,9 @@ def load_data(args, lazy: bool = False):
             end = int(row["end_expanded"])
             seqs.append(get_sequence(chrom, start, end, genome))
             if tbx_5mc is not None:
-                mcg_tracks.append(fast_tabix_to_track(tbx_5mc, chrom_name, start, end))
-            hmcg_tracks.append(fast_tabix_to_track(tbx_5hmc, chrom_name, start, end))
-            atac_tracks.append(np.nan_to_num(atac_bw.values(chrom, start, end + 1), nan=0.0))
+                mcg_tracks.append(read_track_region(tbx_5mc, m5c_fmt, chrom_name, start, end))
+            hmcg_tracks.append(read_track_region(tbx_5hmc, hm5c_fmt, chrom_name, start, end))
+            atac_tracks.append(read_track_region(atac_bw, atac_fmt, chrom, start, end + 1))
 
     combined_df_dmr = pd.concat(dmr_frames, ignore_index=True)
     if use_all_input_groups:
@@ -785,13 +815,11 @@ class LazyM5cSequenceAtacDataset(torch.utils.data.Dataset):
     """
 
     def _open_handles(self):
-        import pyBigWig
         import pyfaidx
-        import pysam
         self._genome = pyfaidx.Fasta(self.genome_fasta)
-        self._tbx_5mc = pysam.TabixFile(self.m5c_bedgraph)
-        self._tbx_5hmc = pysam.TabixFile(self.hm5c_bedgraph)
-        self._atac_bw = pyBigWig.open(self.atac_bw_path)
+        self._tbx_5mc = _open_track_handle(self.m5c_bedgraph, self._m5c_fmt)
+        self._tbx_5hmc = _open_track_handle(self.hm5c_bedgraph, self._hm5c_fmt)
+        self._atac_bw = _open_track_handle(self.atac_bw_path, self._atac_fmt)
 
     def _close_handles(self):
         """Close all open file handles. Safe to call multiple times."""
@@ -829,6 +857,10 @@ class LazyM5cSequenceAtacDataset(torch.utils.data.Dataset):
         self.augment_rc = augment_rc
         self.N = len(indices)
         self._base_to_index = {"A": 0, "C": 1, "G": 2, "T": 3, "N": 0}
+        # Detect track formats once at init (cached — zero per-sample overhead)
+        self._m5c_fmt = _detect_track_format(m5c_bedgraph)
+        self._hm5c_fmt = _detect_track_format(hm5c_bedgraph)
+        self._atac_fmt = _detect_track_format(atac_bw_path)
         self._genome = None
         self._tbx_5mc = None
         self._tbx_5hmc = None
@@ -877,9 +909,9 @@ class LazyM5cSequenceAtacDataset(torch.utils.data.Dataset):
 
         # --- fetch on the fly ---
         seq_str = get_sequence(chrom, start, end, self._genome)
-        hm5c = fast_tabix_to_track(self._tbx_5hmc, chrom_name, start, end)
-        atac = np.nan_to_num(self._atac_bw.values(chrom, start, end + 1), nan=0.0)
-        m5c = fast_tabix_to_track(self._tbx_5mc, chrom_name, start, end)
+        hm5c = read_track_region(self._tbx_5hmc, self._hm5c_fmt, chrom_name, start, end)
+        atac = read_track_region(self._atac_bw, self._atac_fmt, chrom_name, start, end + 1)
+        m5c = read_track_region(self._tbx_5mc, self._m5c_fmt, chrom_name, start, end)
 
         # --- determine common length ---
         seq_len = min(self.target_length, len(seq_str), len(hm5c), len(atac), len(m5c))
