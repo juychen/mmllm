@@ -365,8 +365,8 @@ def load_data(args, lazy: bool = False):
             end = int(row["end_expanded"])
             seqs.append(get_sequence(chrom, start, end, genome))
             if tbx_5mc is not None:
-                mcg_tracks.append(read_track_region(tbx_5mc, m5c_fmt, chrom_name, start, end))
-            hmcg_tracks.append(read_track_region(tbx_5hmc, hm5c_fmt, chrom_name, start, end))
+                mcg_tracks.append(read_track_region(tbx_5mc, m5c_fmt, chrom, start, end))
+            hmcg_tracks.append(read_track_region(tbx_5hmc, hm5c_fmt, chrom, start, end))
             atac_tracks.append(read_track_region(atac_bw, atac_fmt, chrom, start, end + 1))
 
     combined_df_dmr = pd.concat(dmr_frames, ignore_index=True)
@@ -909,9 +909,9 @@ class LazyM5cSequenceAtacDataset(torch.utils.data.Dataset):
 
         # --- fetch on the fly ---
         seq_str = get_sequence(chrom, start, end, self._genome)
-        hm5c = read_track_region(self._tbx_5hmc, self._hm5c_fmt, chrom_name, start, end)
-        atac = read_track_region(self._atac_bw, self._atac_fmt, chrom_name, start, end + 1)
-        m5c = read_track_region(self._tbx_5mc, self._m5c_fmt, chrom_name, start, end)
+        hm5c = read_track_region(self._tbx_5hmc, self._hm5c_fmt, chrom, start, end)
+        atac = read_track_region(self._atac_bw, self._atac_fmt, chrom, start, end + 1)
+        m5c = read_track_region(self._tbx_5mc, self._m5c_fmt, chrom, start, end)
 
         # --- determine common length ---
         seq_len = min(self.target_length, len(seq_str), len(hm5c), len(atac), len(m5c))

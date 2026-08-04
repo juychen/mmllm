@@ -15,8 +15,8 @@ if [[ "$fusion_type" != "cross_hyena" && "$fusion_type" != "cross_attention" ]];
   exit 1
 fi
 
-regions=("PFC" "HIP")
-conditions=("MC")
+regions=("GSE214845")
+conditions=("WT70_D2")
 
 run_experiment() {
   local region="$1"
@@ -60,9 +60,9 @@ run_experiment() {
     --lazy \
     --timestamp "$current_time" \
     --scheduler-min-lr 1e-5 \
-    --m5c-bedgraph "/data2st1/junyi/output/llm0401/processed_meth/${condition}_${region}.CG.h.bedGraph.gz" \
-    --hm5c-bedgraph "/data2st1/junyi/output/llm0401/processed_meth/${condition}_${region}.CG.m.bedGraph.gz" \
-    --atac-bw "/data1st1/junyi/methdata/atac/${region}_${condition}_track.bw" \
+    --m5c-bedgraph "/data1st1/junyi/methdata/GSE214845/${region}_${condition}_oxBS.bw" \
+    --hm5c-bedgraph "/data1st1/junyi/methdata/GSE214845/${region}_${condition}_5hmC.bw" \
+    --atac-bw "/data1st1/junyi/methdata/GSE214845/${region}_${condition}_ATAC.bigwig" \
     --output-csv "${output_dir}/${current_time}_${run_label}_results.csv" \
     --output-json "${output_dir}/${current_time}_${run_label}_results.json" \
     --prediction-signal-h5ad "${output_dir}/${current_time}_${run_label}_{sample_size}.h5ad" \
