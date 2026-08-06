@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 
 from data import (
+    add_clip_at_zero_argument,
     assign_non_overlapping_groups,
     build_sequence_tensor,
     generate_pretraining_cpg_mask,
@@ -563,6 +564,7 @@ def parse_args():
     parser.add_argument("--scheduler-patience", type=int, default=2)
     parser.add_argument("--scheduler-t-max", type=int, default=0)
     parser.add_argument("--atac-scaling", choices=["none", "minmax"], default="minmax")
+    add_clip_at_zero_argument(parser)
     parser.add_argument("--mask-fraction", type=float, default=0.15)
     parser.add_argument("--amp", action="store_true", help="Enable automatic mixed precision (bfloat16).")
     parser.add_argument("--gradient-checkpointing", action="store_true", help="Enable gradient checkpointing to trade compute for memory.")

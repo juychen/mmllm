@@ -37,6 +37,7 @@ import pyfaidx
 
 from data import (
     LazyM5cSequenceAtacDataset,
+    add_clip_at_zero_argument,
     assign_non_overlapping_groups,
     ensure_path_list,
     get_sequence,
@@ -251,6 +252,7 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--mask-mode", choices=["cpg_both", "cpg_forward", "c_only", "all"], default="cpg_forward")
     p.add_argument("--atac-scaling", choices=["none", "minmax"], default="minmax")
+    add_clip_at_zero_argument(p)
 
     # model
     p.add_argument("--hidden-dim", type=int, default=64)
@@ -367,6 +369,7 @@ def main():
             mask_mode=args.mask_mode,
             atac_scaling=args.atac_scaling,
             augment_rc=args.augment_reverse_complement,
+            clip_at_zero=args.clip_at_zero,
         )
         val_base = LazyM5cSequenceAtacDataset(
             indices=val_indices,
@@ -379,6 +382,7 @@ def main():
             mask_mode=args.mask_mode,
             atac_scaling=args.atac_scaling,
             augment_rc=False,
+            clip_at_zero=args.clip_at_zero,
         )
     else:
         # Non-lazy: just use the whole loaded tensor set (no proper split, for fast dev tests)

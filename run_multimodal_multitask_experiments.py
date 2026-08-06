@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from data import (
+    add_clip_at_zero_argument,
     assign_non_overlapping_groups,
     find_cpg_candidate_positions,
     load_data,
@@ -521,6 +522,7 @@ def parse_args():
     parser.add_argument("--scheduler-patience", type=int, default=2)
     parser.add_argument("--scheduler-t-max", type=int, default=0)
     parser.add_argument("--atac-scaling", choices=["none", "minmax"], default="minmax")
+    add_clip_at_zero_argument(parser)
     parser.add_argument("--seed", type=int, default=7, help="Random seed for reproducible initialization and dataloader shuffling.")
     parser.add_argument("--output-csv", default="output/multimodal_multitask_results.csv")
     parser.add_argument("--output-json", default="output/multimodal_multitask_results.json")

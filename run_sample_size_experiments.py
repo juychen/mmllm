@@ -6,7 +6,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
  
-from data import load_data, prepare_experiment_data
+from data import add_clip_at_zero_argument, load_data, prepare_experiment_data
 from models import MinimalCrossHyenaRegressor
 from utils import (
     export_prediction_signals_h5ad,
@@ -318,6 +318,7 @@ def parse_args():
     parser.add_argument("--scheduler-patience", type=int, default=2)
     parser.add_argument("--scheduler-t-max", type=int, default=0)
     parser.add_argument("--atac-scaling", choices=["none", "minmax"], default="minmax")
+    add_clip_at_zero_argument(parser)
     parser.add_argument("--seed", type=int, default=7, help="Random seed for reproducible initialization and dataloader shuffling.")
     parser.add_argument("--output-csv", default="output/sample_size_results.csv")
     parser.add_argument("--output-json", default="output/sample_size_results.json")

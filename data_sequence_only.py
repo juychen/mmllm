@@ -67,6 +67,7 @@ class LazyM5cSequenceOnlyDataset(torch.utils.data.Dataset):
         atac_bw_path: Optional[str] = None,
         atac_scaling: str = "none",
         augment_rc: bool = False,
+        clip_at_zero: bool = False,
     ):
         self.indices = indices
         self.df_dmr = df_dmr
@@ -78,6 +79,7 @@ class LazyM5cSequenceOnlyDataset(torch.utils.data.Dataset):
         self.mask_mode = mask_mode
         self.atac_scaling = atac_scaling
         self.augment_rc = augment_rc
+        self.clip_at_zero = clip_at_zero
         self.N = len(indices)
         self._base_to_index = {"A": 0, "C": 1, "G": 2, "T": 3, "N": 0}
         self._genome = None
@@ -126,11 +128,17 @@ class LazyM5cSequenceOnlyDataset(torch.utils.data.Dataset):
 
         seq_str = get_sequence(chrom, start, end, self._genome)
         hm5c = fast_tabix_to_track(self._tbx_5hmc, chrom_name, start, end)
+        if self.clip_at_zero:
+            hm5c = np.maximum(hm5c, 0.0)
         m5c = fast_tabix_to_track(self._tbx_5mc, chrom_name, start, end)
+        if self.clip_at_zero:
+            m5c = np.maximum(m5c, 0.0)
         if self._atac_bw is not None:
             atac = np.nan_to_num(self._atac_bw.values(chrom, start, end + 1), nan=0.0)
         else:
             atac = np.zeros(end - start, dtype=np.float32)
+        if self.clip_at_zero:
+            atac = np.maximum(atac, 0.0)
 
         seq_len = min(self.target_length, len(seq_str), len(hm5c), len(atac), len(m5c))
 

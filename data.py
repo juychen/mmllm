@@ -37,6 +37,16 @@ def ensure_path_list(value) -> list[str]:
     return [str(item) for item in value]
 
 
+def add_clip_at_zero_argument(parser):
+    parser.add_argument(
+        "--clip-at-zero",
+        dest="clip_at_zero",
+        action="store_true",
+        help="Clamp negative 5mC, 5hmC, and ATAC input values to zero.",
+    )
+    return parser
+
+
 def get_sequence(chrom: str, start: int, end: int, genome: pyfaidx.Fasta) -> str:
     return genome[chrom][start - 1 : end].seq
 
@@ -77,11 +87,22 @@ def _open_track_handle(path: str, fmt: str):
     return pysam.TabixFile(path)
 
 
-def read_track_region(handle, fmt: str, chrom: str, start: int, end: int) -> np.ndarray:
+def read_track_region(
+    handle,
+    fmt: str,
+    chrom: str,
+    start: int,
+    end: int,
+    clip_at_zero: bool = False,
+) -> np.ndarray:
     """Read a track region as a 1D numpy array. ``fmt`` is 'bigwig' or 'bedgraph'."""
     if fmt == "bigwig":
-        return np.nan_to_num(handle.values(chrom, start, end + 1), nan=0.0)
-    return fast_tabix_to_track(handle, chrom, start, end)
+        values = np.nan_to_num(handle.values(chrom, start, end + 1), nan=0.0)
+    else:
+        values = fast_tabix_to_track(handle, chrom, start, end)
+    if clip_at_zero:
+        values = np.maximum(values, 0.0)
+    return values
 
 
 # def find_cpg_candidate_positions(base_ids: torch.Tensor) -> torch.Tensor:
@@ -332,6 +353,7 @@ def load_data(args, lazy: bool = False):
     hm5c_formats = [_detect_track_format(p) for p in hm5c_paths]
     m5c_formats = [_detect_track_format(p) for p in m5c_paths] if should_load_5mc else []
     atac_formats = [_detect_track_format(p) for p in atac_paths]
+    clip_at_zero = getattr(args, "clip_at_zero", getattr(args, "clip_5hmc_at_zero", False))
 
     tbx_5hmc_list = [_open_track_handle(p, f) for p, f in zip(hm5c_paths, hm5c_formats)]
     tbx_5mc_list = [_open_track_handle(p, f) for p, f in zip(m5c_paths, m5c_formats)] if should_load_5mc else []
@@ -365,9 +387,36 @@ def load_data(args, lazy: bool = False):
             end = int(row["end_expanded"])
             seqs.append(get_sequence(chrom, start, end, genome))
             if tbx_5mc is not None:
-                mcg_tracks.append(read_track_region(tbx_5mc, m5c_fmt, chrom, start, end))
-            hmcg_tracks.append(read_track_region(tbx_5hmc, hm5c_fmt, chrom, start, end))
-            atac_tracks.append(read_track_region(atac_bw, atac_fmt, chrom, start, end + 1))
+                mcg_tracks.append(
+                    read_track_region(
+                        tbx_5mc,
+                        m5c_fmt,
+                        chrom,
+                        start,
+                        end,
+                        clip_at_zero=clip_at_zero,
+                    )
+                )
+            hmcg_tracks.append(
+                read_track_region(
+                    tbx_5hmc,
+                    hm5c_fmt,
+                    chrom,
+                    start,
+                    end,
+                    clip_at_zero=clip_at_zero,
+                )
+            )
+            atac_tracks.append(
+                read_track_region(
+                    atac_bw,
+                    atac_fmt,
+                    chrom,
+                    start,
+                    end + 1,
+                    clip_at_zero=clip_at_zero,
+                )
+            )
 
     combined_df_dmr = pd.concat(dmr_frames, ignore_index=True)
     if use_all_input_groups:
@@ -844,6 +893,7 @@ class LazyM5cSequenceAtacDataset(torch.utils.data.Dataset):
         mask_mode: str,
         atac_scaling: str,
         augment_rc: bool = False,
+        clip_at_zero: bool = False,
     ):
         self.indices = indices
         self.df_dmr = df_dmr
@@ -855,6 +905,7 @@ class LazyM5cSequenceAtacDataset(torch.utils.data.Dataset):
         self.mask_mode = mask_mode
         self.atac_scaling = atac_scaling
         self.augment_rc = augment_rc
+        self.clip_at_zero = clip_at_zero
         self.N = len(indices)
         self._base_to_index = {"A": 0, "C": 1, "G": 2, "T": 3, "N": 0}
         # Detect track formats once at init (cached — zero per-sample overhead)
@@ -909,9 +960,30 @@ class LazyM5cSequenceAtacDataset(torch.utils.data.Dataset):
 
         # --- fetch on the fly ---
         seq_str = get_sequence(chrom, start, end, self._genome)
-        hm5c = read_track_region(self._tbx_5hmc, self._hm5c_fmt, chrom, start, end)
-        atac = read_track_region(self._atac_bw, self._atac_fmt, chrom, start, end + 1)
-        m5c = read_track_region(self._tbx_5mc, self._m5c_fmt, chrom, start, end)
+        hm5c = read_track_region(
+            self._tbx_5hmc,
+            self._hm5c_fmt,
+            chrom,
+            start,
+            end,
+            clip_at_zero=self.clip_at_zero,
+        )
+        atac = read_track_region(
+            self._atac_bw,
+            self._atac_fmt,
+            chrom,
+            start,
+            end + 1,
+            clip_at_zero=self.clip_at_zero,
+        )
+        m5c = read_track_region(
+            self._tbx_5mc,
+            self._m5c_fmt,
+            chrom,
+            start,
+            end,
+            clip_at_zero=self.clip_at_zero,
+        )
 
         # --- determine common length ---
         seq_len = min(self.target_length, len(seq_str), len(hm5c), len(atac), len(m5c))

@@ -29,6 +29,7 @@ import torch.nn as nn
 import pyfaidx
 
 from data import (
+    add_clip_at_zero_argument,
     assign_non_overlapping_groups,
     ensure_path_list,
     get_sequence,
@@ -173,6 +174,7 @@ def prepare_sequence_data(num_dmrs, args, df_dmr, seqs, mcg_tracks, hmcg_tracks,
         mask_mode=args.mask_mode,
         atac_scaling=args.atac_scaling,
         augment_rc=getattr(args, "augment_reverse_complement", False),
+        clip_at_zero=getattr(args, "clip_at_zero", False),
     )
     val_dataset = LazyM5cSequenceOnlyDataset(
         indices=val_indices,
@@ -185,6 +187,7 @@ def prepare_sequence_data(num_dmrs, args, df_dmr, seqs, mcg_tracks, hmcg_tracks,
         mask_mode=args.mask_mode,
         atac_scaling=args.atac_scaling,
         augment_rc=False,
+        clip_at_zero=getattr(args, "clip_at_zero", False),
     )
 
     return PreparedSequenceData(
@@ -546,6 +549,7 @@ def parse_args():
     parser.add_argument("--scheduler-patience", type=int, default=2)
     parser.add_argument("--scheduler-t-max", type=int, default=0)
     parser.add_argument("--atac-scaling", choices=["none", "minmax"], default="none")
+    add_clip_at_zero_argument(parser)
     parser.add_argument("--amp", action="store_true",
                         help="Enable automatic mixed precision (bfloat16). Recommended for long sequences.")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1,

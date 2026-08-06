@@ -24,6 +24,7 @@ import pyfaidx
 
 from data import (
     LazyM5cSequenceAtacDataset,
+    add_clip_at_zero_argument,
     assign_non_overlapping_groups,
     ensure_path_list,
     get_sequence,
@@ -205,6 +206,7 @@ def prepare_inference_data(args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tra
         mask_mode=args.mask_mode,
         atac_scaling=args.atac_scaling,
         augment_rc=False,  # no augmentation during inference
+        clip_at_zero=args.clip_at_zero,
     )
 
     loader = torch.utils.data.DataLoader(
@@ -286,6 +288,7 @@ def build_arg_parser():
     p.add_argument("--hidden-dim", type=int, default=64)
     p.add_argument("--mask-mode", choices=["cpg_both", "cpg_forward", "c_only", "all"], default="cpg_both")
     p.add_argument("--atac-scaling", choices=["none", "minmax"], default="minmax")
+    add_clip_at_zero_argument(p)
     p.add_argument("--use-positional-encoding", action="store_true")
     p.add_argument("--model-name", choices=["baseline", "model_b"], default="baseline")
     p.add_argument("--model-b-blocks", type=int, default=2)

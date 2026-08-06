@@ -13,6 +13,7 @@ import pyfaidx
 from data import (
     BASE_COMPLEMENT_INDEX,
     LazyM5cSequenceAtacDataset,
+    add_clip_at_zero_argument,
     assign_non_overlapping_groups,
     ensure_path_list,
     get_sequence,
@@ -424,6 +425,7 @@ def prepare_sequence_atac_crosshyena_data(
         mask_mode=args.mask_mode,
         atac_scaling=args.atac_scaling,
         augment_rc=getattr(args, "augment_reverse_complement", False),
+        clip_at_zero=getattr(args, "clip_at_zero", False),
     )
     val_dataset = LazyM5cSequenceAtacDataset(
         indices=val_indices,
@@ -436,6 +438,7 @@ def prepare_sequence_atac_crosshyena_data(
         mask_mode=args.mask_mode,
         atac_scaling=args.atac_scaling,
         augment_rc=False,
+        clip_at_zero=getattr(args, "clip_at_zero", False),
     )
 
     return PreparedSequenceAtacData(
@@ -879,6 +882,7 @@ def parse_args():
     parser.add_argument("--scheduler-patience", type=int, default=2)
     parser.add_argument("--scheduler-t-max", type=int, default=0)
     parser.add_argument("--atac-scaling", choices=["none", "minmax"], default="minmax")
+    add_clip_at_zero_argument(parser)
     parser.add_argument("--pretrained-checkpoint", default=None, help="Path to a MaskedTrackPretrainingModelB checkpoint (.pt) to initialize model_b weights.")
     parser.add_argument("--init-from-checkpoint", default=None, help="Path to a downstream model_b checkpoint (.pt) for warm-start / curriculum fine-tuning. Loads only model weights, resets optimizer/scheduler.")
     parser.add_argument("--freeze-backbone-epochs", type=int, default=0, help="If >0, freeze all params except head for this many epochs after warm-start from --init-from-checkpoint.")
