@@ -13,6 +13,7 @@ import pyfaidx
 from data import (
     BASE_COMPLEMENT_INDEX,
     LazyM5cSequenceAtacDataset,
+    LazyM5cSequenceAtacRnaDataset,
     add_clip_at_zero_argument,
     assign_non_overlapping_groups,
     ensure_path_list,
@@ -21,7 +22,11 @@ from data import (
     resolve_loss_mask,
     write_train_val_beds,
 )
-from models import M5CQuerySequenceAtacCrossHyenaRegressor, M5CQuerySequenceAtacCrossHyenaRegressorModelB
+from models import (
+    M5CQuerySequenceAtacCrossHyenaRegressor,
+    M5CQuerySequenceAtacCrossHyenaRegressorModelB,
+    M5CQuerySequenceAtacRnaCrossHyenaRegressorModelB,
+)
 from utils import (
     export_prediction_signals_h5ad,
     get_freest_gpu,
@@ -413,8 +418,10 @@ def prepare_sequence_atac_crosshyena_data(
     hm5c_paths = ensure_path_list(getattr(args, "hm5c_bedgraph", None))
     m5c_paths = ensure_path_list(getattr(args, "m5c_bedgraph", None))
     atac_paths = ensure_path_list(getattr(args, "atac_bw", None))
+    rna_paths = ensure_path_list(getattr(args, "rna_coverage_bw", None))
+    rna_path = rna_paths[0] if rna_paths else None
 
-    train_dataset = LazyM5cSequenceAtacDataset(
+    train_dataset = LazyM5cSequenceAtacRnaDataset(
         indices=train_indices,
         df_dmr=split_regions_df,
         genome_fasta=args.genome_fasta,
@@ -424,10 +431,12 @@ def prepare_sequence_atac_crosshyena_data(
         target_length=args.target_length,
         mask_mode=args.mask_mode,
         atac_scaling=args.atac_scaling,
+        rna_bw_path=rna_path,
+        rna_scaling=getattr(args, "rna_scaling", "minmax"),
         augment_rc=getattr(args, "augment_reverse_complement", False),
         clip_at_zero=getattr(args, "clip_at_zero", False),
     )
-    val_dataset = LazyM5cSequenceAtacDataset(
+    val_dataset = LazyM5cSequenceAtacRnaDataset(
         indices=val_indices,
         df_dmr=split_regions_df,
         genome_fasta=args.genome_fasta,
@@ -437,6 +446,8 @@ def prepare_sequence_atac_crosshyena_data(
         target_length=args.target_length,
         mask_mode=args.mask_mode,
         atac_scaling=args.atac_scaling,
+        rna_bw_path=rna_path,
+        rna_scaling=getattr(args, "rna_scaling", "minmax"),
         augment_rc=False,
         clip_at_zero=getattr(args, "clip_at_zero", False),
     )
@@ -489,14 +500,15 @@ def evaluate(model: nn.Module, loader, device: torch.device) -> tuple[float, flo
     targets = []
     masks = []
     with torch.no_grad():
-        for m5c_batch, sequence_batch, atac_batch, target_batch, mask_batch in loader:
+        for m5c_batch, sequence_batch, atac_batch, target_batch, mask_batch, rna_batch in loader:
             m5c_batch = m5c_batch.to(device)
             sequence_batch = sequence_batch.to(device)
             atac_batch = atac_batch.to(device)
             target_batch = target_batch.to(device)
             mask_batch = mask_batch.to(device)
+            rna_batch = rna_batch.to(device)
 
-            pred = model(m5c_batch, sequence_batch, atac_batch)
+            pred = model(m5c_batch, sequence_batch, atac_batch, rna_batch)
             loss = masked_mse_loss(pred, target_batch, mask_batch)
 
             batch_count = m5c_batch.size(0)
@@ -532,11 +544,12 @@ def collect_predictions(model: nn.Module, loader, device: torch.device):
     targets = []
     masks = []
     with torch.no_grad():
-        for m5c_batch, sequence_batch, atac_batch, target_batch, mask_batch in loader:
+        for m5c_batch, sequence_batch, atac_batch, target_batch, mask_batch, rna_batch in loader:
             m5c_batch = m5c_batch.to(device)
             sequence_batch = sequence_batch.to(device)
             atac_batch = atac_batch.to(device)
-            pred = model(m5c_batch, sequence_batch, atac_batch)
+            rna_batch = rna_batch.to(device)
+            pred = model(m5c_batch, sequence_batch, atac_batch, rna_batch)
             preds.append(pred.detach().cpu())
             targets.append(target_batch.detach().cpu())
             masks.append(mask_batch.detach().cpu())
@@ -570,13 +583,24 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
     prepared = prepare_sequence_atac_crosshyena_data(num_dmrs, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks)
 
     if args.model_name == "model_b":
-        model = M5CQuerySequenceAtacCrossHyenaRegressorModelB(
-            seq_len=prepared.seq_len,
-            hidden_dim=args.hidden_dim,
-            use_positional_encoding=args.use_positional_encoding,
-            num_blocks=args.model_b_blocks,
-            fusion_type=args.model_b_fusion,
-        ).to(device)
+        rna_paths = ensure_path_list(getattr(args, "rna_coverage_bw", None))
+        if rna_paths:
+            model = M5CQuerySequenceAtacRnaCrossHyenaRegressorModelB(
+                seq_len=prepared.seq_len,
+                hidden_dim=args.hidden_dim,
+                use_positional_encoding=args.use_positional_encoding,
+                num_blocks=args.model_b_blocks,
+                fusion_type=args.model_b_fusion,
+                rna_dim=1,
+            ).to(device)
+        else:
+            model = M5CQuerySequenceAtacCrossHyenaRegressorModelB(
+                seq_len=prepared.seq_len,
+                hidden_dim=args.hidden_dim,
+                use_positional_encoding=args.use_positional_encoding,
+                num_blocks=args.model_b_blocks,
+                fusion_type=args.model_b_fusion,
+            ).to(device)
     else:
         model = M5CQuerySequenceAtacCrossHyenaRegressor(
             seq_len=prepared.seq_len,
@@ -585,7 +609,7 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
             use_positional_encoding=args.use_positional_encoding,
         ).to(device)
 
-    if args.pretrained_checkpoint and args.model_name == "model_b":
+    if args.pretrained_checkpoint and args.model_name == "model_b" and not getattr(args, "rna_coverage_bw", None):
         transfer_pretrained_weights(model, args.pretrained_checkpoint, device)
 
     if getattr(args, "init_from_checkpoint", None):
@@ -606,11 +630,15 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
         try:
             import torch.utils.checkpoint as ckpt
             orig_forward = model.forward
-            def checkpointed_forward(m5c_track, sequence_track, atac_track):
+            def checkpointed_forward(m5c_track, sequence_track, atac_track, rna_track=None):
                 x = model.query_norm(model.query_proj(m5c_track))
                 seq_h = model.sequence_norm(model.sequence_proj(sequence_track))
                 atac_h = model.atac_norm(model.atac_proj(atac_track))
-                ctx = model.context_norm(model.context_proj(torch.cat([seq_h, atac_h], dim=-1)))
+                parts = [seq_h, atac_h]
+                if rna_track is not None and getattr(model, "rna_proj", None) is not None:
+                    rna_h = model.rna_norm(model.rna_proj(rna_track))
+                    parts.append(rna_h)
+                ctx = model.context_norm(model.context_proj(torch.cat(parts, dim=-1)))
                 if model.position_encoding is not None:
                     x = model.position_encoding(x)
                     ctx = model.position_encoding(ctx)
@@ -671,15 +699,16 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
         optimizer.zero_grad()
         accum_count = 0
 
-        for m5c_batch, sequence_batch, atac_batch, target_batch, mask_batch in prepared.train_loader:
+        for m5c_batch, sequence_batch, atac_batch, target_batch, mask_batch, rna_batch in prepared.train_loader:
             m5c_batch = m5c_batch.to(device)
             sequence_batch = sequence_batch.to(device)
             atac_batch = atac_batch.to(device)
             target_batch = target_batch.to(device)
             mask_batch = mask_batch.to(device)
+            rna_batch = rna_batch.to(device)
 
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=args.amp):
-                pred = model(m5c_batch, sequence_batch, atac_batch)
+                pred = model(m5c_batch, sequence_batch, atac_batch, rna_batch)
                 loss = masked_mse_loss(pred, target_batch, mask_batch)
                 # Scale loss for gradient accumulation
                 loss = loss / args.gradient_accumulation_steps
@@ -882,6 +911,13 @@ def parse_args():
     parser.add_argument("--scheduler-patience", type=int, default=2)
     parser.add_argument("--scheduler-t-max", type=int, default=0)
     parser.add_argument("--atac-scaling", choices=["none", "minmax"], default="minmax")
+    parser.add_argument(
+        "--rna-coverage-bw",
+        nargs="+",
+        default=None,
+        help="Optional RNA-coverage bigWig path(s). When provided, the model adds an RNA track to the context alongside sequence and ATAC.",
+    )
+    parser.add_argument("--rna-scaling", choices=["none", "minmax"], default="minmax")
     add_clip_at_zero_argument(parser)
     parser.add_argument("--pretrained-checkpoint", default=None, help="Path to a MaskedTrackPretrainingModelB checkpoint (.pt) to initialize model_b weights.")
     parser.add_argument("--init-from-checkpoint", default=None, help="Path to a downstream model_b checkpoint (.pt) for warm-start / curriculum fine-tuning. Loads only model weights, resets optimizer/scheduler.")
@@ -926,6 +962,15 @@ def main():
     args.use_m5c = True
     if args.chromosome is not None:
         args.chromosome = normalize_chromosome_label(args.chromosome)
+    # Auto-append "rna" to context modalities when an RNA bigWig is provided.
+    # Users can still override via --context-modalities; we only inject when the
+    # user did not explicitly pass that flag.
+    if getattr(args, "rna_coverage_bw", None):
+        from data import CONTEXT_MODALITIES
+        existing = list(getattr(args, "context_modalities", []) or [])
+        if "rna" in CONTEXT_MODALITIES and "rna" not in existing:
+            existing.append("rna")
+        args.context_modalities = existing
 
     Path(args.output_csv).parent.mkdir(parents=True, exist_ok=True)
     Path(args.output_json).parent.mkdir(parents=True, exist_ok=True)

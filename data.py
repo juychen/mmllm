@@ -193,6 +193,17 @@ def find_forward_cpg_positions(base_ids: torch.Tensor) -> torch.Tensor:
     return is_c & right_is_g
 
 
+def find_forward_ch_positions(base_ids: torch.Tensor) -> torch.Tensor:
+    """Return C positions followed by a non-G base (CH, not CpG)."""
+    is_c = base_ids == 1
+    is_g = base_ids == 2
+    has_right_base = torch.zeros_like(is_c)
+    has_right_base[:, :-1] = True
+    right_is_g = torch.zeros_like(is_g)
+    right_is_g[:, :-1] = is_g[:, 1:]
+    return is_c & has_right_base & ~right_is_g
+
+
 def scale_atac_tensor(atac_tensor: torch.Tensor, mode: str) -> torch.Tensor:
     if mode == "none":
         return atac_tensor
@@ -577,8 +588,10 @@ def resolve_loss_mask(mask_mode: str, base_ids_tensor: torch.Tensor) -> torch.Te
         mask = find_cpg_candidate_positions(base_ids_tensor)
     elif mask_mode == "cpg_forward":
         mask = find_forward_cpg_positions(base_ids_tensor)
+    elif mask_mode == "ch_only":
+        mask = find_forward_ch_positions(base_ids_tensor)
     elif mask_mode == "c_only":
-        # Only cytosine positions are eligible (both strands count via the C/G mapping).
+        # Only cytosine positions are eligible.
         mask = base_ids_tensor == 1
     elif mask_mode == "all":
         mask = torch.ones_like(base_ids_tensor, dtype=torch.bool)
@@ -1080,6 +1093,146 @@ class LazyM5cSequenceAtacDataset(torch.utils.data.Dataset):
             loss_mask = resolve_loss_mask(self.mask_mode, base_ids_rc.unsqueeze(0))[0]
 
         return m5c_t, sequence_onehot, atac_t, hm5c_t, loss_mask
+
+
+class LazyM5cSequenceAtacRnaDataset(LazyM5cSequenceAtacDataset):
+    """Lazy dataset that additionally returns an RNA-coverage track.
+
+    Behavior mirrors :class:`LazyM5cSequenceAtacDataset` but adds:
+      - an optional ``rna_bw_path`` (bigWig only) opened per worker,
+      - a per-sample minmax-scaled RNA tensor,
+      - an additional return value: ``rna_t`` of shape ``(L, 1)``.
+
+    The RNA track is intended as an extra context modality stacked alongside
+    ``sequence`` and ``atac``.  When ``rna_bw_path`` is ``None`` the dataset
+    falls back to a zero-filled track (same convention as ATAC absence in
+    :mod:`data_sequence_only`).
+    """
+
+    def _open_handles(self):
+        import pyfaidx
+        self._genome = pyfaidx.Fasta(self.genome_fasta)
+        self._tbx_5mc = _open_track_handle(self.m5c_bedgraph, self._m5c_fmt)
+        self._tbx_5hmc = _open_track_handle(self.hm5c_bedgraph, self._hm5c_fmt)
+        self._atac_bw = _open_track_handle(self.atac_bw_path, self._atac_fmt)
+        self._rna_bw = _open_track_handle(self.rna_bw_path, self._rna_fmt) if self.rna_bw_path else None
+
+    def _close_handles(self):
+        for attr in ("_genome", "_tbx_5mc", "_tbx_5hmc", "_atac_bw", "_rna_bw"):
+            handle = getattr(self, attr, None)
+            if handle is not None:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+
+    def __init__(
+        self,
+        indices: list[int],
+        df_dmr: pd.DataFrame,
+        genome_fasta: str,
+        m5c_bedgraph: str,
+        hm5c_bedgraph: str,
+        atac_bw_path: str,
+        target_length: int,
+        mask_mode: str,
+        atac_scaling: str,
+        rna_bw_path: str | None = None,
+        rna_scaling: str = "minmax",
+        augment_rc: bool = False,
+        clip_at_zero: bool = False,
+    ):
+        super().__init__(
+            indices=indices,
+            df_dmr=df_dmr,
+            genome_fasta=genome_fasta,
+            m5c_bedgraph=m5c_bedgraph,
+            hm5c_bedgraph=hm5c_bedgraph,
+            atac_bw_path=atac_bw_path,
+            target_length=target_length,
+            mask_mode=mask_mode,
+            atac_scaling=atac_scaling,
+            augment_rc=augment_rc,
+            clip_at_zero=clip_at_zero,
+        )
+        self.rna_bw_path = rna_bw_path
+        self.rna_scaling = rna_scaling
+        self._rna_fmt = _detect_track_format(rna_bw_path) if rna_bw_path else "bigwig"
+        self._rna_bw = None
+
+    def __getstate__(self):
+        state = super().__getstate__()
+        state["_rna_bw"] = None
+        return state
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        self._rna_bw = None
+
+    def __getitem__(self, idx):
+        # Thread-safe lazy handle initialization (once per worker)
+        with self._lock:
+            if self._genome is None:
+                self._close_handles()
+                self._open_handles()
+
+        is_rc = self.augment_rc and idx >= self.N
+        real_idx = self.indices[idx % self.N]
+
+        row = self.df_dmr.iloc[real_idx]
+        chrom_name = str(row["chr"]).removeprefix("chr")
+        chrom = "chr" + chrom_name
+        start = int(row["start_expanded"])
+        end = int(row["end_expanded"])
+
+        # --- fetch on the fly ---
+        seq_str = get_sequence(chrom, start, end, self._genome)
+        hm5c = read_track_region(self._tbx_5hmc, self._hm5c_fmt, chrom, start, end, clip_at_zero=self.clip_at_zero)
+        atac = read_track_region(self._atac_bw, self._atac_fmt, chrom, start, end + 1, clip_at_zero=self.clip_at_zero)
+        m5c = read_track_region(self._tbx_5mc, self._m5c_fmt, chrom, start, end, clip_at_zero=self.clip_at_zero)
+        if self._rna_bw is not None:
+            rna = read_track_region(self._rna_bw, self._rna_fmt, chrom, start, end + 1, clip_at_zero=self.clip_at_zero)
+        else:
+            rna = np.zeros(end - start, dtype=np.float32)
+
+        # --- determine common length ---
+        seq_len = min(self.target_length, len(seq_str), len(hm5c), len(atac), len(m5c), len(rna))
+
+        # --- build tensors ---
+        base_ids = sequence_to_base_ids(seq_str, seq_len, self._base_to_index)
+        sequence_onehot = F.one_hot(base_ids, num_classes=4).float()
+
+        m5c_t = torch.tensor(m5c[:seq_len], dtype=torch.float32).unsqueeze(-1)
+        hm5c_t = torch.tensor(hm5c[:seq_len], dtype=torch.float32).unsqueeze(-1)
+        atac_t = torch.tensor(atac[:seq_len], dtype=torch.float32).unsqueeze(-1)
+        rna_t = torch.tensor(rna[:seq_len], dtype=torch.float32).unsqueeze(-1)
+
+        if self.atac_scaling == "minmax":
+            a_min = atac_t.amin(dim=0, keepdim=True)
+            a_max = atac_t.amax(dim=0, keepdim=True)
+            a_range = (a_max - a_min).clamp_min(1e-6)
+            atac_t = (atac_t - a_min) / a_range
+        if self.rna_scaling == "minmax":
+            r_min = rna_t.amin(dim=0, keepdim=True)
+            r_max = rna_t.amax(dim=0, keepdim=True)
+            r_range = (r_max - r_min).clamp_min(1e-6)
+            rna_t = (rna_t - r_min) / r_range
+
+        loss_mask = resolve_loss_mask(self.mask_mode, base_ids.unsqueeze(0))[0]
+
+        if is_rc:
+            m5c_t = torch.flip(m5c_t, dims=[0])
+            sequence_onehot = torch.flip(sequence_onehot, dims=[0])
+            complement_index = BASE_COMPLEMENT_INDEX.to(sequence_onehot.device)
+            sequence_onehot = sequence_onehot.index_select(dim=-1, index=complement_index)
+            atac_t = torch.flip(atac_t, dims=[0])
+            hm5c_t = torch.flip(hm5c_t, dims=[0])
+            rna_t = torch.flip(rna_t, dims=[0])
+            base_ids_rc = torch.argmax(sequence_onehot, dim=-1)
+            loss_mask = resolve_loss_mask(self.mask_mode, base_ids_rc.unsqueeze(0))[0]
+
+        return m5c_t, sequence_onehot, atac_t, hm5c_t, rna_t, loss_mask
 
 
 if __name__ == "__main__":

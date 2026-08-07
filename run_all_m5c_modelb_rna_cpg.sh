@@ -30,24 +30,21 @@ run_experiment() {
   local bed_name
   bed_name="$(basename "$dmr_csv" .bed | sed 's/\.bed\.gz//')"
 
-  # This run use hm5c bedgraph for methylation and m5c bedgraph for hydroxymethylation
-  # Us 5mc as the target and hm5c as the input for the model
-  run_label="hm5c_query_sequence_atac_crosshyena_modelb_${fusion_type}"
-  output_dir="/data7/junyi/mmllm/output/${region}_${condition}/${bed_name}"
+  run_label="m5c_query_sequence_atac_crosshyena_modelb_${fusion_type}"
+  output_dir="output/${region}_${condition}/${bed_name}"
   mkdir -p "$output_dir"
   log_file="${output_dir}/${current_time}_${run_label}.log"
 
   echo "[$(date)] [${region}_${condition}] Starting... (BED: ${bed_name})" | tee -a "$log_file"
-  echo "Output directory: $output_dir" | tee -a "$log_file"
 
-  python run_m5c_query_sequence_atac_crosshyena_experiments.py \
+  python run_m5c_query_sequence_atac_rna_crosshyena_experiments.py \
     --sample-sizes all \
     --dmr-csv "$dmr_csv" \
     --model-name model_b \
     --model-b-blocks 2 \
     --model-b-fusion "$fusion_type" \
     --augment-reverse-complement \
-    --mask-mode ch_only \
+    --mask-mode cpg_forward \
     --scheduler cosine \
     --num-epochs 100 \
     --batch-size 4 \
@@ -60,9 +57,10 @@ run_experiment() {
     --lazy \
     --timestamp "$current_time" \
     --scheduler-min-lr 1e-5 \
-    --m5c-bedgraph "/data2st1/junyi/output/llm0401/processed_meth/${condition}_${region}.CH.h.bedGraph.gz" \
-    --hm5c-bedgraph "/data2st1/junyi/output/llm0401/processed_meth/${condition}_${region}.CH.m.bedGraph.gz" \
+    --m5c-bedgraph "/data2st1/junyi/output/llm0401/processed_meth/${condition}_${region}.CG.m.bedGraph.gz" \
+    --hm5c-bedgraph "/data2st1/junyi/output/llm0401/processed_meth/${condition}_${region}.CG.h.bedGraph.gz" \
     --atac-bw "/data1st1/junyi/methdata/atac/${region}_${condition}_track.bw" \
+    --rna-coverage-bw "/data2st1/junyi/output/sn0615/BULK_${region}/${region}_${condition}.bw" \
     --output-csv "${output_dir}/${current_time}_${run_label}_results.csv" \
     --output-json "${output_dir}/${current_time}_${run_label}_results.json" \
     --prediction-signal-h5ad "${output_dir}/${current_time}_${run_label}_{sample_size}.h5ad" \

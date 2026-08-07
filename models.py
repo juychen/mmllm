@@ -475,6 +475,66 @@ class M5CQuerySequenceAtacCrossHyenaRegressorModelB(nn.Module):
         return self.head(self.final_norm(hidden))
 
 
+class M5CQuerySequenceAtacRnaCrossHyenaRegressorModelB(nn.Module):
+    """Model B variant that accepts an optional RNA-coverage context track.
+
+    Architecture mirrors ``M5CQuerySequenceAtacCrossHyenaRegressorModelB`` but
+    the context is ``[sequence | atac | (rna?)]``.  When ``rna_dim == 0`` the
+    RNA projection becomes a no-op and ``context_proj`` falls back to the
+    original 2*hidden_dim input dim, making the class fully backward-compatible
+    with the existing ``M5CQuerySequenceAtacCrossHyenaRegressorModelB`` shape.
+    """
+
+    def __init__(
+        self,
+        seq_len: int,
+        query_dim: int = 1,
+        sequence_dim: int = 4,
+        atac_dim: int = 1,
+        rna_dim: int = 1,
+        hidden_dim: int = 64,
+        use_positional_encoding: bool = False,
+        num_blocks: int = 2,
+        fusion_type: str = "cross_hyena",
+    ):
+        super().__init__()
+        self.query_proj = nn.Linear(query_dim, hidden_dim)
+        self.sequence_proj = nn.Linear(sequence_dim, hidden_dim)
+        self.atac_proj = nn.Linear(atac_dim, hidden_dim)
+        self.rna_proj = nn.Linear(rna_dim, hidden_dim) if rna_dim > 0 else None
+        self.query_norm = nn.LayerNorm(hidden_dim)
+        self.sequence_norm = nn.LayerNorm(hidden_dim)
+        self.atac_norm = nn.LayerNorm(hidden_dim)
+        self.rna_norm = nn.LayerNorm(hidden_dim) if rna_dim > 0 else None
+        context_in_dim = 3 * hidden_dim if rna_dim > 0 else 2 * hidden_dim
+        self.context_proj = nn.Linear(context_in_dim, hidden_dim)
+        self.context_norm = nn.LayerNorm(hidden_dim)
+        self.position_encoding = SinusoidalPositionalEncoding(hidden_dim, seq_len) if use_positional_encoding else None
+        self.blocks = nn.ModuleList([StripedHyenaBlock(hidden_dim, seq_len, fusion_type=fusion_type) for _ in range(num_blocks)])
+        self.final_norm = nn.LayerNorm(hidden_dim)
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, m5c_track: torch.Tensor, sequence_track: torch.Tensor, atac_track: torch.Tensor, rna_track: torch.Tensor | None = None) -> torch.Tensor:
+        hidden = self.query_norm(self.query_proj(m5c_track))
+        sequence_hidden = self.sequence_norm(self.sequence_proj(sequence_track))
+        atac_hidden = self.atac_norm(self.atac_proj(atac_track))
+        context_parts = [sequence_hidden, atac_hidden]
+        if rna_track is not None and self.rna_proj is not None:
+            rna_hidden = self.rna_norm(self.rna_proj(rna_track))
+            context_parts.append(rna_hidden)
+        context = self.context_norm(self.context_proj(torch.cat(context_parts, dim=-1)))
+        if self.position_encoding is not None:
+            hidden = self.position_encoding(hidden)
+            context = self.position_encoding(context)
+        for block in self.blocks:
+            hidden = block(hidden, context)
+        return self.head(self.final_norm(hidden))
+
+
 class MinimalHyenaRegressor(nn.Module):
     def __init__(
         self,

@@ -286,7 +286,7 @@ def build_arg_parser():
     p.add_argument("--train-ratio", type=float, default=0.8)
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--hidden-dim", type=int, default=64)
-    p.add_argument("--mask-mode", choices=["cpg_both", "cpg_forward", "c_only", "all"], default="cpg_both")
+    p.add_argument("--mask-mode", choices=["cpg_both", "cpg_forward", "ch_only", "c_only", "all"], default="cpg_both")
     p.add_argument("--atac-scaling", choices=["none", "minmax"], default="minmax")
     add_clip_at_zero_argument(p)
     p.add_argument("--use-positional-encoding", action="store_true")

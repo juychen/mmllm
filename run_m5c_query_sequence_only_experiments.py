@@ -556,7 +556,7 @@ def parse_args():
                         help="Accumulate gradients over N mini-batches. Use with --batch-size 4-8 for long sequences.")
     parser.add_argument("--gradient-checkpointing", action="store_true",
                         help="Trade compute for memory. Recommended for very long sequences (8k+).")
-    parser.add_argument("--mask-mode", choices=["cpg_both", "cpg_forward", "c_only", "all"], default="cpg_forward")
+    parser.add_argument("--mask-mode", choices=["cpg_both", "cpg_forward", "ch_only", "c_only", "all"], default="cpg_forward")
     parser.add_argument("--augment-reverse-complement", action="store_true")
     parser.add_argument("--lazy", action="store_true",
                         help="Fetch sequence/track data on-the-fly per batch instead of preloading.")
