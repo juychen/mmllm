@@ -54,7 +54,8 @@ def get_sequence(chrom: str, start: int, end: int, genome: pyfaidx.Fasta) -> str
 def fast_tabix_to_track(tbx: pysam.TabixFile, chrom: str, start_1based: int, end_1based: int) -> np.ndarray:
     region_start_0based = int(start_1based) - 1
     region_end_0based = int(end_1based)
-    data = [line.split("\t") for line in tbx.fetch(chrom, region_start_0based, region_end_0based)]
+    resolved_chrom = resolve_tabix_chrom(tbx, chrom)
+    data = [line.split("\t") for line in tbx.fetch(resolved_chrom, region_start_0based, region_end_0based)]
     track_length = region_end_0based - region_start_0based
     if not data:
         return np.zeros(track_length, dtype=np.float32)
@@ -87,6 +88,67 @@ def _open_track_handle(path: str, fmt: str):
     return pysam.TabixFile(path)
 
 
+# Per-handle cache: maps requested chrom -> chrom name actually present in the
+# tabix / bigWig index.  Many bedGraphs / bigWigs use bare ``"7"`` while the
+# rest of the code asks for ``"chr7"``; others do the opposite.  Rather than
+# guess, we probe the index the first time we see a chromosome and remember
+# the correct spelling for the lifetime of this handle.
+_TABIX_CHROM_CACHE: dict[int, dict[str, str]] = {}
+
+
+def _handle_id(handle) -> int:
+    return id(handle)
+
+
+def resolve_tabix_chrom(handle, chrom: str) -> str:
+    """Return the chromosome spelling that ``handle`` actually contains.
+
+    Tries the requested name first, then the alternative (``chr7`` ↔ ``7``).
+    Caches the per-handle mapping so subsequent lookups are O(1).
+    Falls back to the requested spelling if no match is found (let tabix raise
+    a clear error).
+    """
+    cache = _TABIX_CHROM_CACHE.setdefault(_handle_id(handle), {})
+    if chrom in cache:
+        return cache[chrom]
+
+    contigs = None
+    if hasattr(handle, "contigs"):
+        try:
+            contigs_attr = handle.contigs
+            # pyBigWig exposes ``contigs`` as a method that returns a dict-like
+            # object; ``chroms`` (also callable) returns the same.  pysam's
+            # ``TabixFile`` exposes ``contigs`` as a dict directly.
+            if callable(contigs_attr):
+                contigs_attr = contigs_attr()
+            contigs = contigs_attr
+        except Exception:
+            contigs = None
+    if contigs is None and hasattr(handle, "chroms"):
+        try:
+            contigs_attr = handle.chroms
+            if callable(contigs_attr):
+                contigs_attr = contigs_attr()
+            contigs = contigs_attr
+        except Exception:
+            contigs = None
+
+    if contigs is not None:
+        candidates = [chrom]
+        if chrom.lower().startswith("chr"):
+            candidates.append(chrom[3:])
+        else:
+            candidates.append("chr" + chrom)
+        for cand in candidates:
+            if cand in contigs:
+                cache[chrom] = cand
+                return cand
+
+    # Could not determine — let the underlying call surface the original error.
+    cache[chrom] = chrom
+    return chrom
+
+
 def read_track_region(
     handle,
     fmt: str,
@@ -96,10 +158,11 @@ def read_track_region(
     clip_at_zero: bool = False,
 ) -> np.ndarray:
     """Read a track region as a 1D numpy array. ``fmt`` is 'bigwig' or 'bedgraph'."""
+    resolved_chrom = resolve_tabix_chrom(handle, chrom)
     if fmt == "bigwig":
-        values = np.nan_to_num(handle.values(chrom, start, end + 1), nan=0.0)
+        values = np.nan_to_num(handle.values(resolved_chrom, start, end + 1), nan=0.0)
     else:
-        values = fast_tabix_to_track(handle, chrom, start, end)
+        values = fast_tabix_to_track(handle, resolved_chrom, start, end)
     if clip_at_zero:
         values = np.maximum(values, 0.0)
     return values

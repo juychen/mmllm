@@ -33,7 +33,7 @@ run_experiment() {
   # This run use hm5c bedgraph for methylation and m5c bedgraph for hydroxymethylation
   # Us 5mc as the target and hm5c as the input for the model
   run_label="hm5c_query_sequence_atac_crosshyena_modelb_${fusion_type}"
-  output_dir="/data8/junyi/mmllm/output/${region}_${condition}/${bed_name}"
+  output_dir="/data7/junyi/mmllm/output/${region}_${condition}/${bed_name}"
   mkdir -p "$output_dir"
   log_file="${output_dir}/${current_time}_${run_label}.log"
 
@@ -60,8 +60,8 @@ run_experiment() {
     --lazy \
     --timestamp "$current_time" \
     --scheduler-min-lr 1e-5 \
-    --m5c-bedgraph "/data2st1/junyi/output/llm0401/processed_meth/${condition}_${region}.CH.h.bedGraph.gz" \
-    --hm5c-bedgraph "/data2st1/junyi/output/llm0401/processed_meth/${condition}_${region}.CH.m.bedGraph.gz" \
+    --m5c-bedgraph "/data2st1/junyi/output/llm0401/processed_meth/${condition}_${region}.CG.h.bedGraph.gz" \
+    --hm5c-bedgraph "/data2st1/junyi/output/llm0401/processed_meth/${condition}_${region}.CG.m.bedGraph.gz" \
     --atac-bw "/data1st1/junyi/methdata/atac/${region}_${condition}_track.bw" \
     --output-csv "${output_dir}/${current_time}_${run_label}_results.csv" \
     --output-json "${output_dir}/${current_time}_${run_label}_results.json" \
