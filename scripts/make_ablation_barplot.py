@@ -48,6 +48,19 @@ EXTRA_RESULTS: dict[str, Path] = {
     / "cCRE_cpg"
     / "sn"
     / "2026-07-16-13-21-29_m5c_query_sequence_phascon_modelb_cross_hyena_results.json",
+    # seq query + RNA coverage context track (run on /data2st1; same CG.m
+    # 5mC input, 5hmC target, ATAC track and train/val split as the sweeps).
+    "seq_query_rna": Path(
+        "/data2st1/junyi/output/mmllm/output/AMY_MC/cCRE_cpg/"
+        "2026-08-07-10-09-31_m5c_query_sequence_atac_crosshyena_modelb_cross_hyena_results.json"
+    ),
+}
+
+# (query, context) display labels for each EXTRA_RESULTS entry.
+EXTRA_QUERY_CONTEXT: dict[str, tuple[str, str]] = {
+    "phascon": ("m5c", "phastCons"),
+    "sn": ("m5c", "sn0601"),
+    "seq_query_rna": ("seq", "ATAC+m5C+RNA"),
 }
 
 # Display order / colors (fixed categorical order, no cycling).
@@ -57,6 +70,7 @@ ABLATION_ORDER = [
     "m5c_only",      # m5C only
     "atac_only",     # ATAC only
     "seq_query",     # sequence query with both context tracks
+    "seq_query_rna", # sequence query + RNA coverage context track
     "all_three",     # m5C+ATAC as one query track
     "seq_only",      # sequence only (no epigenomic input)
     "phascon",       # m5C query, phastCons context track (AMY_MC)
@@ -69,6 +83,7 @@ ABLATION_COLORS = {
     "m5c_only":   "#66a61e",
     "atac_only":  "#d95f02",
     "seq_query":  "#e6ab02",
+    "seq_query_rna": "#00bfc4",
     "all_three":  "#e7298a",
     "seq_only":   "#666666",
     "phascon":    "#386cb0",
@@ -81,6 +96,7 @@ QUERY_CONTEXT_LABELS = {
     "m5c_only":   ("m5C",       "—"),
     "atac_only":  ("ATAC",      "—"),
     "seq_query":  ("seq",       "ATAC+m5C"),
+    "seq_query_rna": ("seq",    "ATAC+m5C+RNA"),
     "all_three":  ("m5C+ATAC",  "—"),
     "seq_only":   ("seq",       "—"),
     "phascon":    ("m5C",       "phastCons"),
@@ -124,14 +140,14 @@ def load_ablation_summaries() -> pd.DataFrame:
             continue
         payload = json.loads(json_path.read_text())
         result = (payload.get("results") or [{}])[0]
-        q_label = "phastCons" if name == "phascon" else "sn0601"
+        q_label, ctx_label = EXTRA_QUERY_CONTEXT.get(name, ("", ""))
         frames.append(
             pd.DataFrame(
                 [
                     {
                         "ablation": name,
-                        "query": "m5c",
-                        "context": q_label,
+                        "query": q_label,
+                        "context": ctx_label,
                         "best_val_loss": result.get("best_val_loss"),
                         "best_val_r2": result.get("best_val_r2"),
                         "best_val_pearsonr": result.get("best_val_pearsonr"),
