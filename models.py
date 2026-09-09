@@ -517,14 +517,39 @@ class M5CQuerySequenceAtacRnaCrossHyenaRegressorModelB(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim, 1),
         )
+        # Learnable [MASK] tokens for modality dropout (context tracks only).
+        # When a track is absent, its whole hidden representation is replaced by
+        # the expanded token so the model learns a "missing modality" embedding
+        # instead of conflating absence with a low/zero track value.
+        self.seq_mask_token = nn.Parameter(torch.zeros(hidden_dim))
+        self.atac_mask_token = nn.Parameter(torch.zeros(hidden_dim))
+        self.rna_mask_token = nn.Parameter(torch.zeros(hidden_dim)) if rna_dim > 0 else None
 
-    def forward(self, m5c_track: torch.Tensor, sequence_track: torch.Tensor, atac_track: torch.Tensor, rna_track: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        m5c_track: torch.Tensor,
+        sequence_track: torch.Tensor,
+        atac_track: torch.Tensor,
+        rna_track: torch.Tensor | None = None,
+        sequence_present: bool = True,
+        atac_present: bool = True,
+        rna_present: bool = True,
+    ) -> torch.Tensor:
         hidden = self.query_norm(self.query_proj(m5c_track))
         sequence_hidden = self.sequence_norm(self.sequence_proj(sequence_track))
         atac_hidden = self.atac_norm(self.atac_proj(atac_track))
+
+        batch_size, length = atac_hidden.shape[0], atac_hidden.shape[1]
+        if not sequence_present:
+            sequence_hidden = self.seq_mask_token.view(1, 1, -1).expand(batch_size, length, -1)
+        if not atac_present:
+            atac_hidden = self.atac_mask_token.view(1, 1, -1).expand(batch_size, length, -1)
+
         context_parts = [sequence_hidden, atac_hidden]
         if rna_track is not None and self.rna_proj is not None:
             rna_hidden = self.rna_norm(self.rna_proj(rna_track))
+            if not rna_present:
+                rna_hidden = self.rna_mask_token.view(1, 1, -1).expand(batch_size, length, -1)
             context_parts.append(rna_hidden)
         context = self.context_norm(self.context_proj(torch.cat(context_parts, dim=-1)))
         if self.position_encoding is not None:

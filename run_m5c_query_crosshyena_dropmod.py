@@ -1,5 +1,6 @@
 import argparse
 import json
+import random
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -630,13 +631,32 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
         try:
             import torch.utils.checkpoint as ckpt
             orig_forward = model.forward
-            def checkpointed_forward(m5c_track, sequence_track, atac_track, rna_track=None):
+
+            def checkpointed_forward(
+                m5c_track,
+                sequence_track,
+                atac_track,
+                rna_track=None,
+                sequence_present=True,
+                atac_present=True,
+                rna_present=True,
+            ):
                 x = model.query_norm(model.query_proj(m5c_track))
                 seq_h = model.sequence_norm(model.sequence_proj(sequence_track))
                 atac_h = model.atac_norm(model.atac_proj(atac_track))
+                b, l = atac_h.shape[0], atac_h.shape[1]
+                seq_mask_token = getattr(model, "seq_mask_token", None)
+                atac_mask_token = getattr(model, "atac_mask_token", None)
+                rna_mask_token = getattr(model, "rna_mask_token", None)
+                if not sequence_present and seq_mask_token is not None:
+                    seq_h = seq_mask_token.view(1, 1, -1).expand(b, l, -1)
+                if not atac_present and atac_mask_token is not None:
+                    atac_h = atac_mask_token.view(1, 1, -1).expand(b, l, -1)
                 parts = [seq_h, atac_h]
                 if rna_track is not None and getattr(model, "rna_proj", None) is not None:
                     rna_h = model.rna_norm(model.rna_proj(rna_track))
+                    if not rna_present and rna_mask_token is not None:
+                        rna_h = rna_mask_token.view(1, 1, -1).expand(b, l, -1)
                     parts.append(rna_h)
                 ctx = model.context_norm(model.context_proj(torch.cat(parts, dim=-1)))
                 if model.position_encoding is not None:
@@ -645,6 +665,7 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
                 for blk in model.blocks:
                     x = ckpt.checkpoint(blk, x, ctx, use_reentrant=False)
                 return model.head(model.final_norm(x))
+
             model.forward = checkpointed_forward
         except (ImportError, AttributeError) as e:
             print(f"Warning: gradient checkpointing not available ({e}), falling back.")
@@ -707,8 +728,23 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
             mask_batch = mask_batch.to(device)
             rna_batch = rna_batch.to(device)
 
+            # Modality dropout: each context track is independently dropped with
+            # its own probability; the 5mC query track is never dropped. Dropped
+            # tracks are replaced inside the model by their learned [MASK] token.
+            seq_present = not (args.seq_drop_p > 0.0 and random.random() < args.seq_drop_p)
+            atac_present = not (args.atac_drop_p > 0.0 and random.random() < args.atac_drop_p)
+            rna_present = not (args.rna_drop_p > 0.0 and random.random() < args.rna_drop_p)
+
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=args.amp):
-                pred = model(m5c_batch, sequence_batch, atac_batch, rna_batch)
+                pred = model(
+                    m5c_batch,
+                    sequence_batch,
+                    atac_batch,
+                    rna_batch,
+                    sequence_present=seq_present,
+                    atac_present=atac_present,
+                    rna_present=rna_present,
+                )
                 loss = masked_mse_loss(pred, target_batch, mask_batch)
                 # Scale loss for gradient accumulation
                 loss = loss / args.gradient_accumulation_steps
@@ -926,6 +962,24 @@ def parse_args():
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1, help="Accumulate gradients over N mini-batches before each optimizer step. Use with --batch-size 4-8 for long sequences.")
     parser.add_argument("--gradient-checkpointing", action="store_true", help="Enable gradient checkpointing to trade compute for memory. Recommended for very long sequences (8k+).")
     parser.add_argument("--mask-mode", choices=["cpg_both", "cpg_forward", "ch_only", "c_only", "all"], default="cpg_both")
+    parser.add_argument(
+        "--seq-drop-p",
+        type=float,
+        default=0.0,
+        help="Modality dropout: probability of dropping the DNA sequence context track for a batch (0.0 disables).",
+    )
+    parser.add_argument(
+        "--atac-drop-p",
+        type=float,
+        default=0.0,
+        help="Modality dropout: probability of dropping the ATAC context track for a batch (0.0 disables).",
+    )
+    parser.add_argument(
+        "--rna-drop-p",
+        type=float,
+        default=0.0,
+        help="Modality dropout: probability of dropping the RNA context track for a batch (0.0 disables).",
+    )
     parser.add_argument("--augment-reverse-complement", action="store_true")
     parser.add_argument("--use-all-input-groups", action="store_true")
     parser.add_argument(
