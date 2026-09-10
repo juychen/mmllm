@@ -1232,7 +1232,10 @@ class LazyM5cSequenceAtacRnaDataset(LazyM5cSequenceAtacDataset):
             base_ids_rc = torch.argmax(sequence_onehot, dim=-1)
             loss_mask = resolve_loss_mask(self.mask_mode, base_ids_rc.unsqueeze(0))[0]
 
-        return m5c_t, sequence_onehot, atac_t, hm5c_t, rna_t, loss_mask
+        # Order must stay (..., loss_mask, rna_t): callers unpack
+        # (m5c, sequence, atac, target, mask, rna) — same convention as
+        # LazyM5cSequenceAtacDataset and LazyM5cSequenceOnlyDataset.
+        return m5c_t, sequence_onehot, atac_t, hm5c_t, loss_mask, rna_t
 
 
 if __name__ == "__main__":
