@@ -174,7 +174,7 @@ def load_model_from_checkpoint(
     Returns the epoch number from the checkpoint (informational only — the
     outer training loop should start at epoch 1).
     """
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     pretrained = checkpoint["model_state_dict"]
     model_state = model.state_dict()
 
@@ -227,6 +227,92 @@ def load_model_from_checkpoint(
               f"Will unfreeze after epoch {freeze_backbone_epochs}.")
 
     return ckpt_epoch
+
+
+def _print_resume_arg_diff(ckpt_args: dict, args) -> None:
+    """Warn when the current run's key hyperparameters differ from the
+    checkpoint's — the optimizer/scheduler state is only meaningful when the
+    training setup (data recipe, dropout, architecture) is the same."""
+    watched = (
+        "mask_mode", "target_length", "batch_size", "train_ratio",
+        "seq_drop_p", "atac_drop_p", "rna_drop_p",
+        "use_all_input_groups", "model_b_blocks", "model_b_fusion",
+        "num_epochs", "learning_rate",
+    )
+    diffs = []
+    for key in watched:
+        old = ckpt_args.get(key, "<absent>")
+        new = getattr(args, key, "<absent>")
+        if old != new:
+            diffs.append(f"{key}: checkpoint={old!r} -> now={new!r}")
+    if diffs:
+        print("[resume] WARNING: arguments differ from the checkpoint:\n    "
+              + "\n    ".join(diffs))
+
+
+def resume_from_checkpoint(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    checkpoint_path: str,
+    device: torch.device,
+    args=None,
+) -> tuple[int, float, dict]:
+    """Strictly continue training from a checkpoint written by this script.
+
+    Unlike `load_model_from_checkpoint` (weights-only warm start: optimizer state
+    discarded, LR restarts, epoch reset to 1), this restores the optimizer state
+    — which carries the learning rate and the AdamW moments — plus the LR
+    scheduler progress and the epoch counter, so the run picks up exactly where
+    it stopped.
+
+    Returns ``(start_epoch, restored_lr, checkpoint_metrics)``.
+    """
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    except TypeError:  # older torch without the weights_only kwarg
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    pretrained = checkpoint["model_state_dict"]
+    model_state = model.state_dict()
+    own_keys = set(model_state.keys())
+    pre_keys = set(pretrained.keys())
+    missing = sorted(own_keys - pre_keys)
+    unexpected = sorted(pre_keys - own_keys)
+    if missing or unexpected:
+        print(f"[resume] WARNING: architecture differs from the checkpoint "
+              f"(missing={missing}, unexpected={unexpected}); loading the intersection.")
+        inter = own_keys & pre_keys
+        model.load_state_dict({k: pretrained[k] for k in inter}, strict=False)
+    else:
+        model.load_state_dict(pretrained, strict=True)
+
+    # Optimizer state carries the LR (param_groups[i]["lr"]) and the moments.
+    # It is unrestorable if the parameter set changed (e.g. adapters added) —
+    # fail loudly and keep the freshly built optimizer instead of crashing.
+    restored_lr = float(optimizer.param_groups[0]["lr"])
+    optimizer_state = checkpoint.get("optimizer_state_dict")
+    if optimizer_state is not None:
+        try:
+            optimizer.load_state_dict(optimizer_state)
+            restored_lr = float(optimizer.param_groups[0]["lr"])
+        except (ValueError, KeyError, RuntimeError) as exc:
+            print(f"[resume] WARNING: could not restore optimizer state ({exc}); "
+                  f"keeping a fresh optimizer (LR stays at {restored_lr:.6g}).")
+
+    scheduler_state = checkpoint.get("scheduler_state_dict")
+    if scheduler is not None and scheduler_state is not None:
+        try:
+            scheduler.load_state_dict(scheduler_state)
+        except (ValueError, KeyError, RuntimeError) as exc:
+            print(f"[resume] WARNING: could not restore scheduler state ({exc}); "
+                  f"the LR schedule restarts from its first step.")
+
+    if args is not None:
+        _print_resume_arg_diff(checkpoint.get("args", {}) or {}, args)
+
+    start_epoch = int(checkpoint.get("epoch", 0)) + 1
+    return start_epoch, restored_lr, dict(checkpoint.get("metrics", {}) or {})
 
 
 def masked_mse_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -680,6 +766,32 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
         optimizer = build_optimizer(model, args)
         scheduler = build_scheduler(optimizer, args, args.num_epochs)
 
+    # Strict continuation vs warm start are mutually exclusive: the former
+    # restores optimizer/scheduler/epoch, the latter deliberately resets them.
+    if getattr(args, "resume_from_checkpoint", None) and getattr(args, "init_from_checkpoint", None):
+        raise ValueError(
+            "Pass either --resume-from-checkpoint (strict continuation) or "
+            "--init-from-checkpoint (weights-only warm start), not both."
+        )
+
+    start_epoch = 1
+    resumed_val_loss = float("inf")
+    if getattr(args, "resume_from_checkpoint", None):
+        start_epoch, restored_lr, ckpt_metrics = resume_from_checkpoint(
+            model, optimizer, scheduler, args.resume_from_checkpoint, device, args
+        )
+        resumed_val_loss = float(ckpt_metrics.get("val_loss", float("inf")))
+        print(
+            f"[resume] {Path(args.resume_from_checkpoint).name}: continuing from epoch "
+            f"{start_epoch} (restored LR={restored_lr:.6g}, "
+            f"checkpoint val_loss={resumed_val_loss:.4f})"
+        )
+        if start_epoch > args.num_epochs:
+            print(
+                f"[resume] WARNING: start_epoch={start_epoch} > num_epochs={args.num_epochs}; "
+                f"no training will run, final evaluation only."
+            )
+
     # Mixed precision scaler
     try:
         scaler = torch.amp.GradScaler("cuda", enabled=args.amp)
@@ -688,16 +800,22 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
     amp_dtype = torch.bfloat16 if args.amp else torch.float32
 
     best_epoch = 0
-    best_val_loss = float("inf")
+    best_val_loss = resumed_val_loss
     best_val_r2 = float("nan")
     best_val_pearsonr = float("nan")
     best_state = None
-    last_epoch = 0
+    last_epoch = start_epoch - 1
+    # Pre-initialized so the post-loop bookkeeping is defined even when a resume
+    # starts past num_epochs and the loop body never runs.
+    val_loss = float("nan")
+    val_r2 = float("nan")
+    val_pearsonr = float("nan")
     best_checkpoint_path = args.best_checkpoint_path.format(sample_size=prepared.usable_dmrs, timestamp=args.timestamp)
     last_checkpoint_path = args.last_checkpoint_path.format(sample_size=prepared.usable_dmrs, timestamp=args.timestamp)
+    periodic_checkpoint_path = args.periodic_checkpoint_path.format(sample_size=prepared.usable_dmrs, timestamp=args.timestamp)
     patience_left = args.patience
 
-    for epoch in range(1, args.num_epochs + 1):
+    for epoch in range(start_epoch, args.num_epochs + 1):
         last_epoch = epoch
 
         # Unfreeze the backbone after the requested freeze epochs (curriculum).
@@ -774,6 +892,27 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
             f"train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
             f"val_r2={val_r2:.4f} | val_pearsonr={val_pearsonr:.4f} | lr={current_lr:.6g}"
         )
+
+        # Periodic checkpoint: protects long runs from losing progress.
+        if getattr(args, "checkpoint_every_n_epochs", 0) > 0 and epoch % args.checkpoint_every_n_epochs == 0:
+            save_checkpoint(
+                periodic_checkpoint_path,
+                model,
+                optimizer,
+                scheduler,
+                epoch,
+                {
+                    "train_loss": train_loss,
+                    "val_loss": val_loss,
+                    "val_r2": val_r2,
+                    "val_pearsonr": val_pearsonr,
+                    "is_best": False,
+                    "is_periodic": True,
+                },
+                args,
+                prepared.usable_dmrs,
+            )
+            print(f"[epoch {epoch:02d}] periodic checkpoint -> {Path(periodic_checkpoint_path).name}")
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -957,6 +1096,9 @@ def parse_args():
     add_clip_at_zero_argument(parser)
     parser.add_argument("--pretrained-checkpoint", default=None, help="Path to a MaskedTrackPretrainingModelB checkpoint (.pt) to initialize model_b weights.")
     parser.add_argument("--init-from-checkpoint", default=None, help="Path to a downstream model_b checkpoint (.pt) for warm-start / curriculum fine-tuning. Loads only model weights, resets optimizer/scheduler.")
+    parser.add_argument("--resume-from-checkpoint", default=None, help="Path to a checkpoint saved by THIS script for strict continuation: restores model weights, optimizer state (incl. LR), scheduler progress and epoch, then resumes from epoch+1. Mutually exclusive with --init-from-checkpoint.")
+    parser.add_argument("--checkpoint-every-n-epochs", type=int, default=0, help="If >0, write a periodic checkpoint every N epochs (protects long runs from losing progress). 0 disables this and keeps the previous behavior.")
+    parser.add_argument("--periodic-checkpoint-path", default="output/{timestamp}_m5c_query_crosshyena_periodic_{sample_size}.pt", help="Path template for --checkpoint-every-n-epochs (supports {timestamp} and {sample_size}).")
     parser.add_argument("--freeze-backbone-epochs", type=int, default=0, help="If >0, freeze all params except head for this many epochs after warm-start from --init-from-checkpoint.")
     parser.add_argument("--amp", action="store_true", help="Enable automatic mixed precision (bfloat16) training. Reduces memory ~2x, recommended for long sequences.")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1, help="Accumulate gradients over N mini-batches before each optimizer step. Use with --batch-size 4-8 for long sequences.")

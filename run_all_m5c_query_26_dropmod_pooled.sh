@@ -27,7 +27,21 @@ fi
 current_time=$(date "+%Y-%m-%d-%H-%M-%S")
 dmr_csv="/data2st1/junyi/generegion_vM23/cCRE_cpg.bed"
 bed_name="$(basename "$dmr_csv" .bed)"
-run_label="m5c_query_crosshyena_modelb_${fusion_type}_dropmod_pooled6_s${seq_drop_p}_a${atac_drop_p}_r${rna_drop_p}"
+
+# Optional strict continuation:
+#   RESUME_CKPT=/path/to/checkpoint.pt ./run_all_m5c_query_26_dropmod_pooled.sh
+# Restores model + optimizer (incl. LR) + scheduler + epoch and resumes there.
+resume_tag=""
+resume_args=()
+if [[ -n "${RESUME_CKPT:-}" ]]; then
+  resume_tag="_resume"
+  resume_args=(--resume-from-checkpoint "$RESUME_CKPT")
+fi
+
+# Periodic checkpoint every N epochs (protects the ~25h pooled run). 0 disables.
+ckpt_every="${CKPT_EVERY:-5}"
+
+run_label="m5c_query_crosshyena_modelb_${fusion_type}_dropmod_pooled6_s${seq_drop_p}_a${atac_drop_p}_r${rna_drop_p}${resume_tag}"
 output_dir="output/ALL_GROUPS/${bed_name}"
 mkdir -p "$output_dir"
 log_file="${output_dir}/${current_time}_${run_label}.log"
@@ -38,11 +52,14 @@ R=/data8/junyi/methdata/bulk_rna
 
 echo "[$(date)] Pooled 6-group training: AMY/HIP/PFC x MC/MW" | tee -a "$log_file"
 echo "[$(date)] drops: seq=${seq_drop_p} atac=${atac_drop_p} rna=${rna_drop_p}" | tee -a "$log_file"
+echo "[$(date)] periodic checkpoint every ${ckpt_every} epoch(s); resume=${RESUME_CKPT:-none}" | tee -a "$log_file"
 echo "[$(date)] log: ${log_file}" | tee -a "$log_file"
 
 python run_m5c_query_crosshyena_dropmod.py \
   --sample-sizes all \
   --use-all-input-groups \
+  "${resume_args[@]}" \
+  --checkpoint-every-n-epochs "$ckpt_every" \
   --dmr-csv "$dmr_csv" \
   --model-name model_b \
   --model-b-blocks 2 \
