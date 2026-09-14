@@ -47,9 +47,21 @@ def resolve_sample_sizes(sample_sizes, args):
     if is_csv:
         total_lines -= 1
 
+    # Multi-dataset runs: `--use-all-input-groups` replicates the DMR table once
+    # per input group, so "all" must resolve to (rows-per-group) × (num_groups),
+    # otherwise prepare_*() would truncate back to the first group's rows.
+    num_groups = 1
+    if getattr(args, "use_all_input_groups", False):
+        for attr in ("m5c_bedgraph", "hm5c_bedgraph", "atac_bw"):
+            v = getattr(args, attr, None)
+            if v:
+                paths = v if isinstance(v, list) else [v]
+                num_groups = max(num_groups, len(paths))
+                break
+
     for s in sample_sizes:
         if s == "all":
-            resolved.append(total_lines)
+            resolved.append(total_lines * num_groups)
         else:
             resolved.append(int(s))
     return resolved

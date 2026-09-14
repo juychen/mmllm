@@ -370,25 +370,15 @@ def load_data(args, lazy: bool = False):
     df_dmr.loc[short_mask, "start_expanded"] = df_dmr.loc[short_mask, "center"] - half_window
     df_dmr.loc[short_mask, "end_expanded"] = df_dmr.loc[short_mask, "center"] + half_window - 1
 
-    # In lazy mode, skip loading sequences and tracks — they will be fetched
-    # on-the-fly by LazyM5cSequenceAtacDataset.  Return minimal placeholder lists
-    # long enough to pass downstream length checks in prepare_*().
-    if lazy:
-        num_rows = len(df_dmr)
-        dummy_seq = "A" * target_length
-        dummy_track = np.zeros(target_length, dtype=np.float32)
-        return (
-            df_dmr,
-            [dummy_seq] * num_rows,
-            [dummy_track] * num_rows,   # mcg (5mC)
-            [dummy_track] * num_rows,   # hmcg (5hmC)
-            [dummy_track] * num_rows,   # atac
-        )
-
-    genome = pyfaidx.Fasta(args.genome_fasta)
+    # --- Resolve input groups (shared by lazy and eager modes) ---
+    # The CLI accepts multiple paths per modality (nargs="+"); with
+    # --use-all-input-groups every group contributes its own copy of the DMR
+    # table and each row carries its group's track paths, so the lazy datasets
+    # can read per-row files (multi-dataset training).
     hm5c_paths = ensure_path_list(getattr(args, "hm5c_bedgraph", None))
     m5c_paths = ensure_path_list(getattr(args, "m5c_bedgraph", None))
     atac_paths = ensure_path_list(getattr(args, "atac_bw", None))
+    rna_paths = ensure_path_list(getattr(args, "rna_coverage_bw", None)) if getattr(args, "rna_coverage_bw", None) else []
 
     requested_track_modalities = set()
     if hasattr(args, "input_modality"):
@@ -412,6 +402,8 @@ def load_data(args, lazy: bool = False):
         atac_paths = atac_paths[:1]
         if should_load_5mc:
             m5c_paths = m5c_paths[:1]
+        if rna_paths:
+            rna_paths = rna_paths[:1]
         num_groups = 1
     else:
         if len(hm5c_paths) != len(atac_paths):
@@ -422,12 +414,57 @@ def load_data(args, lazy: bool = False):
             raise ValueError(
                 "When --use-all-input-groups is enabled, --m5c-bedgraph must have the same number of paths as --hm5c-bedgraph."
             )
+        if rna_paths and len(rna_paths) not in (1, num_groups):
+            raise ValueError(
+                "When --use-all-input-groups is enabled, --rna-coverage-bw must have "
+                "one path per input group (or a single shared path)."
+            )
+
+    def _group_frame(group_idx: int, include_m5c: bool) -> pd.DataFrame:
+        """Replicate the DMR table for one input group, attaching that group's
+        track paths as per-row columns for the lazy datasets."""
+        group_df = df_dmr.copy()
+        group_df["input_group"] = group_idx
+        group_df["hm5c_bedgraph_path"] = hm5c_paths[group_idx]
+        group_df["atac_bw_path"] = atac_paths[group_idx]
+        if include_m5c and m5c_paths:
+            group_df["m5c_bedgraph_path"] = m5c_paths[group_idx]
+        if rna_paths:
+            # A single shared RNA path is reused across groups.
+            group_df["rna_bw_path"] = rna_paths[group_idx % len(rna_paths)]
+        return group_df
+
+    # In lazy mode, skip loading sequences and tracks — they will be fetched
+    # on-the-fly by LazyM5cSequenceAtacDataset.  Multi-group runs still
+    # replicate the DMR table (with per-row track paths) so pooled training
+    # works in lazy mode too.
+    if lazy:
+        if use_all_input_groups and num_groups > 1:
+            combined = pd.concat(
+                [_group_frame(g, include_m5c=bool(m5c_paths)) for g in range(num_groups)],
+                ignore_index=True,
+            )
+            num_rows = len(combined)
+        else:
+            combined = df_dmr
+            num_rows = len(df_dmr)
+        dummy_seq = "A" * target_length
+        dummy_track = np.zeros(target_length, dtype=np.float32)
+        return (
+            combined,
+            [dummy_seq] * num_rows,
+            [dummy_track] * num_rows,   # mcg (5mC)
+            [dummy_track] * num_rows,   # hmcg (5hmC)
+            [dummy_track] * num_rows,   # atac
+        )
+
+    genome = pyfaidx.Fasta(args.genome_fasta)
+    clip_at_zero = getattr(args, "clip_at_zero", getattr(args, "clip_5hmc_at_zero", False))
 
     # Detect formats once (cached — no per-region overhead)
     hm5c_formats = [_detect_track_format(p) for p in hm5c_paths]
     m5c_formats = [_detect_track_format(p) for p in m5c_paths] if should_load_5mc else []
     atac_formats = [_detect_track_format(p) for p in atac_paths]
-    clip_at_zero = getattr(args, "clip_at_zero", getattr(args, "clip_5hmc_at_zero", False))
 
     tbx_5hmc_list = [_open_track_handle(p, f) for p, f in zip(hm5c_paths, hm5c_formats)]
     tbx_5mc_list = [_open_track_handle(p, f) for p, f in zip(m5c_paths, m5c_formats)] if should_load_5mc else []
@@ -439,12 +476,7 @@ def load_data(args, lazy: bool = False):
     atac_tracks = []
     dmr_frames = []
     for group_idx in range(num_groups):
-        group_df = df_dmr.copy()
-        group_df["input_group"] = group_idx
-        group_df["hm5c_bedgraph_path"] = hm5c_paths[group_idx]
-        group_df["atac_bw_path"] = atac_paths[group_idx]
-        if should_load_5mc:
-            group_df["m5c_bedgraph_path"] = m5c_paths[group_idx]
+        group_df = _group_frame(group_idx, include_m5c=should_load_5mc)
         dmr_frames.append(group_df)
 
         tbx_5hmc = tbx_5hmc_list[group_idx]
@@ -942,20 +974,48 @@ class LazyM5cSequenceAtacDataset(torch.utils.data.Dataset):
     def _open_handles(self):
         import pyfaidx
         self._genome = pyfaidx.Fasta(self.genome_fasta)
-        self._tbx_5mc = _open_track_handle(self.m5c_bedgraph, self._m5c_fmt)
-        self._tbx_5hmc = _open_track_handle(self.hm5c_bedgraph, self._hm5c_fmt)
-        self._atac_bw = _open_track_handle(self.atac_bw_path, self._atac_fmt)
+        # Seed the per-path handle cache (and the legacy single-handle
+        # attributes) with the constructor-default tracks.
+        self._tbx_5mc, _ = self._track_handle(self.m5c_bedgraph)
+        self._tbx_5hmc, _ = self._track_handle(self.hm5c_bedgraph)
+        self._atac_bw, _ = self._track_handle(self.atac_bw_path)
+
+    def _track_handle(self, path: str):
+        """Return ``(handle, fmt)`` for ``path``, opening and caching on first use.
+
+        The per-path cache is what enables multi-dataset training: with
+        ``--use-all-input-groups`` each DMR row carries its own track paths and
+        every unique path gets exactly one handle per worker process.
+        """
+        entry = self._track_handle_cache.get(path)
+        if entry is None:
+            fmt = _detect_track_format(path)
+            entry = (_open_track_handle(path, fmt), fmt)
+            self._track_handle_cache[path] = entry
+        return entry
 
     def _close_handles(self):
-        """Close all open file handles. Safe to call multiple times."""
-        for attr in ("_genome", "_tbx_5mc", "_tbx_5hmc", "_atac_bw"):
-            handle = getattr(self, attr, None)
-            if handle is not None:
+        """Close all open file handles. Safe to call multiple times.
+
+        The legacy single-handle attributes may alias cache entries, so track
+        handles are closed via the cache only; the attributes are just reset.
+        """
+        cache = getattr(self, "_track_handle_cache", None)
+        if cache:
+            for handle, _fmt in cache.values():
                 try:
                     handle.close()
                 except Exception:
                     pass
-                setattr(self, attr, None)
+            cache.clear()
+        genome = getattr(self, "_genome", None)
+        if genome is not None:
+            try:
+                genome.close()
+            except Exception:
+                pass
+        for attr in ("_genome", "_tbx_5mc", "_tbx_5hmc", "_atac_bw", "_rna_bw"):
+            setattr(self, attr, None)
 
     def __init__(
         self,
@@ -992,6 +1052,8 @@ class LazyM5cSequenceAtacDataset(torch.utils.data.Dataset):
         self._tbx_5mc = None
         self._tbx_5hmc = None
         self._atac_bw = None
+        # path -> (handle, fmt); enables per-row track paths (multi-dataset).
+        self._track_handle_cache: dict[str, tuple[object, str]] = {}
         self._lock = threading.RLock()
 
     def __len__(self):
@@ -1004,6 +1066,8 @@ class LazyM5cSequenceAtacDataset(torch.utils.data.Dataset):
         state["_tbx_5mc"] = None
         state["_tbx_5hmc"] = None
         state["_atac_bw"] = None
+        state["_rna_bw"] = None
+        state["_track_handle_cache"] = {}
         state["_lock"] = None
         return state
 
@@ -1014,6 +1078,8 @@ class LazyM5cSequenceAtacDataset(torch.utils.data.Dataset):
         self._tbx_5mc = None
         self._tbx_5hmc = None
         self._atac_bw = None
+        self._rna_bw = None
+        self._track_handle_cache = {}
 
     def __del__(self):
         self._close_handles()
@@ -1034,27 +1100,39 @@ class LazyM5cSequenceAtacDataset(torch.utils.data.Dataset):
         start = int(row["start_expanded"])
         end = int(row["end_expanded"])
 
+        # Multi-dataset support: prefer the per-row track paths attached by
+        # load_data(--use-all-input-groups); fall back to the constructor paths.
+        m5c_path = row.get("m5c_bedgraph_path", self.m5c_bedgraph)
+        hm5c_path = row.get("hm5c_bedgraph_path", self.hm5c_bedgraph)
+        atac_path = row.get("atac_bw_path", self.atac_bw_path)
+
+        # Resolve handles under the lock (may open new per-path handles).
+        with self._lock:
+            tbx_5mc, m5c_fmt = self._track_handle(m5c_path)
+            tbx_5hmc, hm5c_fmt = self._track_handle(hm5c_path)
+            atac_bw, atac_fmt = self._track_handle(atac_path)
+
         # --- fetch on the fly ---
         seq_str = get_sequence(chrom, start, end, self._genome)
         hm5c = read_track_region(
-            self._tbx_5hmc,
-            self._hm5c_fmt,
+            tbx_5hmc,
+            hm5c_fmt,
             chrom,
             start,
             end,
             clip_at_zero=self.clip_at_zero,
         )
         atac = read_track_region(
-            self._atac_bw,
-            self._atac_fmt,
+            atac_bw,
+            atac_fmt,
             chrom,
             start,
             end + 1,
             clip_at_zero=self.clip_at_zero,
         )
         m5c = read_track_region(
-            self._tbx_5mc,
-            self._m5c_fmt,
+            tbx_5mc,
+            m5c_fmt,
             chrom,
             start,
             end,
@@ -1110,22 +1188,9 @@ class LazyM5cSequenceAtacRnaDataset(LazyM5cSequenceAtacDataset):
     """
 
     def _open_handles(self):
-        import pyfaidx
-        self._genome = pyfaidx.Fasta(self.genome_fasta)
-        self._tbx_5mc = _open_track_handle(self.m5c_bedgraph, self._m5c_fmt)
-        self._tbx_5hmc = _open_track_handle(self.hm5c_bedgraph, self._hm5c_fmt)
-        self._atac_bw = _open_track_handle(self.atac_bw_path, self._atac_fmt)
-        self._rna_bw = _open_track_handle(self.rna_bw_path, self._rna_fmt) if self.rna_bw_path else None
-
-    def _close_handles(self):
-        for attr in ("_genome", "_tbx_5mc", "_tbx_5hmc", "_atac_bw", "_rna_bw"):
-            handle = getattr(self, attr, None)
-            if handle is not None:
-                try:
-                    handle.close()
-                except Exception:
-                    pass
-                setattr(self, attr, None)
+        super()._open_handles()
+        if self.rna_bw_path:
+            self._rna_bw, _ = self._track_handle(self.rna_bw_path)
 
     def __init__(
         self,
@@ -1186,13 +1251,26 @@ class LazyM5cSequenceAtacRnaDataset(LazyM5cSequenceAtacDataset):
         start = int(row["start_expanded"])
         end = int(row["end_expanded"])
 
+        # Multi-dataset support: per-row track paths (attached by load_data
+        # with --use-all-input-groups), falling back to constructor defaults.
+        m5c_path = row.get("m5c_bedgraph_path", self.m5c_bedgraph)
+        hm5c_path = row.get("hm5c_bedgraph_path", self.hm5c_bedgraph)
+        atac_path = row.get("atac_bw_path", self.atac_bw_path)
+        rna_path = row.get("rna_bw_path", self.rna_bw_path)
+
+        with self._lock:
+            tbx_5mc, m5c_fmt = self._track_handle(m5c_path)
+            tbx_5hmc, hm5c_fmt = self._track_handle(hm5c_path)
+            atac_bw, atac_fmt = self._track_handle(atac_path)
+            rna_bw, rna_fmt = self._track_handle(rna_path) if rna_path else (None, None)
+
         # --- fetch on the fly ---
         seq_str = get_sequence(chrom, start, end, self._genome)
-        hm5c = read_track_region(self._tbx_5hmc, self._hm5c_fmt, chrom, start, end, clip_at_zero=self.clip_at_zero)
-        atac = read_track_region(self._atac_bw, self._atac_fmt, chrom, start, end + 1, clip_at_zero=self.clip_at_zero)
-        m5c = read_track_region(self._tbx_5mc, self._m5c_fmt, chrom, start, end, clip_at_zero=self.clip_at_zero)
-        if self._rna_bw is not None:
-            rna = read_track_region(self._rna_bw, self._rna_fmt, chrom, start, end + 1, clip_at_zero=self.clip_at_zero)
+        hm5c = read_track_region(tbx_5hmc, hm5c_fmt, chrom, start, end, clip_at_zero=self.clip_at_zero)
+        atac = read_track_region(atac_bw, atac_fmt, chrom, start, end + 1, clip_at_zero=self.clip_at_zero)
+        m5c = read_track_region(tbx_5mc, m5c_fmt, chrom, start, end, clip_at_zero=self.clip_at_zero)
+        if rna_bw is not None:
+            rna = read_track_region(rna_bw, rna_fmt, chrom, start, end + 1, clip_at_zero=self.clip_at_zero)
         else:
             rna = np.zeros(end - start, dtype=np.float32)
 
