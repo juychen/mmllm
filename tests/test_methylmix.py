@@ -15,7 +15,11 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from methylmix_data import make_model, make_synthetic_data  # noqa: E402
+from methylmix_data import (  # noqa: E402
+    drop_fully_masked_dmrs,
+    make_model,
+    make_synthetic_data,
+)
 from methylmix_model import (  # noqa: E402
     MixtureBatch,
     MixtureConfig,
@@ -150,6 +154,149 @@ def test_synthetic_delta_recovery(verbose: bool = True):
     return {"inferred": inferred, "signed_delta": signed, "ctrl_mae": ctrl["mae"], "dis_mae": dis["mae"]}
 
 
+# ---------------------------------------------------------------------- #
+# Test 7: a masked bulk observation cannot reach the loss (spec §3.1, §11)
+# ---------------------------------------------------------------------- #
+def test_masked_bulk_entry_does_not_enter_loss():
+    data, _ = make_synthetic_data(n_loci=30, n_ctrl=2, n_dis=2, n_dmr=10, seed=5)
+    model = make_model(data)
+    batch = data.batch
+
+    # While the entry is observed its value drives the loss ...
+    batch.y_ctrl[0, 0] = 0.95
+    observed = float(model.loss(batch, stage="ctrl")[0].detach())
+
+    # ... and masking it makes the value irrelevant: a non-finite placeholder and
+    # a wild finite one both leave the loss exactly where the mask left it.
+    # (NaN * 0 is NaN, so this also checks the loss cannot be poisoned.)
+    batch.mask_ctrl[0, 0] = False
+    batch.y_ctrl[0, 0] = float("nan")
+    masked_nan = float(model.loss(batch, stage="ctrl")[0].detach())
+    batch.y_ctrl[0, 0] = 123.0
+    masked_wild = float(model.loss(batch, stage="ctrl")[0].detach())
+
+    assert torch.isfinite(torch.tensor(masked_nan)), f"NaN at a masked entry poisoned the loss: {masked_nan}"
+    assert masked_wild == masked_nan, \
+        f"value at a masked entry changed the loss: {masked_nan} -> {masked_wild}"
+    assert abs(masked_nan - observed) > 1e-6, "the entry should have moved the loss while observed"
+    print(f"  Test 7 masked bulk entry skipped    OK  -> observed {observed:.6f} vs masked "
+          f"{masked_nan:.6f}; NaN and 123.0 both ignored")
+
+
+# ---------------------------------------------------------------------- #
+# Test 8: a masked reference entry carries no delta (spec §3.1)
+# ---------------------------------------------------------------------- #
+def test_ref_mask_zeroes_delta():
+    data, _ = make_synthetic_data(n_loci=20, n_ctrl=2, n_dis=2, n_dmr=20, seed=6)
+    data.ref_mask[0, 0] = False
+    model = make_model(data)
+    assert not bool(model.component_mask()[0, 0]), "masked reference entry reported as observed"
+    if model.cfg.use_other:
+        assert bool(model.component_mask()[-1].all()), "OTHER must always count as available"
+
+    model.delta.data.normal_(0, 2.0)
+    assert float(model.delta_effective()[0, 0]) == 0.0, \
+        f"delta survived on a masked entry: {float(model.delta_effective()[0, 0])}"
+
+    before = float(model.loss(data.batch, stage="dis")[0].detach())
+    with torch.no_grad():
+        model.delta[0, 0] = 7.0
+    after = float(model.loss(data.batch, stage="dis")[0].detach())
+    assert abs(after - before) < 1e-7, f"delta on a masked entry changed the loss: {before} -> {after}"
+    print(f"  Test 8 ref mask zeroes delta        OK  -> delta_eff=0.0, loss {before:.6f} unchanged")
+
+
+# ---------------------------------------------------------------------- #
+# Test 9: a locus no reference observes is out of the loss (spec §3.1)
+# ---------------------------------------------------------------------- #
+def test_all_ref_masked_locus_excluded():
+    data, truth = make_synthetic_data(
+        n_loci=25, n_ctrl=2, n_dis=2, n_dmr=0, seed=7, all_ref_masked_loci=[0]
+    )
+    assert truth["dropped_dmr_ids"] == [], "a non-DMR locus should not drop a DMR"
+    model = make_model(data)
+    assert not bool(model.locus_valid()[0]), "locus missing in every reference reported usable"
+    assert int((~model.ref_mask[:, 0]).sum()) == model.n_ref, "not every reference was masked"
+    # the placeholder must not be a silent zero (spec §24 criterion 7)
+    assert float(data.theta_ref[:, 0].min()) > 0.0, \
+        f"missing reference value was replaced by 0.0: {data.theta_ref[:, 0].tolist()}"
+
+    before = float(model.loss(data.batch, stage="ctrl")[0].detach())
+    with torch.no_grad():
+        saved = data.batch.y_ctrl[:, 0].clone()
+        data.batch.y_ctrl[:, 0] = 0.654321
+    after = float(model.loss(data.batch, stage="ctrl")[0].detach())
+    with torch.no_grad():
+        data.batch.y_ctrl[:, 0] = saved
+    assert abs(after - before) < 1e-7, f"bulk at an unobserved locus changed the loss: {before} -> {after}"
+    print(f"  Test 9 all-ref-masked locus skipped OK  -> loss {before:.6f} unchanged, "
+          f"placeholder={float(data.theta_ref[0, 0]):.4f} (not 0)")
+
+
+# ---------------------------------------------------------------------- #
+# Test 10: a DMR no reference can inform is dropped as a unit (spec §3.1)
+# ---------------------------------------------------------------------- #
+def test_all_ref_masked_dmr_dropped():
+    # unit: dropped only when EVERY locus of the DMR is unreachable
+    is_dmr = torch.tensor([True] * 3 + [True] * 3)
+    dmr_ids = ["Dfull"] * 3 + ["Dpart"] * 3
+    ref_mask = torch.ones(2, 6, dtype=torch.bool)
+    ref_mask[:, :3] = False       # Dfull: no reference sees any of its loci
+    ref_mask[0, 3] = False        # Dpart: one entry masked, the region stays reachable
+    kept, dropped = drop_fully_masked_dmrs(is_dmr, dmr_ids, ref_mask)
+    assert dropped == ["Dfull"], f"expected only Dfull to be dropped, got {dropped}"
+    assert kept.tolist() == [False] * 3 + [True] * 3, f"is_dmr wrongly rewritten: {kept.tolist()}"
+
+    # end-to-end: pick a locus that IS a DMR, then make it invisible to every reference
+    _, probe_truth = make_synthetic_data(n_loci=30, n_ctrl=2, n_dis=2, n_dmr=10, seed=8)
+    target = int(probe_truth["dmr_loci"].nonzero().flatten()[0])
+    data, truth = make_synthetic_data(
+        n_loci=30, n_ctrl=2, n_dis=2, n_dmr=10, seed=8, all_ref_masked_loci=[target]
+    )
+    assert truth["dropped_dmr_ids"] == [f"D{target}"], \
+        f"dropped DMRs {truth['dropped_dmr_ids']} != ['D{target}']"
+    assert not bool(data.locus_df["is_dmr"][target]), "dropped DMR kept is_dmr=True"
+    assert not bool(truth["dmr_loci"][target]), "dropped DMR still counted as a truth DMR"
+
+    model = make_model(data)
+    model.delta.data.normal_(0, 2.0)
+    assert float(model.delta_effective()[:, target].abs().max()) == 0.0, \
+        "delta survived inside a dropped DMR"
+    assert float(model.delta_effective().abs().max()) > 0.0, "no delta left on the surviving DMRs"
+    print(f"  Test 10 unreachable DMR dropped     OK  -> D{target} dropped, "
+          f"delta zero inside it, {len(data.dropped_dmr_ids)} DMR(s) dropped in total")
+
+
+# ---------------------------------------------------------------------- #
+# Test 11: the reconstruction error function is switchable (huber | mse)
+# ---------------------------------------------------------------------- #
+def test_recon_loss_mse_switch():
+    theta = torch.tensor([[0.8, 0.2], [0.2, 0.6]])
+    model = _fixed_model(theta, [0.75, 0.25])
+    observed = torch.tensor([[0.60, 0.40]])
+    mask = torch.ones(1, 2, dtype=torch.bool)
+    # Full coverage weight, so the reducer is a plain mean and the expected value
+    # is analytic (the coverage weight is normalised by cfg.coverage_cap).
+    weight = torch.full((1, 2), model.cfg.coverage_cap)
+    pred = model.predict_control().detach()
+
+    model.cfg.recon_loss = "huber"
+    huber = float(model._recon(model.predict_control(), observed, mask, weight).detach())
+    model.cfg.recon_loss = "mse"
+    mse = float(model._recon(model.predict_control(), observed, mask, weight).detach())
+    assert abs(mse - float(((pred - observed) ** 2).mean())) < 1e-7, f"mse switch: got {mse}"
+    assert abs(huber - mse) > 0.0, "huber and mse should differ on these residuals"
+
+    # masking an entry excludes it under either function
+    mask[0, 1] = False
+    mse_masked = float(model._recon(model.predict_control(), observed, mask, weight).detach())
+    assert abs(mse_masked - float((pred[0, 0] - observed[0, 0]) ** 2)) < 1e-7, \
+        f"masked mse got {mse_masked}, expected the first entry only"
+    assert MixtureConfig().recon_loss == "huber", "huber must remain the default"
+    print(f"  Test 11 huber/mse switch            OK  -> huber={huber:.6f} mse={mse:.6f}, "
+          f"masked mse={mse_masked:.6f} (entry 1 excluded)")
+
+
 def main() -> int:
     torch.manual_seed(0)
     tests = [
@@ -159,6 +306,11 @@ def main() -> int:
         test_zero_delta_identity,
         test_missing_reference_runs,
         test_synthetic_delta_recovery,
+        test_masked_bulk_entry_does_not_enter_loss,
+        test_ref_mask_zeroes_delta,
+        test_all_ref_masked_locus_excluded,
+        test_all_ref_masked_dmr_dropped,
+        test_recon_loss_mse_switch,
     ]
     failed = 0
     for test in tests:

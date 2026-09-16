@@ -7,6 +7,9 @@ Conventions enforced here:
     percentage and divided by 100);
   * missing observations are encoded by ``valid = 0`` — they are NEVER turned
     into a 0.0 methylation value (spec §3.1, acceptance criterion 7);
+  * a locus that no reference observes is kept as a row but carries no
+    information: it is excluded from the reconstruction loss, and a DMR whose
+    every locus is in that state is dropped as a unit (spec §3.5);
   * unreferenced single-cell cell types are summed into a single ``OTHER``
     column of the composition prior (spec §2, §6).
 """
@@ -63,17 +66,36 @@ class AlignedData:
     dis_sample_ids: list[str]
     cell_types_all: list[str] = field(default_factory=list)   # components incl. OTHER
     group_priors: dict = field(default_factory=dict)          # bookkeeping
+    ref_mask: torch.Tensor | None = None   # [C_ref, R] bool, True = reference observed
+    dropped_dmr_ids: list[str] = field(default_factory=list)  # DMRs no reference can inform
 
     @property
     def n_loci(self) -> int:
         return len(self.locus_df)
 
+    @property
+    def locus_valid(self) -> torch.Tensor | None:
+        """[R] bool, True where at least one reference observes the locus."""
+        if self.ref_mask is None:
+            return None
+        return self.ref_mask.any(dim=0)
 
-def load_reference_tracks(path: str | Path) -> tuple[pd.DataFrame, torch.Tensor, list[str], torch.Tensor]:
+
+def load_reference_tracks(
+    path: str | Path,
+) -> tuple[pd.DataFrame, torch.Tensor, list[str], torch.Tensor, torch.Tensor]:
     """Load reference cell-type methylation (spec §3.1).
 
-    Returns ``(locus_frame, theta_ref [C_ref, R], cell_types, concentration)`` on
-    the loci where EVERY reference has a valid observation.
+    Returns ``(locus_frame, theta_ref [C_ref, R], cell_types, concentration,
+    ref_mask [C_ref, R])``.
+
+    A locus is kept as soon as ONE reference observes it; loci no reference sees
+    at all are dropped. Entries the mask flags False carry an imputed value (the
+    mean of the references observed at that locus) purely so ``theta_ref`` stays
+    finite — they carry no information and the model gates them out.
+
+    ``valid = 0`` marks a missing observation and never becomes a 0.0 value, so
+    "no signal" stays distinguishable from a true methylation of 0.
     """
     frame = read_table(path)
     _require_columns(
@@ -99,15 +121,29 @@ def load_reference_tracks(path: str | Path) -> tuple[pd.DataFrame, torch.Tensor,
         frame.drop_duplicates("locus_id").set_index("locus_id")[locus_cols]
         if locus_cols else pd.DataFrame(index=pivot.index)
     )
-    complete = pivot[cell_types].notna().all(axis=1)
+    observed = pivot[cell_types].notna()
+    complete = observed.any(axis=1)
+    if not bool(complete.any()):
+        raise ValueError(f"reference tracks: no locus is observed by any cell type in {path}")
     pivot = pivot.loc[complete, cell_types]
+    observed = observed.loc[complete]
     locus_frame = locus_frame.loc[pivot.index]
 
-    theta_ref = torch.tensor(pivot.to_numpy(dtype=np.float32).T)          # [C_ref, R]
+    values = pivot.to_numpy(dtype=np.float64)
+    mask_np = observed.to_numpy(dtype=bool)
+    with np.errstate(invalid="ignore"):
+        observed_values = np.where(mask_np, values, np.nan)
+        locus_mean = np.nanmean(observed_values, axis=1, keepdims=True)
+    global_mean = float(np.nanmean(observed_values))
+    fill = np.where(np.isfinite(locus_mean), locus_mean, global_mean)
+    values = np.where(mask_np, values, fill)
+
+    theta_ref = torch.tensor(values.T.astype(np.float32))       # [C_ref, R]
+    ref_mask = torch.tensor(mask_np.T)                          # [C_ref, R]
     conc_mat = conc.loc[pivot.index, cell_types].to_numpy(dtype=np.float32).T
     conc_t = torch.tensor(np.where(np.isnan(conc_mat), 0.0, conc_mat))
     locus_frame = locus_frame.reset_index()
-    return locus_frame, theta_ref, cell_types, conc_t
+    return locus_frame, theta_ref, cell_types, conc_t, ref_mask
 
 
 def load_bulk_tracks(
@@ -129,6 +165,11 @@ def load_bulk_tracks(
     frame = frame.copy()
     frame["meth_value"] = _to_fraction(frame["meth_value"]).clip(0.0, 1.0)
     valid = frame["valid"].astype(bool)
+    if "coverage" in frame.columns:
+        # Zero coverage is no signal even when the row says valid: keeping such an
+        # entry would let a placeholder value into the QC metrics (the loss already
+        # dropped it via the weight).
+        valid &= frame["coverage"].astype(float) > 0.0
     if min_coverage is not None:
         if "coverage" not in frame.columns:
             raise ValueError("min_coverage requested but bulk tracks have no 'coverage' column")
@@ -136,17 +177,27 @@ def load_bulk_tracks(
     frame["_valid"] = valid
     frame.loc[~frame["_valid"], "meth_value"] = np.nan
 
-    y = frame.pivot_table(index="sample_id", columns="locus_id", values="meth_value", aggfunc="mean")
-    mask = frame.assign(_one=1.0).pivot_table(
+    # Pivot on a constant as well as on the values. The constant pivot gives the
+    # full (sample, locus) universe — an invalidated entry still occupies a row —
+    # while the values pivot carries NaN exactly where an observation is missing
+    # or was invalidated. Reindexing the latter onto the former means ``y.notna()``
+    # is the validity mask: an absent entry, a `valid = 0` entry and an entry below
+    # min_coverage are all NaN here, so none of them can become a 0.0 value
+    # (spec §3.1, acceptance criterion 7). Using the constant pivot as the mask
+    # itself would silently accept every invalid entry.
+    universe = frame.assign(_one=1.0).pivot_table(
         index="sample_id", columns="locus_id", values="_one", aggfunc="max"
     )
+    y = frame.pivot_table(index="sample_id", columns="locus_id", values="meth_value", aggfunc="mean")
+    y = y.reindex(index=universe.index, columns=universe.columns)
     weight = None
     if "coverage" in frame.columns:
         weight = frame.pivot_table(index="sample_id", columns="locus_id", values="coverage", aggfunc="mean")
+        weight = weight.reindex(index=universe.index, columns=universe.columns)
 
-    sample_ids = y.index.tolist()
+    sample_ids = universe.index.tolist()
     y = y.reindex(columns=locus_ids)
-    mask = mask.reindex(columns=locus_ids).notna() if mask is not None else y.notna()
+    mask = y.notna()
     if weight is not None:
         weight = weight.reindex(columns=locus_ids)
     y = y.fillna(0.0)  # value for masked-out entries is irrelevant; mask gates the loss
@@ -211,7 +262,7 @@ def load_composition_prior(
     prior = torch.tensor(np.asarray(rows, dtype=np.float32))
     totals = prior.sum(dim=-1, keepdim=True)
     if bool((totals <= 0).any()):
-        bad = [sample_ids[i] for i in range(len(sample_ids)) if float(totals[i]) <= 0]
+        bad = [sample_ids[i] for i, t in enumerate(totals.flatten().tolist()) if t <= 0]
         raise ValueError(f"empty composition prior for sample(s) {bad}")
     prior = prior / totals
     info = {"group_mode": bool(group_mode), "unreferenced_mass_mean": float(
@@ -233,6 +284,33 @@ def load_dmr_annotation(path: str | Path, locus_ids: pd.Index) -> tuple[torch.Te
     return torch.tensor(is_dmr.astype(bool)), dmr_ids
 
 
+def drop_fully_masked_dmrs(
+    is_dmr: torch.Tensor, dmr_ids: list[str], ref_mask: torch.Tensor
+) -> tuple[torch.Tensor, list[str]]:
+    """Drop DMRs that no reference can inform (spec §3.1).
+
+    A DMR is dropped only when EVERY one of its loci is missing in EVERY
+    reference: the region then carries no reference signal at all, so its delta
+    has nothing to fit and must stay out of the penalties and the attribution.
+    A locus that is missing in every reference but sits in a DMR with at least one
+    observed locus keeps its row and is excluded from the loss individually.
+
+    Returns ``(is_dmr with dropped regions cleared, sorted dropped dmr_ids)``.
+    """
+    locus_ok_np = ref_mask.any(dim=0).numpy()
+    ids = pd.Series(list(dmr_ids), dtype="object")
+    selected = (ids.str.len() > 0).to_numpy()
+    if not bool(selected.any()):
+        return is_dmr, []
+    grouped = pd.DataFrame({"dmr_id": ids.to_numpy()[selected], "ok": locus_ok_np[selected]})
+    any_ok = grouped.groupby("dmr_id", sort=False)["ok"].any()
+    dropped = sorted(any_ok.index[~any_ok].tolist())
+    if not dropped:
+        return is_dmr, []
+    in_dropped = torch.tensor(ids.isin(dropped).to_numpy(), dtype=torch.bool)
+    return is_dmr & ~in_dropped, dropped
+
+
 def build_aligned_data(
     reference_path: str | Path,
     ctrl_path: str | Path,
@@ -244,25 +322,32 @@ def build_aligned_data(
     sample_groups: dict[str, str] | None = None,
 ) -> AlignedData:
     """Stage 0: intersect loci across references and both bulk conditions."""
-    locus_frame, theta_ref, ref_cell_types, conc = load_reference_tracks(reference_path)
+    locus_frame, theta_ref, ref_cell_types, conc, ref_mask = load_reference_tracks(reference_path)
     locus_ids = pd.Index(locus_frame["locus_id"])
     if locus_ids.has_duplicates:
         raise ValueError("duplicate locus_id in reference tracks")
 
+    # The DMR annotation is needed before the reference mask is evaluated: a DMR
+    # whose every locus is missing in every reference is dropped as a unit.
+    if dmr_path is not None:
+        is_dmr, dmr_ids = load_dmr_annotation(dmr_path, locus_ids)
+    else:
+        is_dmr, dmr_ids = torch.ones(len(locus_frame), dtype=torch.bool), [""] * len(locus_frame)
+    is_dmr, dropped_dmr_ids = drop_fully_masked_dmrs(is_dmr, dmr_ids, ref_mask)
+
     ctrl_ids, y_c, m_c, w_c = load_bulk_tracks(ctrl_path, locus_ids, "CTRL", min_coverage)
     dis_ids, y_d, m_d, w_d = load_bulk_tracks(dis_path, locus_ids, "DIS", min_coverage)
 
-    # Keep loci that at least one sample of each condition can actually see.
+    # Keep loci that at least one sample of each condition can actually see. Loci
+    # without reference signal are NOT removed here: they keep their row so the
+    # output tables stay aligned, and the model drops them from the loss.
     keep = (m_c.any(dim=0)) & (m_d.any(dim=0))
     if int(keep.sum()) == 0:
         raise ValueError("no loci are observed in both CTRL and DIS tracks")
     locus_frame = locus_frame.loc[keep.numpy()].reset_index(drop=True)
-    theta_ref, conc = theta_ref[:, keep], conc[:, keep]
-
-    if dmr_path is not None:
-        is_dmr, dmr_ids = load_dmr_annotation(dmr_path, pd.Index(locus_frame["locus_id"]))
-    else:
-        is_dmr, dmr_ids = torch.ones(len(locus_frame), dtype=torch.bool), [""] * len(locus_frame)
+    theta_ref, conc, ref_mask = theta_ref[:, keep], conc[:, keep], ref_mask[:, keep]
+    is_dmr = is_dmr[keep]
+    dmr_ids = [d for d, k in zip(dmr_ids, keep.tolist()) if k]
     locus_frame["is_dmr"] = is_dmr.numpy()
     locus_frame["dmr_id"] = dmr_ids
 
@@ -287,13 +372,22 @@ def build_aligned_data(
         dis_sample_ids=dis_ids,
         cell_types_all=components,
         group_priors=info,
+        ref_mask=ref_mask,
+        dropped_dmr_ids=dropped_dmr_ids,
     )
 
 
 def init_other_from_control_residual(
     data: AlignedData, eps: float = 1.0e-4
 ) -> torch.Tensor | None:
-    """spec §6: OTHER init = control residual / OTHER fraction, clipped."""
+    """spec §6: OTHER init = control residual / OTHER fraction, clipped.
+
+    Only entries that are observed (valid, non-zero coverage, and on a locus some
+    reference actually sees) enter the control mean. At loci where the control
+    says nothing there is no residual to estimate, so OTHER falls back to the
+    reference mean weighted by the control prior — the same default the model
+    would use if no init were supplied.
+    """
     batch = data.batch
     if batch.pi0_ctrl is None or not data.cell_types_all or data.cell_types_all[-1] != OTHER:
         return None
@@ -301,13 +395,29 @@ def init_other_from_control_residual(
     other_frac = float(pi_ctrl[:, -1].mean())
     if other_frac <= 0:
         return None
-    m = batch.mask_ctrl
-    if m.sum() == 0:
+
+    pi_ref_mean = pi_ctrl[:, :-1].mean(dim=0)
+    ref_mean = torch.einsum("c,cr->r", pi_ref_mean, data.theta_ref)
+    weights = pi_ref_mean / pi_ref_mean.sum().clamp_min(eps)
+    default_other = torch.einsum("c,cr->r", weights, data.theta_ref)
+
+    observed = batch.mask_ctrl.bool()
+    if batch.weight_ctrl is not None:
+        observed = observed & (batch.weight_ctrl > 0)
+    if data.ref_mask is not None:
+        observed = observed & data.ref_mask.any(dim=0)[None, :]
+    covered = observed.sum(dim=0)
+    if int(covered.sum()) == 0:
         return None
-    y_bar = (batch.y_ctrl * m).sum(dim=0) / m.sum(dim=0).clamp_min(1)
-    ref_mean = torch.einsum("c,cr->r", pi_ctrl[:, :-1].mean(dim=0), data.theta_ref)
+
+    y_bar = torch.where(
+        covered > 0,
+        (batch.y_ctrl * observed).sum(dim=0) / covered.clamp_min(1),
+        ref_mean,
+    )
     residual = y_bar - ref_mean
-    return (residual / other_frac).clamp(eps, 1.0 - eps)
+    other = (residual / other_frac).clamp(eps, 1.0 - eps)
+    return torch.where(covered > 0, other, default_other)
 
 
 def make_model(data: AlignedData, cfg=None, composition_mode: str = "dirichlet_prior"):
@@ -327,6 +437,7 @@ def make_model(data: AlignedData, cfg=None, composition_mode: str = "dirichlet_p
         theta_ref_conc=data.theta_ref_conc,
         cfg=cfg,
         cell_type_names=data.ref_cell_types,
+        ref_mask=data.ref_mask,
     )
 
 
@@ -341,18 +452,38 @@ def make_synthetic_data(
     delta_cell_type: str = "Astro",
     n_dmr: int = 40,
     delta_logit: float = 1.2,
+    delta_spec: dict[str, float] | None = None,
     missing_reference: str | None = None,
     seed: int = 0,
     noise: float = 0.01,
     use_other: bool = True,
+    ref_masked_loci: dict[str, list[int]] | None = None,
+    all_ref_masked_loci: list[int] | None = None,
 ) -> tuple[AlignedData, dict]:
     """Generate a synthetic benchmark with a KNOWN responsible cell type.
 
+    ``delta_spec`` injects into several cell types at once (e.g.
+    ``{"Astro": 1.5, "Oligo": 0.5}``); when it is given it takes precedence over
+    ``delta_cell_type`` / ``delta_logit``. All injected deltas are placed on the
+    same DMR loci, positive or negative as specified.
+
+    ``ref_masked_loci`` marks individual references as unobserved at given loci
+    (``{"Astro": [3, 7]}``) and ``all_ref_masked_loci`` marks loci every reference
+    is missing — the latter are dropped from the loss, and a DMR made up entirely
+    of them is dropped as a unit. Both default to None (fully observed).
+
     Returns ``(data, truth)`` where ``truth`` holds the injected delta, the true
-    compositions and the responsible cell type.
+    compositions and the responsible cell type(s).
     """
     rng = np.random.default_rng(seed)
     theta = rng.beta(2.0, 2.0, size=(len(cell_types), n_loci)).astype(np.float32)
+
+    if delta_spec is None:
+        delta_spec = {delta_cell_type: delta_logit}
+    delta_spec = {str(k): float(v) for k, v in delta_spec.items()}
+    unknown = [c for c in delta_spec if c not in cell_types]
+    if unknown:
+        raise ValueError(f"delta_spec cell type(s) {unknown} not in {list(cell_types)}")
 
     def prior_for(n: int) -> np.ndarray:
         p = rng.dirichlet(np.ones(len(cell_types)) * 3.0, size=n)
@@ -376,8 +507,8 @@ def make_synthetic_data(
     loc[: min(n_dmr, n_loci)] = True
     rng.shuffle(loc)
     delta_true = np.zeros_like(theta_all)
-    target = list(cell_types).index(delta_cell_type)
-    delta_true[target, loc] = delta_logit
+    for cell, value in delta_spec.items():
+        delta_true[list(cell_types).index(cell), loc] = value
 
     def mix(pi, theta_use):
         return np.einsum("sc,cr->sr", pi, theta_use)
@@ -417,6 +548,27 @@ def make_synthetic_data(
         else np.zeros((0, n_loci), dtype=np.float32)
     )
 
+    # ---- reference observation mask (spec §3.1) ---------------------------
+    n_ref = len(ref_types)
+    ref_mask_np = np.ones((n_ref, n_loci), dtype=bool)
+    for cell, loci in (ref_masked_loci or {}).items():
+        if cell not in ref_types:
+            raise ValueError(f"ref_masked_loci cell type {cell!r} not in {ref_types}")
+        ref_mask_np[ref_types.index(cell), np.asarray(loci, dtype=int)] = False
+    if all_ref_masked_loci is not None:
+        ref_mask_np[:, np.asarray(all_ref_masked_loci, dtype=int)] = False
+    if not ref_mask_np.all():
+        # Mirror the loader: masked entries keep a finite placeholder (the locus
+        # mean of the observed references) and carry no information. A locus no
+        # reference observes falls back to the global mean rather than to 0.0, so
+        # a missing value is never mistaken for a true methylation of zero.
+        observed_w = ref_mask_np.astype(np.float32)
+        covered = observed_w.sum(axis=0)
+        locus_mean = (theta_ref * observed_w).sum(axis=0) / np.maximum(covered, 1.0)
+        global_mean = float((theta_ref * observed_w).sum() / max(float(observed_w.sum()), 1.0))
+        fill = np.where(covered > 0, locus_mean, global_mean)
+        theta_ref = np.where(ref_mask_np, theta_ref, fill[None, :]).astype(np.float32)
+
     locus_df = pd.DataFrame({
         "locus_id": [f"L{i}" for i in range(n_loci)],
         "chrom": "chr1",
@@ -425,6 +577,11 @@ def make_synthetic_data(
         "is_dmr": loc,
         "dmr_id": [f"D{i}" if loc[i] else "" for i in range(n_loci)],
     })
+    ref_mask_t = torch.tensor(ref_mask_np)
+    is_dmr_t, dropped_dmr_ids = drop_fully_masked_dmrs(
+        torch.tensor(loc), locus_df["dmr_id"].tolist(), ref_mask_t
+    )
+    locus_df["is_dmr"] = is_dmr_t.numpy()
 
     n_comp = len(ref_types) + (1 if use_other else 0)
     batch = MixtureBatch(
@@ -444,14 +601,22 @@ def make_synthetic_data(
         ctrl_sample_ids=[f"ctrl{i}" for i in range(n_ctrl)],
         dis_sample_ids=[f"dis{i}" for i in range(n_dis)],
         cell_types_all=list(ref_types) + ([OTHER] if use_other else []),
+        ref_mask=ref_mask_t,
+        dropped_dmr_ids=dropped_dmr_ids,
     )
     truth = {
         "delta_true": torch.tensor(delta_true.astype(np.float32)),
-        "delta_cell_type": delta_cell_type,
-        "dmr_loci": torch.tensor(loc),
+        # delta_cell_type keeps the single-injection meaning for older callers;
+        # with multiple injections it reports the largest-magnitude one.
+        "delta_cell_type": max(delta_spec, key=lambda c: abs(delta_spec[c])),
+        "delta_spec": dict(delta_spec),
+        "dmr_loci": is_dmr_t,
         "pi_ctrl_true": torch.tensor(pi_ctrl.astype(np.float32)),
         "pi_dis_true": torch.tensor(pi_dis.astype(np.float32)),
         "theta_all_true": torch.tensor(theta_all.astype(np.float32)),
+        "ref_mask": ref_mask_t,
+        "dropped_dmr_ids": dropped_dmr_ids,
+        "all_ref_masked_loci": sorted(set(all_ref_masked_loci or [])),
     }
     return data, truth
 
@@ -478,9 +643,14 @@ def dump_synthetic_files(
     # --- reference tracks (percent, valid flag, a few forced-invalid rows) ----
     rows = []
     ref_frac = data.theta_ref.numpy()
+    ref_observed = (
+        data.ref_mask.numpy() if data.ref_mask is not None
+        else np.ones_like(ref_frac, dtype=bool)
+    )
     for j, cell in enumerate(data.ref_cell_types):
         for r, lid in enumerate(locus["locus_id"]):
-            valid = 0 if r % 97 == 3 else 1   # drop ~1% to exercise the valid=0 path
+            # honour the mask, and keep dropping ~1% to exercise the valid=0 path
+            valid = int(bool(ref_observed[j, r])) and (0 if r % 97 == 3 else 1)
             rows.append({
                 "locus_id": lid, "chrom": locus["chrom"][r], "start": int(locus["start"][r]),
                 "end": int(locus["end"][r]), "cell_type": cell,
@@ -544,18 +714,85 @@ def _write_tsv(frame: pd.DataFrame, path: str | Path, gzip_out: bool = True) -> 
     frame.to_csv(path, sep="\t", index=False, compression="gzip" if gzip_out else None)
 
 
+# The per-locus tables cost one row per locus per component (or per sample), so a
+# genome-wide run with tens of millions of loci cannot materialise them. Above
+# this many loci ``auto`` writes only the aggregated tables and says why.
+AUTO_PER_LOCUS_MAX_LOCI = 200_000
+
+
+def should_dump_per_locus(policy: str, n_loci: int) -> bool:
+    """Decide whether the per-locus output tables are affordable (see above)."""
+    if policy == "always":
+        return True
+    if policy == "never":
+        return False
+    if policy == "auto":
+        return n_loci <= AUTO_PER_LOCUS_MAX_LOCI
+    raise ValueError(f"unknown dump_per_locus policy: {policy!r} (auto|always|never)")
+
+
+def _skipped(name: str, n_loci: int) -> None:
+    print(
+        f"  [skip] {name}: {n_loci} loci is above the per-locus dump limit "
+        f"({AUTO_PER_LOCUS_MAX_LOCI}); rerun with --dump-per-locus always to force it"
+    )
+
+
 def write_outputs(
     out_dir: str | Path,
     model: ReferenceAnchoredMethylationMixture,
     data: AlignedData,
     qc: dict,
+    dump_per_locus: str = "auto",
 ) -> dict[str, str]:
     """Write the spec §15 output files and return their paths."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     locus_ids = data.locus_df["locus_id"].tolist()
     comps = model.cell_type_names
+    dmr_ids = data.locus_df["dmr_id"].tolist()
+    region = pd.Series(dmr_ids, dtype="object").replace("", "(non-DMR)")
+    per_locus = should_dump_per_locus(dump_per_locus, len(locus_ids))
     files: dict[str, str] = {}
+
+    # reference_missingness.tsv.gz -- per reference x region mask summary (§3.1)
+    ref_mask_np = (
+        data.ref_mask.numpy()
+        if data.ref_mask is not None
+        else np.ones((model.n_ref, model.n_loci), dtype=bool)
+    )
+    recs = []
+    for j, cell in enumerate(comps[: model.n_ref]):
+        grouped = pd.DataFrame({
+            "region_id": region.to_numpy(),
+            "observed": ref_mask_np[j],
+        })
+        agg = grouped.groupby("region_id", sort=False)["observed"].agg(["size", "sum"])
+        for region_id, row in agg.iterrows():
+            n = int(row["size"])
+            n_observed = int(row["sum"])
+            recs.append({
+                "cell_type": cell, "region_id": region_id,
+                "n_loci": n, "n_observed": n_observed, "n_masked": n - n_observed,
+                "frac_masked": (n - n_observed) / n if n else 0.0,
+            })
+    path = out_dir / "reference_missingness.tsv.gz"
+    _write_tsv(pd.DataFrame(recs), path)
+    files["reference_missingness"] = str(path)
+
+    # dropped_dmrs.tsv -- regions no reference could inform
+    region_sizes = region.value_counts()
+    recs = [
+        {
+            "dmr_id": dmr_id,
+            "n_loci": int(region_sizes.get(dmr_id, 0)),
+            "reason": "all_loci_missing_in_all_references",
+        }
+        for dmr_id in data.dropped_dmr_ids
+    ]
+    path = out_dir / "dropped_dmrs.tsv"
+    _write_tsv(pd.DataFrame(recs, columns=["dmr_id", "n_loci", "reason"]), path, gzip_out=False)
+    files["dropped_dmrs"] = str(path)
 
     # sample_composition_posterior.tsv
     rows = []
@@ -576,65 +813,73 @@ def write_outputs(
     files["sample_composition_posterior"] = str(path)
 
     # celltype_baseline_methylation.tsv.gz
-    theta0 = model.theta0().detach().cpu().numpy()
-    recs = []
-    for j, cell in enumerate(comps):
-        is_ref = 1 if cell in data.ref_cell_types else 0
-        sd = float(np.nanstd(theta0[j])) if is_ref == 0 else 0.0
-        recs += [{"locus_id": lid, "cell_type": cell, "theta0_mean": float(theta0[j, r]),
-                  "theta0_sd": sd, "is_reference": is_ref} for r, lid in enumerate(locus_ids)]
-    path = out_dir / "celltype_baseline_methylation.tsv.gz"
-    _write_tsv(pd.DataFrame(recs), path)
-    files["celltype_baseline_methylation"] = str(path)
+    if per_locus:
+        theta0 = model.theta0().detach().cpu().numpy()
+        recs = []
+        for j, cell in enumerate(comps):
+            is_ref = 1 if cell in data.ref_cell_types else 0
+            sd = float(np.nanstd(theta0[j])) if is_ref == 0 else 0.0
+            recs += [{"locus_id": lid, "cell_type": cell, "theta0_mean": float(theta0[j, r]),
+                      "theta0_sd": sd, "is_reference": is_ref} for r, lid in enumerate(locus_ids)]
+        path = out_dir / "celltype_baseline_methylation.tsv.gz"
+        _write_tsv(pd.DataFrame(recs), path)
+        files["celltype_baseline_methylation"] = str(path)
+    else:
+        _skipped("celltype_baseline_methylation.tsv.gz", len(locus_ids))
 
     # celltype_disease_delta.tsv.gz
     att = model.attribution()
     delta = att["delta_effective"].cpu().numpy()
     theta0_np = att["theta0"].cpu().numpy()
     theta_dis_np = att["theta_dis"].cpu().numpy()
-    dmr_ids = data.locus_df["dmr_id"].tolist()
-    recs = []
-    for j, cell in enumerate(comps):
-        for r, lid in enumerate(locus_ids):
-            recs.append({
-                "locus_id": lid, "dmr_id": dmr_ids[r], "cell_type": cell,
-                "delta_logit": float(delta[j, r]),
-                "theta_ctrl": float(theta0_np[j, r]),
-                "theta_disease": float(theta_dis_np[j, r]),
-                "delta_probability": float(theta_dis_np[j, r] - theta0_np[j, r]),
-            })
-    path = out_dir / "celltype_disease_delta.tsv.gz"
-    _write_tsv(pd.DataFrame(recs), path)
-    files["celltype_disease_delta"] = str(path)
+    if per_locus:
+        recs = []
+        for j, cell in enumerate(comps):
+            for r, lid in enumerate(locus_ids):
+                recs.append({
+                    "locus_id": lid, "dmr_id": dmr_ids[r], "cell_type": cell,
+                    "delta_logit": float(delta[j, r]),
+                    "theta_ctrl": float(theta0_np[j, r]),
+                    "theta_disease": float(theta_dis_np[j, r]),
+                    "delta_probability": float(theta_dis_np[j, r] - theta0_np[j, r]),
+                })
+        path = out_dir / "celltype_disease_delta.tsv.gz"
+        _write_tsv(pd.DataFrame(recs), path)
+        files["celltype_disease_delta"] = str(path)
+    else:
+        _skipped("celltype_disease_delta.tsv.gz", len(locus_ids))
 
     # bulk_reconstruction.tsv.gz
-    recs = []
-    with torch.no_grad():
-        for condition, sample_ids, y, m, pred in (
-            ("CTRL", data.ctrl_sample_ids, data.batch.y_ctrl, data.batch.mask_ctrl, model.predict_control()),
-            ("DIS", data.dis_sample_ids, data.batch.y_dis, data.batch.mask_dis, model.predict_disease()),
-        ):
-            for i, sample in enumerate(sample_ids):
-                for r, lid in enumerate(locus_ids):
-                    recs.append({
-                        "sample_id": sample, "condition": condition, "locus_id": lid,
-                        "observed": float(y[i, r]), "predicted": float(pred[i, r]),
-                        "residual": float(pred[i, r] - y[i, r]), "valid": bool(m[i, r]),
-                    })
-    path = out_dir / "bulk_reconstruction.tsv.gz"
-    _write_tsv(pd.DataFrame(recs), path)
-    files["bulk_reconstruction"] = str(path)
+    if per_locus:
+        n_refs_observed = ref_mask_np.sum(axis=0)
+        recs = []
+        with torch.no_grad():
+            for condition, sample_ids, y, m, pred in (
+                ("CTRL", data.ctrl_sample_ids, data.batch.y_ctrl, data.batch.mask_ctrl, model.predict_control()),
+                ("DIS", data.dis_sample_ids, data.batch.y_dis, data.batch.mask_dis, model.predict_disease()),
+            ):
+                for i, sample in enumerate(sample_ids):
+                    for r, lid in enumerate(locus_ids):
+                        recs.append({
+                            "sample_id": sample, "condition": condition, "locus_id": lid,
+                            "observed": float(y[i, r]), "predicted": float(pred[i, r]),
+                            "residual": float(pred[i, r] - y[i, r]), "valid": bool(m[i, r]),
+                            "n_refs_observed": int(n_refs_observed[r]),
+                        })
+        path = out_dir / "bulk_reconstruction.tsv.gz"
+        _write_tsv(pd.DataFrame(recs), path)
+        files["bulk_reconstruction"] = str(path)
+    else:
+        _skipped("bulk_reconstruction.tsv.gz", len(locus_ids))
 
-    # dmr_attribution.tsv.gz
+    # dmr_attribution.tsv.gz -- one row per DMR per component, so it stays affordable
     intrinsic = att["celltype_intrinsic"].cpu().numpy()
     comp_eff = att["composition_effect"].cpu().numpy()
     recs = []
-    seen = {}
+    seen: dict[str, list[int]] = {}
     for r, dmr_id in enumerate(dmr_ids):
         if dmr_id:
             seen.setdefault(dmr_id, []).append(r)
-        if not dmr_id:
-            continue
     for dmr_id, loci in seen.items():
         for j, cell in enumerate(comps):
             intrinsic_effect = float(intrinsic[j, loci].sum())

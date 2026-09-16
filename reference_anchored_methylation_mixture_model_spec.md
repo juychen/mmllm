@@ -238,6 +238,52 @@ direction
 
 For version 1, disease perturbation should be allowed primarily on DMR loci.
 
+## 3.5 Missing signal and locus/region masking
+
+`valid = 0` marks a missing observation and is never turned into a value of `0`
+(criterion 7). Where a track has `coverage`, `coverage <= 0` counts as no signal
+as well, as does `coverage < min_coverage` when a threshold is configured. The
+same rule applies to reference and bulk tracks.
+
+Per-locus reference mask:
+
+- Build a mask `ref_mask[cell_type, locus]`, True where that reference has a
+  signal at that locus.
+- **Partial missingness needs no special treatment.** As long as at least one
+  reference observes the locus, the locus is kept and fits normally. Entries the
+  mask flags False keep an imputed placeholder (the locus mean of the observed
+  references, falling back to the global mean) purely so the reference matrix
+  stays finite; they carry no information.
+- A delta on a masked `(cell_type, locus)` entry is forced to `0`: no data
+  supports it, so it must not enter the L1 / group / smooth penalties nor the
+  attribution table.
+
+Locus-level exclusion:
+
+- A locus no reference observes carries no information about the mixture. It
+  keeps its row (so the output tables stay aligned) but is excluded from the
+  reconstruction loss, together with the delta penalties.
+- The effective reconstruction mask is therefore
+  `valid AND weight > 0 AND (some reference observed at the locus)`. Entries
+  excluded this way contribute to neither the numerator nor the denominator of
+  `L_recon`, and the QC metrics use the same rule so they describe the population
+  the loss actually optimises.
+
+Region-level exclusion:
+
+- A DMR whose **every** locus is missing in **every** reference is dropped as a
+  unit: `is_dmr = 0` for its loci, so its delta stays out of the penalties and the
+  attribution, and the dropped `dmr_id`s are reported.
+
+Bulk observations keep their own `mask[sample, locus]`; the two masks compose.
+
+Per-locus output tables (`celltype_baseline_methylation.tsv.gz`,
+`celltype_disease_delta.tsv.gz`, `bulk_reconstruction.tsv.gz`) cost one row per
+locus per component or sample. At genome-wide locus counts they are not
+affordable, so they are written only when the locus count is below the configured
+limit; the aggregated tables (`reference_missingness.tsv.gz`, `dropped_dmrs.tsv`,
+`dmr_attribution.tsv.gz`) are always written.
+
 ---
 
 # 4. Reference methylation distribution
@@ -1157,6 +1203,32 @@ Remove one known cell type, aggregate its fraction into OTHER, and verify the mo
 
 Inject delta into one cell type and a subset of loci; the inferred top cell type should match the simulated truth.
 
+## Test 7: masked bulk entry is inert
+
+Mask one bulk observation. A non-finite placeholder and a wild finite value at
+that entry must both leave `L` exactly as the mask left it.
+
+## Test 8: masked reference entry carries no delta
+
+Mask one `(cell_type, locus)` entry. `delta_eff` must be `0` there, and changing
+`delta` at that entry must not move `L`. The OTHER row is never masked.
+
+## Test 9: locus no reference observes is excluded
+
+Mask every reference at one locus. The bulk value at that locus must not affect
+`L`, and the imputed placeholder must not be `0.0` (criterion 7).
+
+## Test 10: unreachable DMR is dropped
+
+A DMR whose every locus is missing in every reference is dropped (`is_dmr = 0`,
+delta zeroed inside it, `dmr_id` reported); a DMR with at least one reachable
+locus is kept.
+
+## Test 11: reconstruction error switch
+
+With full coverage weight, `recon_loss = mse` equals the analytic weighted MSE
+and masking an entry reduces it to that entry alone; `huber` stays the default.
+
 ---
 
 # 22. Example config
@@ -1268,6 +1340,10 @@ The first implementation is successful only if:
 10. Control reconstruction passes tolerance before disease attribution is interpreted.
 11. Sensitivity to composition prior and OTHER is reported.
 12. Results are reproducible under a fixed seed.
+13. A masked `(cell_type, locus)` entry cannot influence the objective: changing its
+    value, or the delta fitted on it, leaves `L` unchanged.
+14. A locus that no reference observes is excluded from `L_recon`, and a DMR whose
+    every locus is in that state is dropped as a unit and reported.
 
 ---
 

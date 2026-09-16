@@ -42,6 +42,16 @@ def _sigmoid(x: torch.Tensor) -> torch.Tensor:
     return torch.sigmoid(x)
 
 
+def _masked_mean(values: torch.Tensor, keep: torch.Tensor) -> torch.Tensor:
+    """Mean of ``values`` over the entries where ``keep`` is True.
+
+    Returns 0 when nothing is kept, so an all-masked batch yields a finite penalty
+    instead of NaN. With an all-True ``keep`` this is exactly ``values.mean()``.
+    """
+    w = keep.to(values.dtype)
+    return (values * w).sum() / w.sum().clamp_min(1.0)
+
+
 @dataclass
 class MixtureConfig:
     """Hyperparameters mirroring the spec's example config (§22)."""
@@ -69,6 +79,7 @@ class MixtureConfig:
     lambda_smooth: float = 0.0
     lambda_delta_other_l1: float = 0.1        # extra sparsity on delta[OTHER] (spec §18)
     huber_delta: float = 0.05
+    recon_loss: str = "huber"                  # "huber" | "mse"
     coverage_cap: float = 30.0
     # stage-2/3 quality targets (spec §22)
     target_mae: float = 0.03
@@ -122,6 +133,13 @@ class ReferenceAnchoredMethylationMixture(nn.Module):
     is_dmr : [R] bool, optional
         DMR annotation; with ``delta_scope='dmr_only'`` the disease delta is
         masked to these loci.
+    ref_mask : [C_ref, R] bool, optional
+        True where that reference cell type actually has a signal at that locus
+        (spec §3.1: absence is encoded by mask=0, never by a value of 0). Entries
+        that are False carry an imputed ``theta_ref`` value but no information:
+        they are excluded from the delta penalties and from the attribution, and a
+        locus whose references are all False is dropped from the reconstruction
+        loss entirely. Defaults to all-True, i.e. fully observed references.
     """
 
     def __init__(
@@ -134,6 +152,7 @@ class ReferenceAnchoredMethylationMixture(nn.Module):
         theta_ref_conc: torch.Tensor | float | None = None,
         cfg: MixtureConfig | None = None,
         cell_type_names: list[str] | None = None,
+        ref_mask: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         self.cfg = cfg or MixtureConfig()
@@ -155,6 +174,15 @@ class ReferenceAnchoredMethylationMixture(nn.Module):
         if is_dmr is None:
             is_dmr = torch.ones(n_loci, dtype=torch.bool)
         self.register_buffer("is_dmr", is_dmr.bool())
+
+        # ---- per-(cell, locus) reference observation mask -------------------
+        if ref_mask is None:
+            ref_mask = torch.ones(n_ref, n_loci, dtype=torch.bool)
+        elif tuple(ref_mask.shape) != (n_ref, n_loci):
+            raise ValueError(
+                f"ref_mask must be [{n_ref}, {n_loci}] to match theta_ref, got {tuple(ref_mask.shape)}"
+            )
+        self.register_buffer("ref_mask", ref_mask.bool())
 
         # ---- composition -------------------------------------------------
         if pi0_ctrl.shape[1] != self.n_components:
@@ -212,13 +240,43 @@ class ReferenceAnchoredMethylationMixture(nn.Module):
             return self.theta_ref
         return torch.cat([self.theta_ref, torch.sigmoid(self.other_logits)[None, :]], dim=0)
 
+    def component_mask(self) -> torch.Tensor:
+        """[C, R] bool, True where the component's baseline is actually observed.
+
+        The reference rows carry their own per-(cell, locus) observation mask.
+        OTHER is not a measured track (it stands in for the unreferenced cell
+        types), so its row is always considered available.
+        """
+        if not self.cfg.use_other:
+            return self.ref_mask
+        return torch.cat([self.ref_mask, self.ref_mask.new_ones(1, self.n_loci)], dim=0)
+
+    def locus_valid(self) -> torch.Tensor:
+        """[R] bool, True where at least one reference has a signal.
+
+        A locus where every reference is missing carries no information about the
+        mixture, so it is dropped from the reconstruction loss (spec §3.1).
+        """
+        return self.ref_mask.any(dim=0)
+
     def delta_effective(self) -> torch.Tensor:
-        """[C, R] disease logit shift, restricted to DMR loci when configured."""
+        """[C, R] disease logit shift, restricted to DMR loci when configured.
+
+        Also zeroed wherever the component's baseline is unobserved: a delta fitted
+        on a masked (cell, locus) entry has no data behind it, so letting it into
+        the L1/group/smooth penalties or the attribution table would report a
+        perturbation the data never supported.
+        """
         if self.cfg.delta_scope == "dmr_only":
-            return self.delta * self.is_dmr.to(self.delta.dtype)[None, :]
-        if self.cfg.delta_scope == "all_loci":
-            return self.delta
-        raise ValueError(f"unknown delta_scope: {self.cfg.delta_scope}")
+            delta = self.delta * self.is_dmr.to(self.delta.dtype)[None, :]
+        elif self.cfg.delta_scope == "all_loci":
+            delta = self.delta
+        else:
+            raise ValueError(f"unknown delta_scope: {self.cfg.delta_scope}")
+        cmask = self.component_mask()
+        if not bool(cmask.all()):
+            delta = delta * cmask.to(delta.dtype)
+        return delta
 
     def theta_disease(self) -> torch.Tensor:
         """[C, R] perturbed methylomes: sigmoid(logit(theta0) + delta) (spec §8)."""
@@ -252,13 +310,37 @@ class ReferenceAnchoredMethylationMixture(nn.Module):
         observed: torch.Tensor,
         mask: torch.Tensor,
         weight: torch.Tensor | None,
+        locus_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Masked, coverage-weighted Huber loss over valid observations."""
+        """Masked, coverage-weighted reconstruction error over valid observations.
+
+        ``mask``/``weight`` gate individual (sample, locus) observations;
+        ``locus_mask`` drops loci that carry no signal at all. An entry that is
+        invalid for any of these reasons contributes to neither the numerator nor
+        the denominator, so it cannot influence the fit (spec §11).
+        """
         cfg = self.cfg
-        err = F.huber_loss(pred, observed, reduction="none", delta=cfg.huber_delta)
         m = mask.float()
+        if locus_mask is not None:
+            m = m * locus_mask.to(m.dtype)[None, :]
         if weight is not None:
             m = m * (weight.clamp(max=cfg.coverage_cap) / cfg.coverage_cap).float()
+
+        # A masked-out entry may still hold NaN (a missing observation) and
+        # NaN * 0 is NaN, which would poison the whole sum. Collapse it to the
+        # prediction where the entry is excluded; a NaN in an entry that *should*
+        # contribute is a real data bug and is left alone to fail loudly.
+        finite = torch.isfinite(observed)
+        if not bool(finite.all()):
+            observed = torch.where(finite | (m > 0), observed, pred.detach())
+
+        if cfg.recon_loss == "huber":
+            err = F.huber_loss(pred, observed, reduction="none", delta=cfg.huber_delta)
+        elif cfg.recon_loss == "mse":
+            err = (pred - observed) ** 2
+        else:
+            raise ValueError(f"unknown recon_loss: {cfg.recon_loss}")
+
         denom = m.sum().clamp_min(1.0)
         return (err * m).sum() / denom
 
@@ -281,20 +363,32 @@ class ReferenceAnchoredMethylationMixture(nn.Module):
                           self.other_logits_init, reduction="mean")
 
     def _delta_sparsity(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """L1 on delta (extra weight on the OTHER row) and optional group L2."""
+        """L1 on delta (extra weight on the OTHER row) and optional group L2.
+
+        Averaged over the entries that actually carry information (observed
+        baselines on DMR loci); a masked-out entry would otherwise dilute the
+        penalty. With fully observed references this is the plain mean.
+        """
         cfg = self.cfg
         delta_eff = self.delta_effective()
+        cmask = self.component_mask() & self.is_dmr[None, :]
         if self.cfg.use_other:
-            other_row = delta_eff[-1].abs().mean() * cfg.lambda_delta_other_l1 * self.n_loci
-            ref_l1 = delta_eff[:-1].abs().mean() * max(self.n_ref, 1)
+            other_row = (
+                _masked_mean(delta_eff[-1].abs(), cmask[-1])
+                * cfg.lambda_delta_other_l1 * self.n_loci
+            )
+            ref_l1 = _masked_mean(delta_eff[:-1].abs(), cmask[:-1]) * max(self.n_ref, 1)
             l1 = (ref_l1 + other_row) / max(self.n_components, 1)
         else:
-            l1 = delta_eff.abs().mean()
-        group = torch.linalg.vector_norm(delta_eff, dim=0).mean() if delta_eff.numel() else delta_eff.new_zeros(())
+            l1 = _masked_mean(delta_eff.abs(), cmask)
+        group = (
+            _masked_mean(torch.linalg.vector_norm(delta_eff, dim=0), self.locus_valid())
+            if delta_eff.numel() else delta_eff.new_zeros(())
+        )
         return l1, group
 
     def _delta_common_mode(self) -> torch.Tensor:
-        """|sum_c delta_eff[c, r]| averaged over loci (identifiability penalty).
+        """|sum_c delta_eff[c, r]| averaged over informative loci (identifiability penalty).
 
         Absent this term, "every cell type shifts a little" and "one cell type
         shifts a lot" fit the bulk equally well; the penalty prefers the sparse
@@ -302,13 +396,18 @@ class ReferenceAnchoredMethylationMixture(nn.Module):
         """
         if self.cfg.lambda_delta_common <= 0:
             return self.theta_ref.new_zeros(())
-        return self.delta_effective().sum(dim=0).abs().mean()
+        return _masked_mean(self.delta_effective().sum(dim=0).abs(), self.locus_valid())
 
     def _smooth(self) -> torch.Tensor:
+        """Total variation of delta along the locus axis, over observed neighbours."""
         if self.cfg.lambda_smooth <= 0 or self.n_loci < 2:
             return self.theta_ref.new_zeros(())
+        locus_valid = self.locus_valid()
+        pair = locus_valid[1:] & locus_valid[:-1]
+        if not bool(pair.any()):
+            return self.theta_ref.new_zeros(())
         d = self.delta_effective()
-        return (d[:, 1:] - d[:, :-1]).abs().mean()
+        return _masked_mean((d[:, 1:] - d[:, :-1]).abs(), pair[None, :])
 
     def loss(self, batch: MixtureBatch, stage: str = "joint") -> tuple[torch.Tensor, dict]:
         """Total loss for `batch`. `stage` selects which terms are active.
@@ -320,9 +419,12 @@ class ReferenceAnchoredMethylationMixture(nn.Module):
         cfg = self.cfg
         terms: dict[str, torch.Tensor] = {}
         total = self.theta_ref.new_zeros(())
+        locus_mask = self.locus_valid()
 
         if batch.y_ctrl is not None and stage in ("ctrl", "dis", "joint"):
-            lc = self._recon(self.predict_control(), batch.y_ctrl, batch.mask_ctrl, batch.weight_ctrl)
+            lc = self._recon(
+                self.predict_control(), batch.y_ctrl, batch.mask_ctrl, batch.weight_ctrl, locus_mask
+            )
             terms["recon_ctrl"] = lc
             total = total + cfg.lambda_ctrl_recon * lc
             lpi_c = self._composition_nll("CTRL")
@@ -333,9 +435,12 @@ class ReferenceAnchoredMethylationMixture(nn.Module):
             total = total + cfg.lambda_other_anchor * anchor
 
         if batch.y_dis is not None and stage in ("dis", "joint"):
-            ld = self._recon(self.predict_disease(), batch.y_dis, batch.mask_dis, batch.weight_dis)
+            ld = self._recon(
+                self.predict_disease(), batch.y_dis, batch.mask_dis, batch.weight_dis, locus_mask
+            )
             terms["recon_dis"] = ld
             total = total + cfg.lambda_dis_recon * ld
+
             lpi_d = self._composition_nll("DIS")
             terms["composition_dis"] = lpi_d
             total = total + cfg.lambda_composition * lpi_d
@@ -397,9 +502,19 @@ def _masked_metrics(
     mask: torch.Tensor,
     weight: torch.Tensor | None,
     tolerance: float,
+    locus_mask: torch.Tensor | None = None,
 ) -> dict:
-    """RMSE / MAE / Pearson / within-tolerance fraction over valid entries."""
+    """RMSE / MAE / Pearson / within-tolerance fraction over valid entries.
+
+    Uses the same validity rule as the reconstruction loss -- flagged valid, with
+    non-zero coverage, on a locus that carries reference signal -- so the reported
+    QC describes the population the loss actually optimises.
+    """
     m = mask.bool()
+    if weight is not None:
+        m = m & (weight > 0)
+    if locus_mask is not None:
+        m = m & locus_mask.bool()[None, :]
     if m.sum() == 0:
         return {"n": 0, "rmse": float("nan"), "mae": float("nan"), "pearson": float("nan"),
                 "within_tolerance": float("nan")}
@@ -509,21 +624,29 @@ def stage_metrics(
 ) -> dict:
     """Reconstruction QC for the current parameters (spec §15 model_qc)."""
     tol = model.cfg.target_mae if tolerance is None else tolerance
+    locus_valid = model.locus_valid()
     out: dict[str, dict] = {}
     with torch.no_grad():
         if batch.y_ctrl is not None:
             out["control"] = _masked_metrics(
-                model.predict_control(), batch.y_ctrl, batch.mask_ctrl, batch.weight_ctrl, tol
+                model.predict_control(), batch.y_ctrl, batch.mask_ctrl, batch.weight_ctrl, tol,
+                locus_valid,
             )
         if batch.y_dis is not None:
             out["disease"] = _masked_metrics(
-                model.predict_disease(), batch.y_dis, batch.mask_dis, batch.weight_dis, tol
+                model.predict_disease(), batch.y_dis, batch.mask_dis, batch.weight_dis, tol,
+                locus_valid,
             )
         delta = model.delta_effective()
+        cmask = model.component_mask() & model.is_dmr[None, :]
         out["delta_sparsity"] = {
-            "fraction_nonzero": float((delta.abs() > 1e-8).float().mean()),
-            "l1_mean": float(delta.abs().mean()),
-            "l2_group_mean": float(torch.linalg.vector_norm(delta, dim=0).mean()),
+            "fraction_nonzero": (
+                float((delta.abs() > 1e-8).float()[cmask].mean()) if bool(cmask.any()) else 0.0
+            ),
+            "l1_mean": float(_masked_mean(delta.abs(), cmask)),
+            "l2_group_mean": float(
+                _masked_mean(torch.linalg.vector_norm(delta, dim=0), locus_valid)
+            ),
         }
         pi_d = model.composition("DIS")
         prior_d = model.pi0_dis
@@ -531,4 +654,47 @@ def stage_metrics(
             "mean_abs_deviation": float((pi_d - prior_d).abs().mean()),
             "other_fraction_mean": float(pi_d[:, -1].mean()) if model.cfg.use_other else 0.0,
         }
+        out["mask"] = mask_summary(model, batch)
     return out
+
+
+def mask_summary(
+    model: ReferenceAnchoredMethylationMixture, batch: MixtureBatch | None = None
+) -> dict:
+    """How much of the reference/bulk signal was actually available.
+
+    ``n_loci_all_refs_masked`` counts loci dropped from the reconstruction because
+    every reference was missing there; ``per_cell_type`` reports the same by track.
+    """
+    ref_mask = model.ref_mask.detach()
+    locus_valid = model.locus_valid().detach()
+    per_cell = {
+        name: {
+            "n_observed": int(ref_mask[i].sum()),
+            "frac_masked": float(1.0 - ref_mask[i].float().mean()),
+        }
+        for i, name in enumerate(model.cell_type_names[: model.n_ref])
+    }
+    out = {
+        "n_loci": int(model.n_loci),
+        "n_loci_all_refs_masked": int((~locus_valid).sum()),
+        "n_loci_usable": int(locus_valid.sum()),
+        "n_dmr_loci_usable": int((locus_valid & model.is_dmr).sum()),
+        "per_cell_type": per_cell,
+    }
+    if batch is not None:
+        for key, mask_key, weight_key in (
+            ("control_observed_fraction", "mask_ctrl", "weight_ctrl"),
+            ("disease_observed_fraction", "mask_dis", "weight_dis"),
+        ):
+            mask = getattr(batch, mask_key, None)
+            if mask is None:
+                continue
+            eff = mask.bool()
+            weight = getattr(batch, weight_key, None)
+            if weight is not None:
+                eff = eff & (weight > 0)
+            eff = eff & locus_valid[None, :].to(eff.device)
+            out[key] = float(eff.float().mean())
+    return out
+
