@@ -18,13 +18,11 @@ seq_drop_p="${2:-0.0}"
 atac_drop_p="${3:-0.8}"
 rna_drop_p="${4:-0.8}"
 
-# Micro-batch and accumulation, env-overridable. The historical setting was
-# batch 4 x accum 64 = effective batch 256; the default here doubles the
-# micro-batch and halves the accumulation, i.e. same effective batch and same
-# optimisation, just better GPU utilisation. Set GRAD_ACCUM=64 to double the
-# effective batch as well.
-batch_size="${BATCH_SIZE:-16}"
-grad_accum="${GRAD_ACCUM:-128}"
+# Micro-batch and accumulation, env-overridable. Historical setting:
+# batch 4 x accum 64 = effective batch 256. Override via env vars if a
+# different effective batch is desired (e.g. BATCH_SIZE=8 GRAD_ACCUM=128).
+batch_size="${BATCH_SIZE:-4}"
+grad_accum="${GRAD_ACCUM:-64}"
 
 if [[ "$fusion_type" != "cross_hyena" && "$fusion_type" != "cross_attention" ]]; then
   echo "Unsupported model_b fusion: $fusion_type"
