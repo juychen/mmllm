@@ -15,8 +15,8 @@ export PYTHONUNBUFFERED=1
 
 fusion_type="${1:-cross_hyena}"
 seq_drop_p="${2:-0.0}"
-atac_drop_p="${3:-0.2}"
-rna_drop_p="${4:-0.2}"
+atac_drop_p="${3:-0.8}"
+rna_drop_p="${4:-0.8}"
 
 # Micro-batch and accumulation, env-overridable. The historical setting was
 # batch 4 x accum 64 = effective batch 256; the default here doubles the
@@ -41,7 +41,7 @@ for prob in "$seq_drop_p" "$atac_drop_p" "$rna_drop_p"; do
 done
 
 regions=("AMY")
-conditions=("MC" "MW")
+conditions=("MC")
 
 run_experiment() {
   local region="$1"
