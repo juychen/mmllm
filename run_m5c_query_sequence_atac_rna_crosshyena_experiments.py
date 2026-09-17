@@ -807,7 +807,11 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
 
     input_group_files = []
     if "input_group" in df_dmr.columns:
-        group_columns = [column for column in ["m5c_bedgraph_path", "hm5c_bedgraph_path", "atac_bw_path"] if column in df_dmr.columns]
+        group_columns = [
+            column
+            for column in ["m5c_bedgraph_path", "hm5c_bedgraph_path", "atac_bw_path", "rna_bw_path"]
+            if column in df_dmr.columns
+        ]
         grouped_inputs = df_dmr.loc[:, ["input_group", *group_columns]].drop_duplicates().sort_values("input_group")
         for input_group, group_rows in grouped_inputs.groupby("input_group", sort=True):
             group_record = {"input_group": int(input_group)}
@@ -817,6 +821,8 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
                 group_record["hm5c_bedgraph"] = str(group_rows["hm5c_bedgraph_path"].iloc[0])
             if "atac_bw_path" in group_rows.columns:
                 group_record["atac_bw"] = str(group_rows["atac_bw_path"].iloc[0])
+            if "rna_bw_path" in group_rows.columns:
+                group_record["rna_bw"] = str(group_rows["rna_bw_path"].iloc[0])
             input_group_files.append(group_record)
     else:
         input_group_files.append(
@@ -825,6 +831,7 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
                 "m5c_bedgraph": args.m5c_bedgraph[0] if getattr(args, "m5c_bedgraph", None) else None,
                 "hm5c_bedgraph": args.hm5c_bedgraph[0] if getattr(args, "hm5c_bedgraph", None) else None,
                 "atac_bw": args.atac_bw[0] if getattr(args, "atac_bw", None) else None,
+                "rna_bw": args.rna_coverage_bw[0] if getattr(args, "rna_coverage_bw", None) else None,
             }
         )
 

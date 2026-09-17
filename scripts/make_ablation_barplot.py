@@ -59,7 +59,7 @@ EXTRA_RESULTS: dict[str, Path] = {
 # (query, context) display labels for each EXTRA_RESULTS entry.
 EXTRA_QUERY_CONTEXT: dict[str, tuple[str, str]] = {
     "phascon": ("m5c", "phastCons"),
-    "sn": ("m5c", "sn0601"),
+    "sn": ("m5c", "snRNA-Seq"),  # BULK snRNA-Seq coverage from sn0615
     "seq_query_rna": ("seq", "ATAC+m5C+RNA"),
 }
 
@@ -100,7 +100,7 @@ QUERY_CONTEXT_LABELS = {
     "all_three":  ("m5C+ATAC",  "—"),
     "seq_only":   ("seq",       "—"),
     "phascon":    ("m5C",       "phastCons"),
-    "sn":         ("m5C",       "sn0601"),
+    "sn":         ("m5C",       "snRNA-Seq"),  # BULK snRNA-Seq coverage from sn0615
 }
 
 
