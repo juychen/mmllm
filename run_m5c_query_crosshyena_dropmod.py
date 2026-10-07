@@ -21,6 +21,7 @@ from data import (
     get_sequence,
     load_data,
     resolve_loss_mask,
+    resolve_train_val_test_split,
     write_train_val_beds,
 )
 from models import (
@@ -426,11 +427,13 @@ def augment_three_modalities(
 class PreparedSequenceAtacData:
     train_loader: torch.utils.data.DataLoader
     val_loader: torch.utils.data.DataLoader
+    test_loader: torch.utils.data.DataLoader | None
     usable_dmrs: int
     seq_len: int
     post_filter_len: int
     train_regions: int
     val_regions: int
+    test_regions: int
     non_overlap_groups: int
     val_region_metadata: pd.DataFrame
 
@@ -461,16 +464,17 @@ def prepare_sequence_atac_crosshyena_data(
     split_regions_df["chr"] = split_regions_df["chr"].astype(str)
     split_regions_df["start_expanded"] = split_regions_df["start_expanded"].astype(int)
     split_regions_df["end_expanded"] = split_regions_df["end_expanded"].astype(int)
-    split_regions_df = assign_non_overlapping_groups(split_regions_df, "chr", "start_expanded", "end_expanded")
 
-    group_ids = split_regions_df["overlap_group"].drop_duplicates().to_numpy()
-    num_train_groups = max(1, int(len(group_ids) * args.train_ratio))
-    train_group_ids = set(group_ids[:num_train_groups].tolist())
-    train_mask = split_regions_df["overlap_group"].isin(train_group_ids).to_numpy()
-    train_indices = np.flatnonzero(train_mask).tolist()
-    val_indices = np.flatnonzero(~train_mask).tolist()
+    # Three-way split: without --test-bed the windows are auto-cut into
+    # train / val / test (default 0.8 / 0.1 / 0.1 genomic-tail split); with
+    # --test-bed the overlapping windows become test and the rest is train / val.
+    train_indices, val_indices, test_indices, split_info = resolve_train_val_test_split(
+        split_regions_df,
+        train_ratio=args.train_ratio,
+        test_bed_path=getattr(args, "test_bed", None),
+    )
 
-    # Write train / val region BED files to output dir for inspection.
+    # Write train / val / test region BED files to output dir for inspection.
     # Output dir is derived from --output-csv's parent directory.
     from pathlib import Path as _Path
     bed_out_dir = _Path(args.output_csv).parent
@@ -480,6 +484,7 @@ def prepare_sequence_atac_crosshyena_data(
         val_indices,
         output_dir=bed_out_dir,
         timestamp=args.timestamp,
+        test_indices=test_indices,
     )
 
     # Build val_region_metadata with real sequences fetched from genome
@@ -538,6 +543,23 @@ def prepare_sequence_atac_crosshyena_data(
         augment_rc=False,
         clip_at_zero=getattr(args, "clip_at_zero", False),
     )
+    test_dataset = None
+    if len(test_indices) > 0:
+        test_dataset = LazyM5cSequenceAtacRnaDataset(
+            indices=test_indices,
+            df_dmr=split_regions_df,
+            genome_fasta=args.genome_fasta,
+            m5c_bedgraph=m5c_paths[0],
+            hm5c_bedgraph=hm5c_paths[0],
+            atac_bw_path=atac_paths[0],
+            target_length=args.target_length,
+            mask_mode=args.mask_mode,
+            atac_scaling=args.atac_scaling,
+            rna_bw_path=rna_path,
+            rna_scaling=getattr(args, "rna_scaling", "minmax"),
+            augment_rc=False,
+            clip_at_zero=getattr(args, "clip_at_zero", False),
+        )
 
     return PreparedSequenceAtacData(
         train_loader=torch.utils.data.DataLoader(
@@ -550,12 +572,24 @@ def prepare_sequence_atac_crosshyena_data(
             num_workers=2, prefetch_factor=2, persistent_workers=False,
             pin_memory=True,
         ),
+        test_loader=(
+            torch.utils.data.DataLoader(
+                test_dataset, batch_size=args.batch_size, shuffle=False,
+                num_workers=2, prefetch_factor=2, persistent_workers=False,
+                pin_memory=True,
+            )
+            if test_dataset is not None
+            else None
+        ),
         usable_dmrs=usable_dmrs,
         seq_len=seq_len,
         post_filter_len=post_filter_len,
         train_regions=len(train_dataset),
         val_regions=len(val_dataset),
-        non_overlap_groups=split_regions_df["overlap_group"].nunique(),
+        test_regions=len(test_dataset) if test_dataset is not None else 0,
+        non_overlap_groups=(
+            split_info["train_groups"] + split_info["val_groups"] + split_info["test_groups"]
+        ),
         val_region_metadata=val_region_metadata,
     )
 
@@ -651,6 +685,7 @@ class ExperimentResult:
     output_files: dict
     train_regions: int
     val_regions: int
+    test_regions: int
     non_overlap_groups: int
     best_epoch: int
     final_lr: float
@@ -660,6 +695,10 @@ class ExperimentResult:
     final_val_loss: float
     final_val_r2: float
     final_val_pearsonr: float
+    test_loss: float
+    test_r2: float
+    test_pearsonr: float
+    split_info: dict
     signal_h5ad: str
     regression_plot: str
     checkpoint_paths: dict
@@ -963,6 +1002,18 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
     final_val_loss, final_val_r2, final_val_pearsonr = evaluate(model, prepared.val_loader, device)
     final_preds, final_targets, final_masks = collect_predictions(model, prepared.val_loader, device)
 
+    # Held-out test set: touched exactly once, after the best checkpoint has
+    # been selected on val.  These are the numbers to report in the paper.
+    test_loss = float("nan")
+    test_r2 = float("nan")
+    test_pearsonr = float("nan")
+    if prepared.test_loader is not None:
+        test_loss, test_r2, test_pearsonr = evaluate(model, prepared.test_loader, device)
+        print(
+            "FINAL TEST METRICS (report once): "
+            f"loss={test_loss:.4f}  R²={test_r2:.4f}  pearson r={test_pearsonr:.4f}"
+        )
+
     signal_h5ad = args.prediction_signal_h5ad.format(sample_size=prepared.usable_dmrs, timestamp=args.timestamp)
     regression_plot = args.regression_plot_path.format(sample_size=prepared.usable_dmrs, timestamp=args.timestamp)
     export_prediction_signals_h5ad(
@@ -1026,6 +1077,7 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
         },
         train_regions=prepared.train_regions,
         val_regions=prepared.val_regions,
+        test_regions=prepared.test_regions,
         non_overlap_groups=prepared.non_overlap_groups,
         best_epoch=best_epoch,
         final_lr=optimizer.param_groups[0]["lr"],
@@ -1035,6 +1087,10 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
         final_val_loss=final_val_loss,
         final_val_r2=final_val_r2,
         final_val_pearsonr=final_val_pearsonr,
+        test_loss=test_loss,
+        test_r2=test_r2,
+        test_pearsonr=test_pearsonr,
+        split_info=split_info,
         signal_h5ad=signal_h5ad,
         regression_plot=regression_plot,
         checkpoint_paths={
@@ -1077,6 +1133,13 @@ def parse_args():
     parser.add_argument("--chromosome", default=None)
     parser.add_argument("--target-length", type=int, default=1024)
     parser.add_argument("--train-ratio", type=float, default=0.8)
+    parser.add_argument(
+        "--test-bed",
+        default=None,
+        help="Optional BED of held-out test regions (chr/start/end). Windows overlapping it become the test set; "
+             "the rest is split train/val by --train-ratio. Without it, windows are auto-split "
+             "train/val/test = train_ratio / (1-train_ratio)/2 / (1-train_ratio)/2 (default 0.8/0.1/0.1).",
+    )
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--model-name", choices=["baseline", "model_b"], default="baseline")

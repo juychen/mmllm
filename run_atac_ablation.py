@@ -43,6 +43,7 @@ from data import (
     get_sequence,
     load_data,
     resolve_loss_mask,
+    resolve_train_val_test_split,
     write_train_val_beds,
 )
 from models import FlexibleQueryRegressorModelB
@@ -249,6 +250,13 @@ def parse_args():
     p.add_argument("--target-length", type=int, default=16384)
     p.add_argument("--sample-sizes", nargs="+", default=["all"])
     p.add_argument("--train-ratio", type=float, default=0.8)
+    p.add_argument(
+        "--test-bed",
+        default=None,
+        help="Optional BED of held-out test regions (chr/start/end). Windows overlapping it become the test set; "
+             "the rest is split train/val by --train-ratio. Without it, windows are auto-split "
+             "train/val/test = train_ratio / (1-train_ratio)/2 / (1-train_ratio)/2 (default 0.8/0.1/0.1).",
+    )
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--mask-mode", choices=["cpg_both", "cpg_forward", "ch_only", "c_only", "all"], default="cpg_forward")
     p.add_argument("--atac-scaling", choices=["none", "minmax"], default="minmax")
@@ -330,21 +338,18 @@ def main():
 
     # Build base Dataset (LazyM5cSequenceAtacDataset) + flexible wrapper
     if args.lazy:
-        # Build per-split indices using the non-overlap-group split
+        # Three-way split: auto 0.8/0.1/0.1 genomic-tail split without
+        # --test-bed, or BED-defined test with the rest split train/val.
         split_regions_df = df_dmr.copy().reset_index().rename(columns={"index": "original_idx"})
         split_regions_df["start_expanded"] = split_regions_df["start_expanded"].astype(int)
         split_regions_df["end_expanded"] = split_regions_df["end_expanded"].astype(int)
-        split_regions_df = assign_non_overlapping_groups(
-            split_regions_df, "chr", "start_expanded", "end_expanded"
+        train_indices, val_indices, test_indices, split_info = resolve_train_val_test_split(
+            split_regions_df,
+            train_ratio=args.train_ratio,
+            test_bed_path=getattr(args, "test_bed", None),
         )
-        group_ids = split_regions_df["overlap_group"].drop_duplicates().to_numpy()
-        num_train_groups = max(1, int(len(group_ids) * args.train_ratio))
-        train_group_ids = set(group_ids[:num_train_groups].tolist())
-        train_mask = split_regions_df["overlap_group"].isin(train_group_ids).to_numpy()
-        train_indices = np.flatnonzero(train_mask).tolist()
-        val_indices = np.flatnonzero(~train_mask).tolist()
 
-        # Write train / val region BED files to output dir for inspection
+        # Write train / val / test region BED files to output dir for inspection
         bed_out_dir = Path(args.output_dir) / ablation_name
         write_train_val_beds(
             split_regions_df,
@@ -352,6 +357,7 @@ def main():
             val_indices,
             output_dir=bed_out_dir,
             timestamp=args.timestamp,
+            test_indices=test_indices,
         )
 
         hm5c_paths = ensure_path_list(args.hm5c_bedgraph)
@@ -384,6 +390,21 @@ def main():
             augment_rc=False,
             clip_at_zero=args.clip_at_zero,
         )
+        test_base = None
+        if len(test_indices) > 0:
+            test_base = LazyM5cSequenceAtacDataset(
+                indices=test_indices,
+                df_dmr=split_regions_df,
+                genome_fasta=args.genome_fasta,
+                m5c_bedgraph=m5c_paths[0],
+                hm5c_bedgraph=hm5c_paths[0],
+                atac_bw_path=atac_paths[0],
+                target_length=args.target_length,
+                mask_mode=args.mask_mode,
+                atac_scaling=args.atac_scaling,
+                augment_rc=False,
+                clip_at_zero=args.clip_at_zero,
+            )
     else:
         # Non-lazy: just use the whole loaded tensor set (no proper split, for fast dev tests)
         usable = min(usable_dmrs, len(df_dmr), len(seqs), len(mcg_tracks), len(hmcg_tracks), len(atac_tracks))
@@ -392,6 +413,7 @@ def main():
 
     train_ds = FlexibleAblationDataset(train_base, ablation_name)
     val_ds = FlexibleAblationDataset(val_base, ablation_name)
+    test_ds = FlexibleAblationDataset(test_base, ablation_name) if test_base is not None else None
 
     train_loader = torch.utils.data.DataLoader(
         train_ds,
@@ -413,6 +435,18 @@ def main():
         persistent_workers=False,
         pin_memory=True,
     )
+    test_loader = None
+    if test_ds is not None:
+        test_loader = torch.utils.data.DataLoader(
+            test_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            collate_fn=flexible_collate,
+            prefetch_factor=2,
+            persistent_workers=False,
+            pin_memory=True,
+        )
 
     # Model
     device = torch.device(f"cuda:{get_freest_gpu()}" if torch.cuda.is_available() else "cpu")
@@ -525,8 +559,18 @@ def main():
     torch.save({"epoch": best_epoch, "model_state_dict": model.state_dict(),
                 "ablation": ablation_name, "args": vars(args)}, last_ckpt)
 
-    # Final eval + save metrics
+    # Final eval + save metrics; the held-out test set is touched exactly
+    # once, after the best checkpoint has been selected on val.
     final_val_loss, final_val_r2, final_val_pearson = evaluate(model, val_loader, device)
+    test_loss = float("nan")
+    test_r2 = float("nan")
+    test_pearson = float("nan")
+    if test_loader is not None:
+        test_loss, test_r2, test_pearson = evaluate(model, test_loader, device)
+        print(
+            f"FINAL TEST METRICS (report once): loss={test_loss:.4f}  "
+            f"R²={test_r2:.4f}  pearson r={test_pearson:.4f}"
+        )
     metrics = {
         "ablation": ablation_name,
         "query_modality": q_mod,
@@ -536,6 +580,10 @@ def main():
         "best_val_loss": best_val_loss,
         "best_val_r2": final_val_r2,    # last-loaded best state metrics
         "best_val_pearson": final_val_pearson,
+        "test_loss": test_loss,
+        "test_r2": test_r2,
+        "test_pearson": test_pearson,
+        "split_info": split_info,
         "num_params": n_params,
         "num_train_regions": len(train_ds),
         "num_val_regions": len(val_ds),

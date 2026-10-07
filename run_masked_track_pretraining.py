@@ -10,12 +10,13 @@ import torch.nn as nn
 
 from data import (
     add_clip_at_zero_argument,
-    assign_non_overlapping_groups,
     build_sequence_tensor,
     generate_pretraining_cpg_mask,
     get_track_arrays,
     load_data,
+    resolve_train_val_test_split,
     tensorize_track_modality,
+    write_train_val_beds,
 )
 from models import MaskedTrackPretrainingModelB
 from utils import get_freest_gpu, resolve_sample_sizes, set_random_seed
@@ -91,11 +92,14 @@ def save_checkpoint(checkpoint_path: str, model, optimizer, scheduler, epoch: in
 class PreparedPretrainingData:
     train_loader: torch.utils.data.DataLoader
     val_loader: torch.utils.data.DataLoader
+    test_loader: torch.utils.data.DataLoader | None
     usable_dmrs: int
     seq_len: int
     train_regions: int
     val_regions: int
+    test_regions: int
     non_overlap_groups: int
+    split_info: dict
 
 
 def prepare_pretraining_data(
@@ -132,40 +136,81 @@ def prepare_pretraining_data(
     split_regions_df["chr"] = split_regions_df["chr"].astype(str)
     split_regions_df["start_expanded"] = split_regions_df["start_expanded"].astype(int)
     split_regions_df["end_expanded"] = split_regions_df["end_expanded"].astype(int)
-    split_regions_df = assign_non_overlapping_groups(split_regions_df, "chr", "start_expanded", "end_expanded")
 
-    group_ids = split_regions_df["overlap_group"].drop_duplicates().to_numpy()
-    num_train_groups = max(1, int(len(group_ids) * args.train_ratio))
-    train_group_ids = set(group_ids[:num_train_groups].tolist())
-    train_mask = split_regions_df["overlap_group"].isin(train_group_ids).to_numpy()
-    train_idx = torch.from_numpy(np.flatnonzero(train_mask)).long()
-    val_idx = torch.from_numpy(np.flatnonzero(~train_mask)).long()
+    # Three-way split: auto 0.8/0.1/0.1 genomic-tail split without --test-bed,
+    # or BED-defined test with the rest split train/val by --train-ratio.
+    train_idx_np, val_idx_np, test_idx_np, split_info = resolve_train_val_test_split(
+        split_regions_df,
+        train_ratio=args.train_ratio,
+        test_bed_path=getattr(args, "test_bed", None),
+    )
 
-    train_dataset = torch.utils.data.TensorDataset(
-        *[t[train_idx] for t in track_tensors],
-        sequence_tensor[train_idx],
-        base_ids_tensor[train_idx],
+    from pathlib import Path
+    write_train_val_beds(
+        split_regions_df,
+        train_idx_np,
+        val_idx_np,
+        output_dir=Path(args.output_csv).parent,
+        timestamp=args.timestamp,
+        test_indices=test_idx_np,
     )
-    val_dataset = torch.utils.data.TensorDataset(
-        *[t[val_idx] for t in track_tensors],
-        sequence_tensor[val_idx],
-        base_ids_tensor[val_idx],
-    )
+
+    train_idx = torch.from_numpy(train_idx_np).long()
+    val_idx = torch.from_numpy(val_idx_np).long()
+    test_idx = torch.from_numpy(test_idx_np).long()
+
+    def _make_subset(index_tensor: torch.Tensor) -> torch.utils.data.TensorDataset:
+        return torch.utils.data.TensorDataset(
+            *[t[index_tensor] for t in track_tensors],
+            sequence_tensor[index_tensor],
+            base_ids_tensor[index_tensor],
+        )
+
+    train_dataset = _make_subset(train_idx)
+    val_dataset = _make_subset(val_idx)
+    test_dataset = _make_subset(test_idx) if test_idx.numel() > 0 else None
 
     return PreparedPretrainingData(
         train_loader=torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True),
         val_loader=torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False),
+        test_loader=(
+            torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
+            if test_dataset is not None
+            else None
+        ),
         usable_dmrs=usable_dmrs,
         seq_len=seq_len,
         train_regions=len(train_dataset),
         val_regions=len(val_dataset),
-        non_overlap_groups=split_regions_df["overlap_group"].nunique(),
+        test_regions=len(test_dataset) if test_dataset is not None else 0,
+        non_overlap_groups=split_info["train_groups"] + split_info["val_groups"] + split_info["test_groups"],
+        split_info=split_info,
     )
 
 
-def sample_track_masks(base_ids_batch: torch.Tensor, mask_fraction: float, num_tracks: int) -> list[torch.Tensor]:
-    shared_mask = generate_pretraining_cpg_mask(base_ids_batch, mask_fraction=mask_fraction, seed=None)
-    return [shared_mask.clone() for _ in range(num_tracks)]
+def sample_track_masks(
+    base_ids_batch: torch.Tensor,
+    mask_fraction: float,
+    num_tracks: int,
+    seed: int | None = None,
+) -> list[torch.Tensor]:
+    """One independent CpG mask per track.
+
+    Independent masks let a masked-out position in one track be reconstructed
+    from the other track's visible value (e.g. the 5hmC head sees unmasked
+    5mC), which mirrors the downstream 5mC -> 5hmC supervised task.
+    ``seed`` makes masks deterministic (validation/test, so epoch-to-epoch
+    metrics are comparable); ``seed=None`` gives fresh random masks (training).
+    Track t uses ``seed + t`` so tracks stay independent under a fixed seed.
+    """
+    return [
+        generate_pretraining_cpg_mask(
+            base_ids_batch,
+            mask_fraction=mask_fraction,
+            seed=None if seed is None else seed + track_index,
+        )
+        for track_index in range(num_tracks)
+    ]
 
 
 def apply_masks_to_tracks(track_tensors: list[torch.Tensor], mask_tensors: list[torch.Tensor]) -> list[torch.Tensor]:
@@ -189,7 +234,21 @@ def compute_multitrack_masked_loss(
     return total_loss, losses
 
 
-def evaluate(model: nn.Module, loader, device: torch.device, mask_fraction: float, track_names: list[str], amp: bool = False) -> dict[str, float]:
+def evaluate(
+    model: nn.Module,
+    loader,
+    device: torch.device,
+    mask_fraction: float,
+    track_names: list[str],
+    amp: bool = False,
+    mask_seed: int | None = None,
+) -> dict[str, float]:
+    """Masked-reconstruction metrics on ``loader``.
+
+    ``mask_seed`` pins the masks (seed + batch index) so repeated evaluations
+    are comparable across epochs — without it the val metric carries mask
+    resampling noise.  None keeps the old fully-random behavior.
+    """
     model.eval()
     amp_dtype = torch.bfloat16 if amp else torch.float32
     num_tracks = len(track_names)
@@ -201,12 +260,17 @@ def evaluate(model: nn.Module, loader, device: torch.device, mask_fraction: floa
     all_masks = {name: [] for name in track_names}
 
     with torch.no_grad():
-        for batch in loader:
+        for batch_index, batch in enumerate(loader):
             track_batches = [t.to(device) for t in batch[:num_tracks]]
             sequence_batch = batch[num_tracks].to(device)
             base_ids_batch = batch[num_tracks + 1]
 
-            masks = sample_track_masks(base_ids_batch, mask_fraction, num_tracks)
+            masks = sample_track_masks(
+                base_ids_batch,
+                mask_fraction,
+                num_tracks,
+                seed=None if mask_seed is None else mask_seed + batch_index,
+            )
             masks = [mask.to(device) for mask in masks]
 
             original_tracks = track_batches
@@ -277,6 +341,11 @@ class ExperimentResult:
     final_val_track_losses: dict[str, float]
     final_val_r2: dict[str, float]
     final_val_pearsonr: dict[str, float]
+    test_total_loss: float | None
+    test_track_losses: dict[str, float] | None
+    test_r2: dict[str, float] | None
+    test_pearsonr: dict[str, float] | None
+    split_info: dict
     checkpoint_paths: dict
 
 
@@ -392,7 +461,8 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
         train_total_loss = train_total_loss_sum / denom
         train_track_losses = {name: train_track_loss_sums[name] / denom for name in track_names}
 
-        val_metrics = evaluate(model, prepared.val_loader, device, args.mask_fraction, track_names, amp=args.amp)
+        val_metrics = evaluate(model, prepared.val_loader, device, args.mask_fraction, track_names,
+                               amp=args.amp, mask_seed=args.seed + 1000)
 
         if scheduler is not None:
             if args.scheduler == "plateau":
@@ -433,7 +503,8 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
             if args.patience > 0 and patience_left <= 0:
                 break
 
-    final_val_metrics = evaluate(model, prepared.val_loader, device, args.mask_fraction, track_names, amp=args.amp)
+    final_val_metrics = evaluate(model, prepared.val_loader, device, args.mask_fraction, track_names,
+                                 amp=args.amp, mask_seed=args.seed + 1000)
 
     save_checkpoint(
         last_checkpoint_path,
@@ -451,7 +522,20 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
 
     if best_state is not None:
         model.load_state_dict(best_state)
-        final_val_metrics = evaluate(model, prepared.val_loader, device, args.mask_fraction, track_names, amp=args.amp)
+        final_val_metrics = evaluate(model, prepared.val_loader, device, args.mask_fraction, track_names,
+                                     amp=args.amp, mask_seed=args.seed + 1000)
+
+    # Held-out test: evaluated exactly once on the best checkpoint with its own
+    # fixed mask seed, so the reported numbers are reproducible.
+    test_metrics: dict[str, float] | None = None
+    if prepared.test_loader is not None:
+        test_metrics = evaluate(model, prepared.test_loader, device, args.mask_fraction, track_names,
+                                amp=args.amp, mask_seed=args.seed + 2000)
+        test_detail = ", ".join(
+            f"{n}: R²={test_metrics[f'val_{n}_r2']:.4f} ρ={test_metrics[f'val_{n}_pearsonr']:.4f}"
+            for n in track_names
+        )
+        print(f"FINAL TEST METRICS (report once): total={test_metrics['val_total_loss']:.4f} | {test_detail}")
 
     best_track_losses = {name: float(best_metrics.get(f"val_{name}_loss", 0.0)) for name in track_names}
     final_track_losses = {name: float(final_val_metrics.get(f"val_{name}_loss", 0.0)) for name in track_names}
@@ -464,6 +548,7 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
         num_dmrs=prepared.usable_dmrs,
         train_regions=prepared.train_regions,
         val_regions=prepared.val_regions,
+        test_regions=prepared.test_regions,
         non_overlap_groups=prepared.non_overlap_groups,
         best_epoch=best_epoch,
         final_lr=optimizer.param_groups[0]["lr"],
@@ -476,6 +561,20 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
         final_val_track_losses=final_track_losses,
         final_val_r2=final_track_r2,
         final_val_pearsonr=final_track_pearsonr,
+        test_total_loss=(test_metrics or {}).get("val_total_loss"),
+        test_track_losses=(
+            {n: float((test_metrics or {}).get(f"val_{n}_loss", float("nan"))) for n in track_names}
+            if test_metrics is not None else None
+        ),
+        test_r2=(
+            {n: float((test_metrics or {}).get(f"val_{n}_r2", float("nan"))) for n in track_names}
+            if test_metrics is not None else None
+        ),
+        test_pearsonr=(
+            {n: float((test_metrics or {}).get(f"val_{n}_pearsonr", float("nan"))) for n in track_names}
+            if test_metrics is not None else None
+        ),
+        split_info=prepared.split_info,
         checkpoint_paths={
             "best": best_checkpoint_path,
             "last": last_checkpoint_path,
@@ -545,6 +644,13 @@ def parse_args():
     parser.add_argument("--chromosome", default=None)
     parser.add_argument("--target-length", type=int, default=1024)
     parser.add_argument("--train-ratio", type=float, default=0.8)
+    parser.add_argument(
+        "--test-bed",
+        default=None,
+        help="Optional BED of held-out test regions (chr/start/end). Windows overlapping it become the test set; "
+             "the rest is split train/val by --train-ratio. Without it, windows are auto-split "
+             "train/val/test = train_ratio / (1-train_ratio)/2 / (1-train_ratio)/2 (default 0.8/0.1/0.1).",
+    )
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--num-blocks", type=int, default=4)

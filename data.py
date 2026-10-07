@@ -1,3 +1,4 @@
+from collections import defaultdict
 from dataclasses import dataclass
 import threading
 
@@ -263,19 +264,24 @@ def write_train_val_beds(
     output_dir: "str | os.PathLike | None" = None,
     timestamp: str = "",
     tag: str = "",
-) -> tuple["Path | None", "Path | None"]:
-    """Write train / val region BED files to ``output_dir``.
+    test_indices: "list[int] | np.ndarray | None" = None,
+) -> tuple["Path | None", "Path | None", "Path | None"]:
+    """Write train / val [/ test] region BED files to ``output_dir``.
 
     Writes 5 columns: chr / start_expanded / end_expanded / original_idx / overlap_group.
-    Returns the (train_bed_path, val_bed_path) tuple.  If ``output_dir`` is None,
-    nothing is written and (None, None) is returned.
+    Returns the (train_bed_path, val_bed_path, test_bed_path) tuple; ``test_bed_path``
+    is None when ``test_indices`` is empty/None.  If ``output_dir`` is None,
+    nothing is written and (None, None, None) is returned.
     """
     if output_dir is None:
-        return None, None
+        return None, None, None
     from pathlib import Path
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    bed_cols = ["chr", "start_expanded", "end_expanded", "original_idx", "overlap_group"]
+    bed_cols_all = ["chr", "start_expanded", "end_expanded", "original_idx", "overlap_group"]
+    # resolve_train_val_test_split hands back the raw frame without overlap_group;
+    # write whichever columns exist so both annotated and raw frames work.
+    bed_cols = [c for c in bed_cols_all if c in split_regions_df.columns]
     suffix = f"_{tag}" if tag else ""
     ts = f"{timestamp}_" if timestamp else ""
     train_path = out_dir / f"{ts}train_regions{suffix}.bed"
@@ -288,7 +294,180 @@ def write_train_val_beds(
     )
     print(f"  train regions : {len(train_indices)}  -> {train_path}")
     print(f"  val regions   : {len(val_indices)}  -> {val_path}")
-    return train_path, val_path
+
+    test_path = None
+    if test_indices is not None and len(test_indices) > 0:
+        test_path = out_dir / f"{ts}test_regions{suffix}.bed"
+        split_regions_df.iloc[test_indices][bed_cols].to_csv(
+            test_path, sep="\t", index=False, header=False,
+        )
+        print(f"  test regions  : {len(test_indices)}  -> {test_path}")
+    return train_path, val_path, test_path
+
+
+def _load_split_bed(bed_path: str) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Load a 3+ column BED (0-based start, exclusive end) into merged intervals.
+
+    Returns {chrom: (starts, ends)} with per-chromosome sorted, non-overlapping
+    interval arrays — the same representation used by the annotation overlap
+    helpers, so a window is "in the BED" iff its span overlaps any interval.
+    """
+    raw: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    with open(bed_path) as handle:
+        for line in handle:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 3:
+                continue
+            try:
+                start, end = int(parts[1]), int(parts[2])
+            except ValueError:
+                continue
+            if end > start:
+                raw[parts[0]].append((start, end))
+    out: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for chrom, intervals in raw.items():
+        intervals.sort()
+        merged: list[list[int]] = []
+        for s, e in intervals:
+            if merged and s <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], e)
+            else:
+                merged.append([s, e])
+        arr = np.asarray(merged, dtype=np.int64)
+        out[chrom] = (arr[:, 0], arr[:, 1])
+    return out
+
+
+def _windows_overlapping_bed(
+    chr_arr: np.ndarray,
+    start_arr: np.ndarray,
+    end_arr: np.ndarray,
+    bed: dict[str, tuple[np.ndarray, np.ndarray]],
+) -> np.ndarray:
+    """True where the 1-based inclusive window [start, end] overlaps any BED interval.
+
+    BED intervals are 0-based half-open, so the window span is [start-1, end).
+    The `k >= 0` guard matters: `searchsorted(..., 'left') - 1` yields -1 for a
+    window that starts before the first interval, which must not be clipped
+    into a false overlap (same pitfall as the annotation `covered()` helper).
+    """
+    hit = np.zeros(len(chr_arr), dtype=bool)
+    for chrom, (starts, ends) in bed.items():
+        rows = np.flatnonzero(chr_arr == chrom)
+        if rows.size == 0:
+            continue
+        q_start = start_arr[rows] - 1
+        q_end = end_arr[rows]
+        k = np.searchsorted(starts, q_end, side="left") - 1
+        safe_k = np.clip(k, 0, len(starts) - 1)
+        overlap = (k >= 0) & (q_start < ends[safe_k])
+        hit[rows[overlap]] = True
+    return hit
+
+
+def resolve_train_val_test_split(
+    region_frame: pd.DataFrame,
+    train_ratio: float = 0.8,
+    test_bed_path: str | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+    """Split windows into train / val / test.
+
+    Requires the frame to carry ``chr``, ``start_expanded``, ``end_expanded``
+    (1-based inclusive).  Returned index arrays position into
+    ``region_frame`` (usable with ``.iloc``).
+
+    Case A (``test_bed_path`` is None): every window is pooled and
+    ``assign_non_overlapping_groups`` cuts it in genomic order — the first
+    ``train_ratio`` fraction of overlap groups is train, the remaining tail is
+    split evenly into val and test.  Default ``train_ratio=0.8`` therefore
+    yields the 0.8 / 0.1 / 0.1 split (a train_ratio of 0.7 gives
+    0.7 / 0.15 / 0.15).
+
+    Case B (``test_bed_path`` given): windows overlapping the BED become test
+    (test wins, so a window straddling the boundary can never sit in train);
+    the remaining windows are grouped and cut into train / val by
+    ``train_ratio`` as before.
+
+    ``info`` reports the case, source paths and per-set window/group counts.
+    """
+    frame = region_frame.copy().reset_index(drop=True)
+    chrom_arr = frame["chr"].astype(str).to_numpy()
+    start_arr = frame["start_expanded"].to_numpy(dtype=np.int64)
+    end_arr = frame["end_expanded"].to_numpy(dtype=np.int64)
+
+    if test_bed_path:
+        test_hit = _windows_overlapping_bed(
+            chrom_arr, start_arr, end_arr, _load_split_bed(test_bed_path)
+        )
+        test_indices = np.flatnonzero(test_hit)
+        pool_indices = np.flatnonzero(~test_hit)
+        split_case = "test_bed"
+    else:
+        test_bed_path = None
+        test_indices = np.array([], dtype=np.int64)
+        pool_indices = np.arange(len(frame))
+        split_case = "auto_3way"
+
+    pool = frame.iloc[pool_indices].copy()
+    pool["original_idx"] = pool_indices
+    pool = pool.reset_index(drop=True)
+    pool["chr"] = pool["chr"].astype(str)
+    pool["start_expanded"] = pool["start_expanded"].astype(int)
+    pool["end_expanded"] = pool["end_expanded"].astype(int)
+    pool = assign_non_overlapping_groups(pool, "chr", "start_expanded", "end_expanded")
+
+    # assign_non_overlapping_groups assigns group ids in genomic order, so
+    # ascending group id == genomic order regardless of input row order.
+    group_ids = np.sort(pool["overlap_group"].drop_duplicates().to_numpy())
+    n_train_groups = max(1, int(len(group_ids) * train_ratio))
+    train_group_ids = set(group_ids[:n_train_groups].tolist())
+    if test_indices.size == 0:
+        n_tail_groups = len(group_ids) - n_train_groups
+        n_val_groups = n_tail_groups // 2
+        val_group_ids = set(group_ids[n_train_groups:n_train_groups + n_val_groups].tolist())
+        test_group_ids = set(group_ids[n_train_groups + n_val_groups:].tolist())
+    else:
+        val_group_ids = set(group_ids[n_train_groups:].tolist())
+        test_group_ids = set()
+
+    train_mask = pool["overlap_group"].isin(train_group_ids).to_numpy()
+    val_mask = pool["overlap_group"].isin(val_group_ids).to_numpy()
+    train_indices = pool_indices[train_mask]
+    val_indices = pool_indices[val_mask]
+    if test_indices.size == 0:
+        # Case A: the tail groups beyond train/val are the test windows.
+        test_mask = pool["overlap_group"].isin(test_group_ids).to_numpy()
+        test_indices = pool_indices[test_mask]
+
+    if test_indices.size > 0:
+        test_df = frame.iloc[test_indices].copy()
+        test_df["original_idx"] = test_indices
+        test_df = test_df.reset_index(drop=True)
+        test_df["chr"] = test_df["chr"].astype(str)
+        test_df["start_expanded"] = test_df["start_expanded"].astype(int)
+        test_df["end_expanded"] = test_df["end_expanded"].astype(int)
+        test_df = assign_non_overlapping_groups(test_df, "chr", "start_expanded", "end_expanded")
+        n_test_groups = int(test_df["overlap_group"].nunique())
+    else:
+        n_test_groups = len(test_group_ids)
+
+    info = {
+        "split_case": split_case,
+        "test_bed": test_bed_path,
+        "train_windows": int(train_indices.size),
+        "val_windows": int(val_indices.size),
+        "test_windows": int(test_indices.size),
+        "train_groups": int(n_train_groups),
+        "val_groups": int(len(val_group_ids)),
+        "test_groups": int(n_test_groups),
+    }
+    print(
+        f"[split:{split_case}] train={info['train_windows']} ({info['train_groups']} groups) | "
+        f"val={info['val_windows']} ({info['val_groups']} groups) | "
+        f"test={info['test_windows']} ({info['test_groups']} groups)"
+        + (f" | test BED: {test_bed_path}" if test_bed_path else "")
+    )
+    return train_indices, val_indices, test_indices, info
 
 
 def _chromosome_sort_key(chrom_value) -> tuple[int, int | str]:
