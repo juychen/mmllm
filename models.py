@@ -599,11 +599,34 @@ class MaskedTrackPretrainingModelB(nn.Module):
       - context = 5hmC_masked + ATAC_masked  → context_track_proj (shared per-track) → concat
         with sequence → context_proj → context_norm
       - Multiple StripedHyenaBlock blocks (cross-hyena + multi-scale hyena)
-      - Three independent output heads (one per track)
+      - One independent output head per reconstructed track
 
     During pretraining, ~15% of CpG positions in each track are independently
     masked. The model learns to reconstruct the original values using cross-track
     and sequence context.
+
+    Two optional extensions (both off by default → identical to the original
+    class, state-dict compatible with existing checkpoints):
+
+    * ``num_reconstructed_context_tracks``: only the first N context tracks get
+      output heads; the remaining context tracks are input-only (no head, never
+      in the loss). Enables e.g. 5hmC reconstructed while ATAC/RNA are just
+      conditioning inputs.
+    * ``use_mask_tokens=True``: learned [MASK] tokens for the two-layer masking
+      scheme of ``run_masked_multimodal_pretraining.py``. Masking is done by
+      SUBSTITUTING the projected hidden representation, never by zeroing the raw
+      track values — 0 is a real methylation level, so zeroing would conflate
+      "missing" with "unmethylated".
+        - ``position_mask`` (N, L, 1), 1.0 = masked position: every signal
+          track's hidden at those positions becomes that track's [POS-MASK]
+          token.
+        - ``track_present``: list of (N, 1, 1) multipliers (1.0 = present) in
+          ``track_tensors`` order: an absent track's whole hidden becomes its
+          [MODALITY-MASK] token.
+        - ``sequence_present`` (N, 1, 1): whole-track [MASK] for the sequence.
+      Anti-leakage: when the loss is only computed at ``position_mask``
+      positions, no track's real value at those positions ever enters the
+      network.
     """
 
     def __init__(
@@ -617,9 +640,16 @@ class MaskedTrackPretrainingModelB(nn.Module):
         num_blocks: int = 4,
         fusion_type: str = "cross_hyena",
         num_context_tracks: int = 2,
+        num_reconstructed_context_tracks: int | None = None,
+        use_mask_tokens: bool = False,
     ):
         super().__init__()
-        num_heads = 1 + num_context_tracks  # query (5mC) + each context track
+        if num_reconstructed_context_tracks is None:
+            num_reconstructed_context_tracks = num_context_tracks
+        num_heads = 1 + num_reconstructed_context_tracks  # query (5mC) + reconstructed context tracks
+        self.num_context_tracks = num_context_tracks
+        self.num_reconstructed_context_tracks = num_reconstructed_context_tracks
+        self.use_mask_tokens = use_mask_tokens
 
         # Query branch: 5mC (masked)
         self.query_proj = nn.Linear(query_dim, hidden_dim)
@@ -652,7 +682,8 @@ class MaskedTrackPretrainingModelB(nn.Module):
 
         self.final_norm = nn.LayerNorm(hidden_dim)
 
-        # Independent output heads: one per track (query + context tracks)
+        # Independent output heads: one per reconstructed track (query + first
+        # `num_reconstructed_context_tracks` context tracks, in input order)
         self.heads = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim),
@@ -661,13 +692,43 @@ class MaskedTrackPretrainingModelB(nn.Module):
             ) for _ in range(num_heads)
         ])
 
-    def forward(self, track_tensors: list[torch.Tensor], sequence_tensor: torch.Tensor) -> list[torch.Tensor]:
+        # Learned [MASK] tokens for the two-layer masking scheme. Created only
+        # when requested so that the default state dict (and every existing
+        # checkpoint) stays unchanged.
+        if use_mask_tokens:
+            self.query_mask_token = nn.Parameter(torch.zeros(hidden_dim))
+            self.context_track_mask_tokens = nn.ParameterList([
+                nn.Parameter(torch.zeros(hidden_dim)) for _ in range(num_context_tracks)
+            ])
+            self.query_pos_token = nn.Parameter(torch.zeros(hidden_dim))
+            self.context_pos_tokens = nn.ParameterList([
+                nn.Parameter(torch.zeros(hidden_dim)) for _ in range(num_context_tracks)
+            ])
+            self.sequence_mask_token = nn.Parameter(torch.zeros(hidden_dim))
+
+    def forward(
+        self,
+        track_tensors: list[torch.Tensor],
+        sequence_tensor: torch.Tensor,
+        position_mask: torch.Tensor | None = None,
+        track_present: list[torch.Tensor] | None = None,
+        sequence_present: torch.Tensor | None = None,
+    ) -> list[torch.Tensor]:
         """
         Args:
             track_tensors: [query_track (5mC), *context_tracks], each (N, seq_len, 1)
             sequence_tensor: (N, seq_len, 4) one-hot DNA
+            position_mask: optional (N, seq_len, 1), 1.0 = masked position —
+                every track's hidden is replaced by its learned [POS-MASK] token
+                there (requires use_mask_tokens=True).
+            track_present: optional list of (N, 1, 1) presence multipliers in
+                track_tensors order, 1.0 = present — an absent track's whole
+                hidden is replaced by its learned [MODALITY-MASK] token.
+            sequence_present: optional (N, 1, 1) presence multiplier for the
+                sequence track.
         Returns:
-            [pred_query, pred_context_1, ...], each (N, seq_len, 1)
+            [pred_query, pred_context_1, ...], each (N, seq_len, 1) — one entry
+            per output head (query + reconstructed context tracks).
         """
         query_track = track_tensors[0]
         context_tracks = track_tensors[1:]
@@ -683,6 +744,42 @@ class MaskedTrackPretrainingModelB(nn.Module):
 
         # Sequence projection
         sequence_hidden = self.sequence_norm(self.sequence_proj(sequence_tensor))
+
+        if not self.use_mask_tokens and (position_mask is not None or track_present is not None):
+            raise ValueError(
+                "position_mask/track_present require use_mask_tokens=True on this model."
+            )
+        if track_present is not None and len(track_present) != len(track_tensors):
+            raise ValueError(
+                f"track_present has {len(track_present)} entries but got {len(track_tensors)} track tensors."
+            )
+
+        # Layer 1 — shared position mask: substitute the per-track [POS-MASK]
+        # token at masked positions (all signal tracks share the same positions).
+        if position_mask is not None:
+            keep = 1.0 - position_mask
+            hidden = hidden * keep + self.query_pos_token.view(1, 1, -1) * position_mask
+            context_track_hidden = [
+                h * keep + token.view(1, 1, -1) * position_mask
+                for h, token in zip(context_track_hidden, self.context_pos_tokens)
+            ]
+
+        # Layer 2 — per-track modality mask: substitute the whole track's hidden
+        # with its [MODALITY-MASK] token for absent samples.
+        if track_present is not None:
+            q_keep = track_present[0]
+            hidden = hidden * q_keep + self.query_mask_token.view(1, 1, -1) * (1.0 - q_keep)
+            context_track_hidden = [
+                h * keep + token.view(1, 1, -1) * (1.0 - keep)
+                for h, keep, token in zip(
+                    context_track_hidden, track_present[1:], self.context_track_mask_tokens
+                )
+            ]
+        if sequence_present is not None:
+            sequence_hidden = (
+                sequence_hidden * sequence_present
+                + self.sequence_mask_token.view(1, 1, -1) * (1.0 - sequence_present)
+            )
 
         # Context fusion: concat(sequence_hidden, *context_track_hidden) → proj → norm
         context = self.context_norm(self.context_proj(torch.cat([sequence_hidden, *context_track_hidden], dim=-1)))

@@ -1157,7 +1157,8 @@ class LazyM5cSequenceAtacDataset(torch.utils.data.Dataset):
         # attributes) with the constructor-default tracks.
         self._tbx_5mc, _ = self._track_handle(self.m5c_bedgraph)
         self._tbx_5hmc, _ = self._track_handle(self.hm5c_bedgraph)
-        self._atac_bw, _ = self._track_handle(self.atac_bw_path)
+        if self.atac_bw_path:
+            self._atac_bw, _ = self._track_handle(self.atac_bw_path)
 
     def _track_handle(self, path: str):
         """Return ``(handle, fmt)`` for ``path``, opening and caching on first use.
@@ -1226,7 +1227,9 @@ class LazyM5cSequenceAtacDataset(torch.utils.data.Dataset):
         # Detect track formats once at init (cached — zero per-sample overhead)
         self._m5c_fmt = _detect_track_format(m5c_bedgraph)
         self._hm5c_fmt = _detect_track_format(hm5c_bedgraph)
-        self._atac_fmt = _detect_track_format(atac_bw_path)
+        # atac_bw_path may be None (modality absent) → zero-filled ATAC track,
+        # same convention as the RNA track in LazyM5cSequenceAtacRnaDataset.
+        self._atac_fmt = _detect_track_format(atac_bw_path) if atac_bw_path else None
         self._genome = None
         self._tbx_5mc = None
         self._tbx_5hmc = None
@@ -1289,7 +1292,7 @@ class LazyM5cSequenceAtacDataset(torch.utils.data.Dataset):
         with self._lock:
             tbx_5mc, m5c_fmt = self._track_handle(m5c_path)
             tbx_5hmc, hm5c_fmt = self._track_handle(hm5c_path)
-            atac_bw, atac_fmt = self._track_handle(atac_path)
+            atac_bw, atac_fmt = self._track_handle(atac_path) if atac_path else (None, None)
 
         # --- fetch on the fly ---
         seq_str = get_sequence(chrom, start, end, self._genome)
@@ -1301,14 +1304,17 @@ class LazyM5cSequenceAtacDataset(torch.utils.data.Dataset):
             end,
             clip_at_zero=self.clip_at_zero,
         )
-        atac = read_track_region(
-            atac_bw,
-            atac_fmt,
-            chrom,
-            start,
-            end + 1,
-            clip_at_zero=self.clip_at_zero,
-        )
+        if atac_bw is not None:
+            atac = read_track_region(
+                atac_bw,
+                atac_fmt,
+                chrom,
+                start,
+                end + 1,
+                clip_at_zero=self.clip_at_zero,
+            )
+        else:
+            atac = np.zeros(end - start, dtype=np.float32)
         m5c = read_track_region(
             tbx_5mc,
             m5c_fmt,
@@ -1440,13 +1446,16 @@ class LazyM5cSequenceAtacRnaDataset(LazyM5cSequenceAtacDataset):
         with self._lock:
             tbx_5mc, m5c_fmt = self._track_handle(m5c_path)
             tbx_5hmc, hm5c_fmt = self._track_handle(hm5c_path)
-            atac_bw, atac_fmt = self._track_handle(atac_path)
+            atac_bw, atac_fmt = self._track_handle(atac_path) if atac_path else (None, None)
             rna_bw, rna_fmt = self._track_handle(rna_path) if rna_path else (None, None)
 
         # --- fetch on the fly ---
         seq_str = get_sequence(chrom, start, end, self._genome)
         hm5c = read_track_region(tbx_5hmc, hm5c_fmt, chrom, start, end, clip_at_zero=self.clip_at_zero)
-        atac = read_track_region(atac_bw, atac_fmt, chrom, start, end + 1, clip_at_zero=self.clip_at_zero)
+        if atac_bw is not None:
+            atac = read_track_region(atac_bw, atac_fmt, chrom, start, end + 1, clip_at_zero=self.clip_at_zero)
+        else:
+            atac = np.zeros(end - start, dtype=np.float32)
         m5c = read_track_region(tbx_5mc, m5c_fmt, chrom, start, end, clip_at_zero=self.clip_at_zero)
         if rna_bw is not None:
             rna = read_track_region(rna_bw, rna_fmt, chrom, start, end + 1, clip_at_zero=self.clip_at_zero)
