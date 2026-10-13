@@ -878,3 +878,215 @@ class FlexibleQueryRegressorModelB(nn.Module):
         for block in self.blocks:
             hidden = block(hidden, context)
         return self.head(self.final_norm(hidden))
+
+
+class MultiQueryMaskedPretrainingModel(nn.Module):
+    """Masked pretraining with N independent query streams sharing ONE context.
+
+    Unlike :class:`MaskedTrackPretrainingModelB` (a single query trunk that all
+    heads read), every query track (e.g. 5mC *and* 5hmC) gets its OWN projection
+    + norm and its own pass through the shared StripedHyena blocks.
+
+    ``context_mode`` controls what each query's fused context carries:
+
+    * ``"shared"``     — DNA sequence + the non-query context tracks (e.g. ATAC,
+      RNA), identical for every query. The query streams do NOT see each other.
+    * ``"all-others"`` — DNA sequence + EVERY other signal track, i.e. the other
+      query tracks *and* the context tracks. Each query sees a different context
+      (everything except itself), so e.g. the 5hmC head keeps access to 5mC.
+
+    Anti-leakage is preserved in both modes: at masked positions every signal
+    track's hidden — including every query's — is replaced by that track's learned
+    [POS-MASK] token, so no track's real value at a predicted position is ever
+    visible, whether it is used as a trunk or as another query's context. Masking
+    is always substitution in hidden space, never raw zeroing, because 0 is a real
+    methylation level.
+
+    Forward signature::
+
+        forward(query_tracks, sequence_tensor, context_tracks,
+                position_mask=None, query_present=None, track_present=None,
+                sequence_present=None) -> list[Tensor]
+
+    where each tensor in ``query_tracks`` / ``context_tracks`` is (N, seq_len, 1),
+    ``sequence_tensor`` is (N, seq_len, 4) one-hot, ``position_mask`` is
+    (N, seq_len, 1), and the presence tensors are (N, 1, 1). Returns one
+    prediction (N, seq_len, 1) per query track, in ``query_tracks`` order.
+    """
+
+    def __init__(
+        self,
+        seq_len: int,
+        hidden_dim: int = 64,
+        use_positional_encoding: bool = False,
+        num_blocks: int = 4,
+        fusion_type: str = "cross_hyena",
+        num_queries: int = 2,
+        num_context_tracks: int = 2,
+        query_dim: int = 1,
+        context_track_dim: int = 1,
+        sequence_dim: int = 4,
+        context_mode: str = "shared",
+    ):
+        super().__init__()
+        if num_queries < 1:
+            raise ValueError("num_queries must be >= 1")
+        if context_mode not in ("shared", "all-others"):
+            raise ValueError(f"unknown context_mode: {context_mode!r} (use 'shared' or 'all-others')")
+        self.num_queries = num_queries
+        self.num_context_tracks = num_context_tracks
+        self.context_mode = context_mode
+        # Number of signal tracks carried by each query's fused context.
+        #   shared     : the non-query context tracks only (identical for every query)
+        #   all-others : every other signal track, i.e. the other queries AND the context tracks
+        if context_mode == "all-others":
+            self.num_context_in_fusion = (num_queries - 1) + num_context_tracks
+        else:
+            self.num_context_in_fusion = num_context_tracks
+        self.context_specs = self._build_context_specs()
+
+        # One independent query stream per query track.
+        self.query_projs = nn.ModuleList([
+            nn.Linear(query_dim, hidden_dim) for _ in range(num_queries)
+        ])
+        self.query_norms = nn.ModuleList([
+            nn.LayerNorm(hidden_dim) for _ in range(num_queries)
+        ])
+
+        # Context tracks — one projection + norm per track.
+        self.context_track_projs = nn.ModuleList([
+            nn.Linear(context_track_dim, hidden_dim) for _ in range(num_context_tracks)
+        ])
+        self.context_track_norms = nn.ModuleList([
+            nn.LayerNorm(hidden_dim) for _ in range(num_context_tracks)
+        ])
+
+        # Sequence projection
+        self.sequence_proj = nn.Linear(sequence_dim, hidden_dim)
+        self.sequence_norm = nn.LayerNorm(hidden_dim)
+
+        # Context fusion: seq_hidden + this query's context track hiddens.
+        context_concat_dim = hidden_dim * (1 + self.num_context_in_fusion)
+        self.context_proj = nn.Linear(context_concat_dim, hidden_dim)
+        self.context_norm = nn.LayerNorm(hidden_dim)
+
+        # Positional encoding
+        self.position_encoding = SinusoidalPositionalEncoding(hidden_dim, seq_len) if use_positional_encoding else None
+
+        # Shared StripedHyena blocks — every query stream runs through these.
+        self.blocks = nn.ModuleList([
+            StripedHyenaBlock(hidden_dim, seq_len, fusion_type=fusion_type)
+            for _ in range(num_blocks)
+        ])
+
+        # Per-query output head (each query reconstructs itself).
+        self.final_norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_queries)])
+        self.heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, 1),
+            ) for _ in range(num_queries)
+        ])
+
+        # Learned [MASK] tokens for the two-layer masking scheme.
+        # Layer 1 — [POS-MASK]: per query / context track, substituted at masked positions.
+        # Layer 2 — [MODALITY-MASK]: per query / context track, substituted for whole absent tracks.
+        self.query_pos_tokens = nn.ParameterList([
+            nn.Parameter(torch.zeros(hidden_dim)) for _ in range(num_queries)
+        ])
+        self.query_mask_tokens = nn.ParameterList([
+            nn.Parameter(torch.zeros(hidden_dim)) for _ in range(num_queries)
+        ])
+        self.context_pos_tokens = nn.ParameterList([
+            nn.Parameter(torch.zeros(hidden_dim)) for _ in range(num_context_tracks)
+        ])
+        self.context_track_mask_tokens = nn.ParameterList([
+            nn.Parameter(torch.zeros(hidden_dim)) for _ in range(num_context_tracks)
+        ])
+        self.sequence_mask_token = nn.Parameter(torch.zeros(hidden_dim))
+
+    def _apply_position_mask(self, hidden: torch.Tensor, token: nn.Parameter, position_mask: torch.Tensor) -> torch.Tensor:
+        keep = 1.0 - position_mask
+        return hidden * keep + token.view(1, 1, -1) * position_mask
+
+    def _build_context_specs(self) -> list[list[int]]:
+        """Per-query context track indices into the flat [*queries, *context] order.
+
+        shared     -> every query uses the same non-query context tracks.
+        all-others -> each query uses EVERY other signal track (other queries + context).
+        """
+        nq, nc = self.num_queries, self.num_context_tracks
+        total = nq + nc
+        if self.context_mode == "all-others":
+            return [[j for j in range(total) if j != i] for i in range(nq)]
+        return [[nq + k for k in range(nc)] for _ in range(nq)]
+
+    def _fuse_context(self, sequence_hidden: torch.Tensor, track_hidden: list[torch.Tensor], indices: list[int]) -> torch.Tensor:
+        parts = [sequence_hidden, *[track_hidden[j] for j in indices]]
+        context = self.context_norm(self.context_proj(torch.cat(parts, dim=-1)))
+        if self.position_encoding is not None:
+            context = self.position_encoding(context)
+        return context
+
+    def forward(
+        self,
+        query_tracks: list[torch.Tensor],
+        sequence_tensor: torch.Tensor,
+        context_tracks: list[torch.Tensor],
+        position_mask: torch.Tensor | None = None,
+        query_present: list[torch.Tensor] | None = None,
+        track_present: list[torch.Tensor] | None = None,
+        sequence_present: torch.Tensor | None = None,
+    ) -> list[torch.Tensor]:
+        if len(query_tracks) != self.num_queries:
+            raise ValueError(f"expected {self.num_queries} query tracks, got {len(query_tracks)}")
+        if len(context_tracks) != self.num_context_tracks:
+            raise ValueError(f"expected {self.num_context_tracks} context tracks, got {len(context_tracks)}")
+
+        # ----- per-track hidden reps, flat order [*query_tracks, *context_tracks] -----
+        # Each track gets its own proj+norm, its [POS-MASK] at masked positions and
+        # its [MODALITY-MASK] when the whole track is absent. Query tracks are
+        # projected once and reused both as their own trunk and (in 'all-others'
+        # mode) as another query's context — never by re-deriving from raw values.
+        track_hidden: list[torch.Tensor] = []
+        for i, query_track in enumerate(query_tracks):
+            h = self.query_norms[i](self.query_projs[i](query_track))
+            if position_mask is not None:
+                h = self._apply_position_mask(h, self.query_pos_tokens[i], position_mask)
+            if query_present is not None:
+                keep = query_present[i]
+                h = h * keep + self.query_mask_tokens[i].view(1, 1, -1) * (1.0 - keep)
+            track_hidden.append(h)
+        for k, context_track in enumerate(context_tracks):
+            h = self.context_track_norms[k](self.context_track_projs[k](context_track))
+            if position_mask is not None:
+                h = self._apply_position_mask(h, self.context_pos_tokens[k], position_mask)
+            if track_present is not None:
+                keep = track_present[k]
+                h = h * keep + self.context_track_mask_tokens[k].view(1, 1, -1) * (1.0 - keep)
+            track_hidden.append(h)
+
+        sequence_hidden = self.sequence_norm(self.sequence_proj(sequence_tensor))
+        if sequence_present is not None:
+            sequence_hidden = (
+                sequence_hidden * sequence_present
+                + self.sequence_mask_token.view(1, 1, -1) * (1.0 - sequence_present)
+            )
+
+        # ----- one independent pass per query stream, each with its OWN context -----
+        context_cache: dict[tuple, torch.Tensor] = {}
+        preds = []
+        for i in range(self.num_queries):
+            key = tuple(self.context_specs[i])
+            context = context_cache.get(key)
+            if context is None:
+                context = self._fuse_context(sequence_hidden, track_hidden, self.context_specs[i])
+                context_cache[key] = context
+            hidden = track_hidden[i]
+            if self.position_encoding is not None:
+                hidden = self.position_encoding(hidden)
+            for block in self.blocks:
+                hidden = block(hidden, context)
+            preds.append(self.heads[i](self.final_norms[i](hidden)))
+        return preds

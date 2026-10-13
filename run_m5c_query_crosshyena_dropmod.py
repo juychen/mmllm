@@ -436,6 +436,7 @@ class PreparedSequenceAtacData:
     test_regions: int
     non_overlap_groups: int
     val_region_metadata: pd.DataFrame
+    split_info: dict
 
 
 def prepare_sequence_atac_crosshyena_data(
@@ -591,6 +592,7 @@ def prepare_sequence_atac_crosshyena_data(
             split_info["train_groups"] + split_info["val_groups"] + split_info["test_groups"]
         ),
         val_region_metadata=val_region_metadata,
+        split_info=split_info,
     )
 
 
@@ -1090,7 +1092,7 @@ def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, a
         test_loss=test_loss,
         test_r2=test_r2,
         test_pearsonr=test_pearsonr,
-        split_info=split_info,
+        split_info=prepared.split_info,
         signal_h5ad=signal_h5ad,
         regression_plot=regression_plot,
         checkpoint_paths={
