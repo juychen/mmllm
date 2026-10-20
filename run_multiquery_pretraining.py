@@ -246,16 +246,85 @@ def compute_masked_reconstruction_loss(
 # Training helpers
 # ---------------------------------------------------------------------------
 
+def load_model_from_checkpoint(
+    model: nn.Module,
+    checkpoint_path: str,
+    device: torch.device,
+) -> tuple[int, dict]:
+    """Warm-start ``model`` from a checkpoint written by this script.
+
+    Only the model weights are restored — optimizer, scheduler and epoch are
+    NOT, so training restarts at epoch 1 on the new data (curriculum
+    warm-start, same semantics as ``run_warmup_*_crosshyena.sh``).
+
+    Architecture mismatches raise instead of being skipped: a partial load
+    leaves randomly-initialised tensors in place and silently ruins the run.
+    """
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    if "model_state_dict" not in checkpoint:
+        raise ValueError(f"{checkpoint_path} has no 'model_state_dict' (not a checkpoint from this script?)")
+
+    pretrained = checkpoint["model_state_dict"]
+    own = model.state_dict()
+    missing = sorted(set(own) - set(pretrained))
+    unexpected = sorted(set(pretrained) - set(own))
+    mismatched = sorted(k for k in set(own) & set(pretrained) if own[k].shape != pretrained[k].shape)
+
+    if missing or unexpected or mismatched:
+        ckpt_args = checkpoint.get("args", {}) or {}
+        arch_keys = ("target_length", "hidden_dim", "num_blocks", "fusion_type",
+                     "context_mode", "query_tracks")
+        cache = {
+            "checkpoint": {k: ckpt_args.get(k) for k in arch_keys},
+            "current": {
+                "hidden_dim": int(model.context_norm.normalized_shape[0]),
+                "num_blocks": len(getattr(model, "blocks", [])),
+                "context_mode": getattr(model, "context_mode", None),
+                "num_queries": getattr(model, "num_queries", None),
+                "num_context_tracks": getattr(model, "num_context_tracks", None),
+            },
+        }
+        raise ValueError(
+            "checkpoint architecture does not match this model — refusing a partial load.\n"
+            f"  missing in checkpoint : {missing[:8]}{' ...' if len(missing) > 8 else ''}\n"
+            f"  unexpected in ckpt    : {unexpected[:8]}{' ...' if len(unexpected) > 8 else ''}\n"
+            f"  shape mismatch        : {[(k, tuple(own[k].shape), tuple(pretrained[k].shape)) for k in mismatched[:8]]}\n"
+            f"  arch                  : {cache}\n"
+            "  hint: keep --hidden-dim / --num-blocks / --context-mode / --query-tracks identical "
+            "to the checkpoint's training args (see checkpoint['args'])."
+        )
+
+    model.load_state_dict(pretrained, strict=True)
+    return int(checkpoint.get("epoch", 0)), checkpoint.get("args", {}) or {}
+
+
 def build_scheduler(optimizer: torch.optim.Optimizer, args, steps_per_experiment: int):
     if args.scheduler == "none":
         return None
     if args.scheduler == "cosine":
         total_steps = args.scheduler_t_max if args.scheduler_t_max > 0 else steps_per_experiment
         total_steps = max(1, total_steps)
+        warmup_epochs = max(0, int(getattr(args, "warmup_epochs", 0) or 0))
+        warmup_epochs = min(warmup_epochs, total_steps - 1)   # keep >= 1 cosine step
+        if warmup_epochs > 0:
+            warm = torch.optim.lr_scheduler.LinearLR(
+                optimizer,
+                start_factor=float(getattr(args, "warmup_start_factor", 0.1)),
+                end_factor=1.0,
+                total_iters=warmup_epochs,
+            )
+            cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=max(1, total_steps - warmup_epochs), eta_min=args.scheduler_min_lr,
+            )
+            return torch.optim.lr_scheduler.SequentialLR(
+                optimizer, schedulers=[warm, cosine], milestones=[warmup_epochs],
+            )
         return torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=total_steps, eta_min=args.scheduler_min_lr,
         )
     if args.scheduler == "plateau":
+        if getattr(args, "warmup_epochs", 0):
+            print("[build_scheduler] WARNING: --warmup-epochs is ignored with --scheduler plateau")
         return torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="min", factor=args.scheduler_factor,
             patience=args.scheduler_patience, min_lr=args.scheduler_min_lr,
@@ -627,6 +696,22 @@ def run_experiment(
     if args.gradient_checkpointing:
         enable_block_checkpointing(model)
 
+    # Optional curriculum warm-start: reload weights only (fresh optimizer /
+    # scheduler, training restarts at epoch 1) from a checkpoint of this same
+    # architecture — e.g. cCRE pre-training → whole-genome fine-tuning.
+    init_checkpoint = getattr(args, "init_from_checkpoint", "") or ""
+    if init_checkpoint:
+        init_epoch, init_args = load_model_from_checkpoint(model, init_checkpoint, device)
+        print(
+            f"[warm-start] loaded {init_checkpoint} (weights trained to epoch {init_epoch}); "
+            f"optimizer/scheduler reset, training restarts at epoch 1"
+        )
+        for key in ("target_length", "mask_mode", "augment_reverse_complement"):
+            prev = init_args.get(key)
+            cur = getattr(args, key, None)
+            if prev is not None and cur is not None and prev != cur:
+                print(f"[warm-start] WARNING: {key} changed {prev!r} -> {cur!r}")
+
     optimizer = build_optimizer(model, args)
     scheduler = build_scheduler(optimizer, args, args.num_epochs)
 
@@ -945,6 +1030,11 @@ def parse_args():
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--scheduler", choices=["none", "cosine", "plateau"], default="cosine")
     parser.add_argument("--scheduler-min-lr", type=float, default=1e-5)
+    parser.add_argument("--warmup-epochs", type=int, default=0,
+                        help="Linear LR warm-up over the first N epochs, then cosine decay over the rest "
+                             "(default 0 = off). Ignored by --scheduler plateau/none.")
+    parser.add_argument("--warmup-start-factor", type=float, default=0.1,
+                        help="LR multiplier for the first warm-up epoch (default 0.1 → ramps 0.1x → 1x).")
     parser.add_argument("--scheduler-factor", type=float, default=0.5)
     parser.add_argument("--scheduler-patience", type=int, default=2)
     parser.add_argument("--scheduler-t-max", type=int, default=0)
@@ -952,6 +1042,9 @@ def parse_args():
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--augment-reverse-complement", action="store_true")
+    parser.add_argument("--init-from-checkpoint", default="",
+                        help="Warm-start from a checkpoint saved by this script (same architecture). "
+                             "Only model weights are loaded; optimizer/scheduler/epoch are reset.")
     parser.add_argument("--seed", type=int, default=7)
     # track scaling
     parser.add_argument("--atac-scaling", choices=["none", "minmax"], default="minmax")
@@ -1001,6 +1094,10 @@ def main():
     print(f"  modality drop p   : 5mc={args.drop_p_5mc} 5hmc={args.drop_p_5hmc} "
           f"atac={args.drop_p_atac} rna={args.drop_p_rna} seq={args.drop_p_seq}")
     print(f"  blocks / hidden   : {args.num_blocks} / {args.hidden_dim}  (blocks shared across queries)")
+    print(f"  lr / warm-up      : {args.learning_rate} (min {args.scheduler_min_lr}) / "
+          f"{args.warmup_epochs} epochs (start x{args.warmup_start_factor})")
+    print(f"  init checkpoint   : {args.init_from_checkpoint or '-'}"
+          + ("  (weights only; optimizer reset)" if args.init_from_checkpoint else ""))
     print(f"  test pred .h5ad   : {'on' if args.export_test_h5ad else 'off'}"
           + (f"  → {args.test_h5ad_path}" if args.test_h5ad_path else "  (derived from best-checkpoint path)"))
     print("=" * 60)
