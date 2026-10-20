@@ -257,6 +257,195 @@ def export_prediction_signals_h5ad(
           f"→ {output_path}")
 
 
+def derive_test_h5ad_path(checkpoint_path: str) -> str:
+    """Default .h5ad path for test predictions next to a checkpoint.
+
+    ``..._best_80137.pt`` → ``..._test_pred_80137.h5ad``; any other name gets a
+    ``_test_pred`` suffix instead of clobbering the checkpoint or a sibling file.
+    """
+    path = str(checkpoint_path)
+    if "_best_" in path:
+        return path.replace("_best_", "_test_pred_").replace(".pt", ".h5ad")
+    if path.endswith(".pt"):
+        return path[: -len(".pt")] + "_test_pred.h5ad"
+    return path + "_test_pred.h5ad"
+
+
+def export_multiquery_predictions_h5ad(
+    output_path: str,
+    region_metadata: pd.DataFrame,
+    base_ids: np.ndarray,
+    predictions: dict[str, np.ndarray],
+    targets: dict[str, np.ndarray],
+    mask: np.ndarray,
+    *,
+    track_names: list[str] | None = None,
+    x_track: str | None = None,
+    positions: str = "cpg",
+    uns_extra: dict | None = None,
+) -> str:
+    """Export multi-query predictions to a single sparse .h5ad (AnnData).
+
+    One row per genomic window, one column per position in the window; only
+    predicted/reconstructed positions are stored as CSC sparse matrices
+    (everything else is implicitly 0).
+
+    Layout (aligned with :func:`export_prediction_signals_h5ad`):
+      .X                          predicted signal of ``x_track`` (default: first query)
+      .layers['pred_<track>']     predicted signal, one layer per query track
+      .layers['target_<track>']   ground-truth signal, one layer per query track
+      .layers['mask']             shared position mask (1 = masked / scored position)
+      .layers['base_encoded']     1=A 2=C 3=G 4=T (N is encoded as A, as in the dataset)
+      .layers['motif']            1=CG, 2=CH, 0=not C
+      .obs                        chr, start_expanded, end_expanded, [strand_view, original_idx]
+      .var                        position_idx (0-based offset inside the window)
+      .uns                        query_tracks, x_track, positions, mask_fraction, ...
+
+    Parameters
+    ----------
+    base_ids:
+        ``(N, L)`` integer array, A=0 C=1 G=2 T=3. Used to locate the C
+        positions (and CpG/CH motif).
+    positions:
+        Which positions to store:
+
+        * ``"cpg"`` (default) — the C **and** G of every CpG. This is exactly the
+          set that ``generate_pretraining_cpg_mask`` samples the shared position
+          mask from, so the export reproduces the reported masked metrics.
+          Note the forward signal tracks only carry a value on the C, i.e. the
+          target at G positions is 0; filter ``base_encoded == 2`` (C) for
+          biology-facing analyses.
+        * ``"cpg_forward"`` — only the C of forward-strand CpGs (the positions
+          the CG bedGraph tracks are actually defined on).
+        * ``"c"`` — every C.
+    """
+    import anndata as ad
+    from scipy.sparse import csc_matrix
+
+    output_path = str(output_path)
+    if not output_path.endswith(".h5ad"):
+        output_path += ".h5ad"
+    ensure_parent_dir(output_path)
+
+    def _2d(arr) -> np.ndarray:
+        arr = np.asarray(arr)
+        if arr.ndim == 3 and arr.shape[-1] == 1:
+            arr = arr[..., 0]
+        if arr.ndim != 2:
+            raise ValueError(f"expected a (N, L) or (N, L, 1) array, got shape {arr.shape}")
+        return arr
+
+    base_ids = _2d(base_ids)
+    N, L = base_ids.shape
+
+    names = list(track_names) if track_names else list(predictions.keys())
+    if not names:
+        raise ValueError("no query tracks to export")
+    missing = [n for n in names if n not in predictions or n not in targets]
+    if missing:
+        raise ValueError(f"missing predictions/targets for track(s): {missing}")
+
+    pred = {n: _2d(predictions[n]).astype(np.float32) for n in names}
+    tgt = {n: _2d(targets[n]).astype(np.float32) for n in names}
+    msk = (_2d(mask) > 0.5).astype(np.int8)
+
+    for n in names:
+        if pred[n].shape != (N, L) or tgt[n].shape != (N, L):
+            raise ValueError(f"track {n!r}: expected ({N}, {L}), got pred {pred[n].shape}, target {tgt[n].shape}")
+    if msk.shape != (N, L):
+        raise ValueError(f"mask: expected ({N}, {L}), got {msk.shape}")
+
+    # ----- which positions to store -----------------------------------------
+    is_c = base_ids == 1
+    is_g = base_ids == 2
+    right_is_g = np.zeros_like(is_c)
+    right_is_g[:, :-1] = is_g[:, 1:]
+    left_is_c = np.zeros_like(is_c)
+    left_is_c[:, 1:] = is_c[:, :-1]
+
+    if positions == "cpg":
+        # C and G of every CpG — exactly the set generate_pretraining_cpg_mask
+        # samples from, so the export reproduces the reported masked metrics.
+        selected = (is_c & right_is_g) | (is_g & left_is_c)
+    elif positions == "cpg_forward":
+        selected = is_c & right_is_g
+    elif positions == "c":
+        selected = is_c
+    else:
+        raise ValueError(f"unknown positions={positions!r} (expected 'cpg', 'cpg_forward' or 'c')")
+
+    rows, cols = np.nonzero(selected)
+    nnz = len(rows)
+    if nnz == 0:
+        print(f"[export_multiquery_predictions_h5ad] WARNING: no {positions} positions found → "
+              f"{output_path.replace('.h5ad', '.empty.info')}")
+        Path(output_path.replace(".h5ad", ".empty.info")).touch()
+        return output_path
+
+    shape = (N, L)
+    x_name = x_track if x_track in pred else names[0]
+
+    # ----- .obs: region-level metadata --------------------------------------
+    obs_cols = ["chr", "start_expanded", "end_expanded", "strand_view"]
+    available = [c for c in obs_cols if c in region_metadata.columns]
+    if len(region_metadata) != N:
+        raise ValueError(f"region_metadata has {len(region_metadata)} rows, expected {N}")
+    obs_df = region_metadata[available].reset_index(drop=True).copy()
+    if "original_idx" in region_metadata.columns:
+        obs_df["original_idx"] = region_metadata["original_idx"].values
+    obs_df.index = [
+        f"{row['chr']}:{int(row['start_expanded'])}-{int(row['end_expanded'])}"
+        + (f":{int(row['original_idx'])}" if "original_idx" in obs_df.columns else "")
+        for _, row in obs_df.iterrows()
+    ]
+    if obs_df.index.duplicated().any():
+        obs_df.index = pd.Index([f"{name}-{i}" for i, name in enumerate(obs_df.index)])
+
+    # ----- .var: position offset inside the window --------------------------
+    var_df = pd.DataFrame({"position_idx": np.arange(L, dtype=np.int32)})
+    var_df.index = [f"pos_{j}" for j in range(L)]
+
+    # ----- sparse layers ----------------------------------------------------
+    def _csc(values: np.ndarray, dtype) -> "csc_matrix":
+        return csc_matrix((values, (rows, cols)), shape=shape, dtype=dtype)
+
+    adata = ad.AnnData(X=_csc(pred[x_name][rows, cols], np.float32), obs=obs_df, var=var_df)
+    for n in names:
+        adata.layers[f"pred_{n}"] = _csc(pred[n][rows, cols], np.float32)
+        adata.layers[f"target_{n}"] = _csc(tgt[n][rows, cols], np.float32)
+    adata.layers["mask"] = _csc(msk[rows, cols], np.int8)
+    adata.layers["base_encoded"] = _csc((base_ids[rows, cols] + 1).astype(np.int8), np.int8)
+
+    if positions == "c":
+        motif_vals = np.full(nnz, 2, dtype=np.int8)   # CH by default
+        next_is_g = (cols + 1 < L) & (base_ids[rows, np.minimum(cols + 1, L - 1)] == 2)
+        motif_vals[next_is_g] = 1                     # CG
+    else:
+        motif_vals = np.ones(nnz, dtype=np.int8)      # every stored position is CG
+    adata.layers["motif"] = _csc(motif_vals, np.int8)
+
+    # ----- .uns -------------------------------------------------------------
+    adata.uns["query_tracks"] = names
+    adata.uns["x_track"] = x_name
+    adata.uns["positions"] = positions
+    for key, value in (uns_extra or {}).items():
+        if value is None:
+            continue
+        if isinstance(value, dict):
+            value = {str(k): float(v) if isinstance(v, (int, float, np.floating)) else str(v)
+                     for k, v in value.items()}
+        elif isinstance(value, (np.floating, np.integer)):
+            value = value.item()
+        adata.uns[str(key)] = value
+
+    adata.write(output_path, compression="gzip")
+    density_pct = 100.0 * nnz / max(N * L, 1)
+    print(f"[export_multiquery_predictions_h5ad] {N:,} regions × {L:,} positions, "
+          f"{nnz:,} {positions} positions ({density_pct:.2f}% density) | tracks={names} | "
+          f"X={x_name} → {output_path}")
+    return output_path
+
+
 def plot_regression_predictions(
     output_path: str,
     predictions,

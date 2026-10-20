@@ -23,6 +23,9 @@
 #   NUM_WORKERS=8                   dataloader workers (default 8)
 #   NUM_EPOCHS=100                  max epochs (default 100)
 #   MAX_CONCURRENT=4                max parallel jobs (default 4; auto-capped to the #idle GPUs)
+#   TEST_H5AD=1                     export test-set predictions to .h5ad after the final
+#                                   test eval (default 1; set 0 to skip)
+#   TEST_H5AD_POSITIONS=cpg         positions stored: cpg | cpg_forward | c
 #   OUT_TAG=                        extra label appended to the run label
 #   GPUS="1 4 6 7"                  OPTIONAL manual override (round-robin over just these)
 #   MIN_FREE_MIB=40000              a GPU qualifies only with >= this much free  (auto mode)
@@ -53,6 +56,14 @@ num_workers="${NUM_WORKERS:-8}"
 num_epochs="${NUM_EPOCHS:-100}"
 max_concurrent="${MAX_CONCURRENT:-4}"
 out_tag="${OUT_TAG:-}"
+
+# ---- test-prediction .h5ad export (on by default) ---------------------------
+test_h5ad="${TEST_H5AD:-1}"
+test_h5ad_positions="${TEST_H5AD_POSITIONS:-cpg}"
+h5ad_args=()
+if [[ "$test_h5ad" == "0" ]]; then
+  h5ad_args+=(--no-export-test-h5ad)
+fi
 
 # ---- GPU selection (auto unless GPUS is set) --------------------------------
 min_free_mib="${MIN_FREE_MIB:-40000}"
@@ -131,7 +142,7 @@ run_experiment() {
   fi
 
   echo "[$(date)] [${region}_${condition}] GPU${gpu} | multi-query masked pretraining (BED: ${bed_name})" | tee -a "$log_file"
-  echo "[$(date)] [${region}_${condition}] queries=5mc,5hmc | context_mode=${context_mode} | context=atac,rna,seq | mask_fraction=${mask_fraction} | drops: s=${seq_drop_p} a=${atac_drop_p} r=${rna_drop_p} | bs=${batch_size} accum=${grad_accum} workers=${num_workers}" | tee -a "$log_file"
+  echo "[$(date)] [${region}_${condition}] queries=5mc,5hmc | context_mode=${context_mode} | context=atac,rna,seq | mask_fraction=${mask_fraction} | drops: s=${seq_drop_p} a=${atac_drop_p} r=${rna_drop_p} | bs=${batch_size} accum=${grad_accum} workers=${num_workers} | test_h5ad=${test_h5ad}(${test_h5ad_positions})" | tee -a "$log_file"
 
   CUDA_VISIBLE_DEVICES="$gpu" python run_multiquery_pretraining.py \
     --sample-sizes "$sample_sizes" \
@@ -166,6 +177,8 @@ run_experiment() {
     --output-json "${output_dir}/${current_time}_${run_label}_results.json" \
     --best-checkpoint-path "${output_dir}/${current_time}_${run_label}_best_{sample_size}.pt" \
     --last-checkpoint-path "${output_dir}/${current_time}_${run_label}_last_{sample_size}.pt" \
+    --test-h5ad-positions "$test_h5ad_positions" \
+    "${h5ad_args[@]}" \
     2>&1 | tee -a "$log_file"
 
   local exit_code=${PIPESTATUS[0]}

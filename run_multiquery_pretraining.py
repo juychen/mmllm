@@ -65,7 +65,13 @@ from data import (
     write_train_val_beds,
 )
 from models import MultiQueryMaskedPretrainingModel
-from utils import get_freest_gpu, resolve_sample_sizes, set_random_seed
+from utils import (
+    derive_test_h5ad_path,
+    export_multiquery_predictions_h5ad,
+    get_freest_gpu,
+    resolve_sample_sizes,
+    set_random_seed,
+)
 
 
 ALL_TRACKS = ["5mc", "5hmc", "atac", "rna"]
@@ -411,6 +417,37 @@ def prepare_data(num_dmrs: int, args, track_order: list[str]) -> PreparedData:
 # Evaluation
 # ---------------------------------------------------------------------------
 
+def _loader_region_metadata(loader, n_samples: int) -> "pd.DataFrame":
+    """Region metadata (chr/start/end/...) in the order ``loader`` yields samples.
+
+    Only valid for a sequential, non-augmented loader (val/test): the exported
+    rows must align 1:1 with the prediction tensor, so shuffling and
+    reverse-complement doubling are rejected rather than silently misaligned.
+    """
+    dataset = loader.dataset
+    base = getattr(dataset, "base", dataset)
+    if not isinstance(loader.sampler, torch.utils.data.SequentialSampler):
+        raise ValueError("prediction export requires a sequential loader (shuffle=False)")
+    if getattr(base, "augment_rc", False):
+        raise ValueError("prediction export requires augment_rc=False")
+    if n_samples != len(base):
+        raise ValueError(f"loader yielded {n_samples} samples but dataset has {len(base)}")
+    rows = []
+    for k in range(n_samples):
+        row = base.df_dmr.iloc[base.indices[k % base.N]]
+        entry = {
+            "chr": str(row["chr"]),
+            "start_expanded": int(row["start_expanded"]),
+            "end_expanded": int(row["end_expanded"]),
+        }
+        if "strand_view" in row.index:
+            entry["strand_view"] = row["strand_view"]
+        if "original_idx" in row.index:
+            entry["original_idx"] = int(row["original_idx"])
+        rows.append(entry)
+    return pd.DataFrame(rows)
+
+
 def evaluate(
     model: nn.Module,
     loader,
@@ -420,13 +457,19 @@ def evaluate(
     context_tracks: list[str],
     amp: bool = False,
     mask_seed: int | None = None,
-) -> dict[str, float]:
+    return_predictions: bool = False,
+):
     """Reconstruction metrics on a held-out loader (query tracks are the heads).
 
     Position masks are seeded (``mask_seed + batch_index``) so repeated
     evaluations are comparable across epochs; modality dropout is NOT applied at
     eval — every track is present, only positions are masked. Metrics are
     computed on masked positions only, per query head.
+
+    With ``return_predictions=True`` returns ``(metrics, payload)`` where payload
+    carries dense per-window ``predictions``/``targets``/``mask`` arrays,
+    ``base_ids`` and the matching ``region_metadata`` — ready to hand to
+    :func:`utils.export_multiquery_predictions_h5ad`.
     """
     model.eval()
     amp_dtype = torch.bfloat16 if amp else torch.float32
@@ -438,6 +481,7 @@ def evaluate(
     all_preds = {name: [] for name in query_tracks}
     all_targets = {name: [] for name in query_tracks}
     all_masks = {name: [] for name in query_tracks}
+    all_base_ids: list[torch.Tensor] = []
 
     with torch.no_grad():
         for batch_index, batch in enumerate(loader):
@@ -469,6 +513,8 @@ def evaluate(
                 all_preds[name].append(pred.detach().cpu())
                 all_targets[name].append(target.detach().cpu())
                 all_masks[name].append(position_mask.detach().cpu())
+            if return_predictions:
+                all_base_ids.append(base_ids_batch.detach().cpu())
 
     denom = max(seen, 1)
     result = {f"val_{name}_loss": track_loss_sums[name] / denom for name in query_tracks}
@@ -497,7 +543,18 @@ def evaluate(
         denom_pearson = (centered_target.pow(2).sum() * centered_pred.pow(2).sum()).sqrt().clamp_min(1e-12)
         result[f"val_{name}_pearsonr"] = float(((centered_target * centered_pred).sum() / denom_pearson).item())
 
-    return result
+    if not return_predictions:
+        return result
+
+    payload = {
+        "predictions": {n: torch.cat(all_preds[n], dim=0).squeeze(-1).float().numpy() for n in query_tracks},
+        "targets": {n: torch.cat(all_targets[n], dim=0).squeeze(-1).float().numpy() for n in query_tracks},
+        # one shared position mask by construction — any track's copy is the same
+        "mask": torch.cat(all_masks[query_tracks[0]], dim=0).squeeze(-1).float().numpy(),
+        "base_ids": torch.cat(all_base_ids, dim=0).numpy().astype(np.uint8),
+        "region_metadata": _loader_region_metadata(loader, seen),
+    }
+    return result, payload
 
 
 # ---------------------------------------------------------------------------
@@ -531,6 +588,7 @@ class ExperimentResult:
     test_pearsonr: dict[str, float] | None
     split_info: dict
     checkpoint_paths: dict
+    test_h5ad_path: str = ""
 
 
 def run_experiment(
@@ -735,18 +793,55 @@ def run_experiment(
         )
 
     # Held-out test: evaluated exactly once on the best checkpoint with its own
-    # fixed mask seed, so the reported numbers are reproducible.
+    # fixed mask seed, so the reported numbers are reproducible.  The per-window
+    # predictions are exported to .h5ad (on by default) for downstream analysis.
     test_metrics: dict[str, float] | None = None
+    test_h5ad_path = ""
     if prepared.test_loader is not None:
-        test_metrics = evaluate(
-            model, prepared.test_loader, device, args.mask_fraction,
-            query_tracks, context_tracks, amp=args.amp, mask_seed=args.seed + 2000,
-        )
+        test_payload = None
+        if args.export_test_h5ad:
+            test_metrics, test_payload = evaluate(
+                model, prepared.test_loader, device, args.mask_fraction,
+                query_tracks, context_tracks, amp=args.amp, mask_seed=args.seed + 2000,
+                return_predictions=True,
+            )
+        else:
+            test_metrics = evaluate(
+                model, prepared.test_loader, device, args.mask_fraction,
+                query_tracks, context_tracks, amp=args.amp, mask_seed=args.seed + 2000,
+            )
         test_detail = ", ".join(
             f"{n}: R²={test_metrics[f'val_{n}_r2']:.4f} ρ={test_metrics[f'val_{n}_pearsonr']:.4f}"
             for n in query_tracks
         )
         print(f"FINAL TEST METRICS (report once): total={test_metrics['val_total_loss']:.4f} | {test_detail}")
+
+        if test_payload is not None:
+            h5ad_template = args.test_h5ad_path or derive_test_h5ad_path(best_checkpoint_path)
+            test_h5ad_path = h5ad_template.format(
+                sample_size=prepared.usable_dmrs, timestamp=args.timestamp,
+            )
+            try:
+                export_multiquery_predictions_h5ad(
+                    test_h5ad_path,
+                    test_payload["region_metadata"],
+                    test_payload["base_ids"],
+                    test_payload["predictions"],
+                    test_payload["targets"],
+                    test_payload["mask"],
+                    track_names=query_tracks,
+                    positions=args.test_h5ad_positions,
+                    uns_extra={
+                        "split": "test",
+                        "mask_fraction": args.mask_fraction,
+                        "test_r2": {n: test_metrics[f"val_{n}_r2"] for n in query_tracks},
+                        "test_pearsonr": {n: test_metrics[f"val_{n}_pearsonr"] for n in query_tracks},
+                        "checkpoint": str(best_checkpoint_path),
+                    },
+                )
+            except Exception as exc:                     # never fail a finished run on export
+                test_h5ad_path = ""
+                print(f"[h5ad] WARNING: test prediction export failed: {exc}")
 
     def _track_dict(metrics: dict[str, float], key: str) -> dict[str, float]:
         return {name: float(metrics.get(f"val_{name}_{key}", float("nan"))) for name in query_tracks}
@@ -777,6 +872,7 @@ def run_experiment(
         test_pearsonr=_track_dict(test_metrics, "pearsonr") if test_metrics is not None else None,
         split_info=prepared.split_info,
         checkpoint_paths={"best": best_checkpoint_path, "last": last_checkpoint_path},
+        test_h5ad_path=test_h5ad_path,
     )
 
 
@@ -870,6 +966,17 @@ def parse_args():
     parser.add_argument("--timestamp", default="")
     parser.add_argument("--best-checkpoint-path", default="output/multiquery_mm_best_{sample_size}.pt")
     parser.add_argument("--last-checkpoint-path", default="output/multiquery_mm_last_{sample_size}.pt")
+    parser.add_argument("--export-test-h5ad", action=argparse.BooleanOptionalAction, default=True,
+                        help="Export the held-out TEST predictions/targets/mask to .h5ad after the final "
+                             "test evaluation (default: on; disable with --no-export-test-h5ad).")
+    parser.add_argument("--test-h5ad-path",
+                        default="",
+                        help="Output template for the test .h5ad ({sample_size} and {timestamp} are "
+                             "substituted). Empty (default) derives it from --best-checkpoint-path by "
+                             "replacing '_best_' with '_test_pred_' and '.pt' with '.h5ad'.")
+    parser.add_argument("--test-h5ad-positions", choices=["cpg", "cpg_forward", "c"], default="cpg",
+                        help="Positions stored in the test .h5ad: 'cpg' (C and G of every CpG; matches the "
+                             "masked metric, default), 'cpg_forward' (forward-strand C only) or 'c' (all C).")
     return parser.parse_args()
 
 
@@ -894,6 +1001,8 @@ def main():
     print(f"  modality drop p   : 5mc={args.drop_p_5mc} 5hmc={args.drop_p_5hmc} "
           f"atac={args.drop_p_atac} rna={args.drop_p_rna} seq={args.drop_p_seq}")
     print(f"  blocks / hidden   : {args.num_blocks} / {args.hidden_dim}  (blocks shared across queries)")
+    print(f"  test pred .h5ad   : {'on' if args.export_test_h5ad else 'off'}"
+          + (f"  → {args.test_h5ad_path}" if args.test_h5ad_path else "  (derived from best-checkpoint path)"))
     print("=" * 60)
 
     results = []
