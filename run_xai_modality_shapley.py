@@ -383,6 +383,22 @@ def make_loader(merged: dict, split_df: pd.DataFrame, indices, track_order: list
     return dataset, loader
 
 
+def donor_source_indices(ctx, split_name: str, selected: np.ndarray) -> np.ndarray:
+    """Windows used as 'this modality elsewhere' donors.
+
+    Prefer the OTHER splits: the train/val/test groups are non-overlapping by
+    construction, so a donor can never be the same locus as the explained window
+    (which would make the intervention nearly a no-op).  When the run only has a
+    single split, fall back to that split and let the caller exclude self.
+    """
+    other = [name for name in ("test", "val", "train") if name != split_name]
+    parts = [np.asarray(ctx["split_idx"][name], dtype=np.int64) for name in other]
+    source = np.concatenate(parts) if parts else np.array([], dtype=np.int64)
+    if source.size == 0:
+        source = np.asarray(ctx["split_idx"][split_name], dtype=np.int64)
+    return source
+
+
 def sample_window_indices(indices: np.ndarray, n_windows: int, seed: int) -> np.ndarray:
     """Deterministic subset of rows, returned in ascending order (genomic order)."""
     indices = np.asarray(indices, dtype=np.int64)
@@ -455,15 +471,18 @@ def permuted_track(track: torch.Tensor, rng: np.random.Generator) -> torch.Tenso
 class DonorPool:
     """A small cache of real windows used as 'this modality elsewhere' donors."""
 
-    def __init__(self, tensors: dict[str, torch.Tensor], means: dict[str, float]):
+    def __init__(self, tensors: dict[str, torch.Tensor], means: dict[str, float],
+                 indices: np.ndarray | None = None):
         self.tensors = tensors
         self.means = means
+        self.indices = indices
         self.size = len(next(iter(tensors.values()))) if tensors else 0
 
     @classmethod
     def build(cls, merged, split_df, pool_indices, track_order, n_tracks):
         if len(pool_indices) == 0:
             return cls({}, {})
+        pool_indices = np.asarray(pool_indices, dtype=np.int64)
         _, loader = make_loader(
             merged, split_df, pool_indices, track_order,
             batch_size=min(16, len(pool_indices)), num_workers=0,
@@ -477,7 +496,7 @@ class DonorPool:
         means = {name: float(t.numpy().mean()) for name, t in tensors.items()}
         print(f"[donor] pool of {len(next(iter(tensors.values())))} windows | "
               + ", ".join(f"{k}={v:.4f}" for k, v in means.items()))
-        return cls(tensors, means)
+        return cls(tensors, means, pool_indices)
 
     def gather(self, name: str, donor_ids: np.ndarray, device) -> torch.Tensor:
         return self.tensors[name][donor_ids].to(device)
@@ -720,10 +739,17 @@ def scored_positions(base_ids: torch.Tensor, position_mask: torch.Tensor,
 
 def cluster_bootstrap_mean(per_window_sum: np.ndarray, per_window_count: np.ndarray,
                            n_boot: int, seed: int) -> tuple[float, float, float]:
-    """Window-level bootstrap CI for a ratio of sums (CpGs are autocorrelated)."""
+    """Window-level bootstrap CI for a ratio of sums (CpGs are autocorrelated).
+
+    With fewer than two windows the CI is undefined (there is nothing to
+    resample), so the bounds come back as NaN while the point estimate is kept.
+    """
     total_count = per_window_count.sum()
     if per_window_sum.size == 0 or total_count == 0:
         return float("nan"), float("nan"), float("nan")
+    point = float(per_window_sum.sum() / total_count)
+    if per_window_sum.size < 2:
+        return point, float("nan"), float("nan")
     rng = np.random.default_rng(seed)
     n = per_window_sum.size
     means = np.empty(n_boot, dtype=np.float64)
@@ -731,9 +757,8 @@ def cluster_bootstrap_mean(per_window_sum: np.ndarray, per_window_count: np.ndar
         idx = rng.integers(0, n, size=n)
         denom = per_window_count[idx].sum()
         means[i] = per_window_sum[idx].sum() / denom if denom else np.nan
-    point = per_window_sum.sum() / total_count
     lo, hi = np.nanpercentile(means, [2.5, 97.5])
-    return float(point), float(lo), float(hi)
+    return point, float(lo), float(hi)
 
 
 def spearman(a: np.ndarray, b: np.ndarray) -> float:
@@ -832,6 +857,248 @@ def cmd_verify(opts) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Region selection (single window / locus)
+# ---------------------------------------------------------------------------
+
+def parse_locus(spec: str) -> tuple[str, int, int]:
+    """Parse ``chr9:119592828-119609211`` (1-based, inclusive, commas ok)."""
+    text = str(spec).replace(",", "").replace(" ", "")
+    if ":" not in text:
+        raise SystemExit(f"--locus {spec!r} must look like chr9:119592828-119609211")
+    chrom, coords = text.split(":", 1)
+    if "-" not in coords:
+        raise SystemExit(f"--locus {spec!r} has no '-start-end' part")
+    start_text, end_text = coords.split("-", 1)
+    try:
+        start, end = int(start_text), int(end_text)
+    except ValueError:
+        raise SystemExit(f"--locus {spec!r}: start/end must be integers")
+    if start > end:
+        raise SystemExit(f"--locus {spec!r}: start > end")
+    return chrom, start, end
+
+
+def select_region_windows(split_df: pd.DataFrame, split_indices: np.ndarray,
+                          split_name: str, locus: str | None = None,
+                          original_idx: int | None = None) -> np.ndarray:
+    """Resolve one written region to exactly one window index.
+
+    Matching tiers for ``--locus``: exact expanded window -> window containing the
+    locus -> window overlapping the locus.  A tier that yields several windows is
+    reported (never silently resolved), because overlapping 16 kb windows are
+    common and picking one at random would change the answer.
+    """
+    indices = np.asarray(split_indices, dtype=np.int64)
+    rows = split_df.iloc[indices].reset_index(drop=True)
+
+    if original_idx is not None:
+        matches = rows["original_idx"].to_numpy(dtype=np.int64) == int(original_idx)
+        hits = indices[matches]
+        if hits.size == 1:
+            row = rows.loc[matches].iloc[0]
+            print(f"[region] original_idx={int(original_idx)} -> "
+                  f"{row['chr']}:{int(row['start_expanded'])}-{int(row['end_expanded'])}")
+            return hits
+        if hits.size > 1:
+            raise SystemExit(
+                f"--window-original-idx {original_idx} matches {hits.size} rows in "
+                f"split={split_name}; the DMR table has duplicate original_idx values"
+            )
+        exists = int(original_idx) in set(
+            split_df["original_idx"].to_numpy(dtype=np.int64)
+        )
+        raise SystemExit(
+            f"--window-original-idx {original_idx} is not in split={split_name}"
+            + ("" if not exists else " (it exists in the dataset, try another --split)")
+            + "\n  hint: column 4 of *_test_regions.bed is original_idx"
+        )
+
+    chrom, start, end = parse_locus(locus)
+    chr_mask = rows["chr"].astype(str).to_numpy() == chrom
+    if not chr_mask.any():
+        available = sorted(set(rows["chr"].astype(str)))
+        raise SystemExit(
+            f"--locus chromosome {chrom!r} is not in split={split_name}; "
+            f"available: {available}"
+        )
+    starts = rows["start_expanded"].to_numpy(dtype=np.int64)
+    ends = rows["end_expanded"].to_numpy(dtype=np.int64)
+    tiers = (
+        ("exact", chr_mask & (starts == start) & (ends == end)),
+        ("containing", chr_mask & (starts <= start) & (ends >= end)),
+        ("overlapping", chr_mask & (starts <= end) & (ends >= start)),
+    )
+    for tier, hit_mask in tiers:
+        hits = indices[hit_mask]
+        if hits.size == 1:
+            row = rows.loc[hit_mask].iloc[0]
+            print(f"[region] {tier} match -> {row['chr']}:"
+                  f"{int(row['start_expanded'])}-{int(row['end_expanded'])} "
+                  f"(original_idx={int(row['original_idx'])})")
+            return hits
+        if hits.size > 1:
+            preview = rows.loc[hit_mask, ["chr", "start_expanded", "end_expanded",
+                                          "original_idx"]].head(8)
+            raise SystemExit(
+                f"--locus {locus!r} {tier}-matches {hits.size} windows in split="
+                f"{split_name}; disambiguate with --window-original-idx.\n"
+                + preview.to_string(index=False)
+            )
+    raise SystemExit(
+        f"--locus {locus!r} no longer falls inside any window of split={split_name}"
+    )
+
+
+def read_bed_raw(bed_path: str) -> dict[str, list[tuple[int, int]]]:
+    """Parse a BED into {chrom: [(start, end), ...]} WITHOUT merging intervals.
+
+    ``data._load_split_bed`` merges overlapping intervals, which is right for
+    "does this window overlap the region set" but destroys exact-window lists
+    (the 16 kb windows of this project overlap each other heavily).
+    """
+    import gzip
+
+    opener = gzip.open if str(bed_path).endswith(".gz") else open
+    raw: dict[str, list[tuple[int, int]]] = {}
+    with opener(bed_path, "rt") as handle:
+        for line in handle:
+            line = line.rstrip("\n")
+            if not line or line.startswith(("#", "track", "browser")):
+                continue
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            try:
+                start, end = int(parts[1]), int(parts[2])
+            except ValueError:
+                continue
+            if end > start:
+                raw.setdefault(parts[0], []).append((start, end))
+    return raw
+
+
+def region_bed_mask(split_df: pd.DataFrame, indices: np.ndarray, bed_path: str,
+                    mode: str = "overlap") -> tuple[np.ndarray, dict]:
+    """Boolean mask over ``indices`` for the windows selected by ``bed_path``.
+
+    ``mode='overlap'`` (default): any dataset window overlapping a BED interval,
+    the same semantics as ``--test-bed`` during training.  16 kb windows overlap
+    each other, so a short BED can legitimately pull in more windows than it
+    lists — both counts are printed by ``select_bed_windows``.
+
+    ``mode='exact'``: only windows whose coordinates are listed in the BED
+    (0-based half-open), i.e. "the BED is a list of windows".
+
+    Chromosome names are normalised, so a BED written as ``9`` matches data
+    stored as ``chr9``.
+    """
+    from data import _windows_overlapping_bed
+
+    bed = read_bed_raw(bed_path)
+    if not bed:
+        raise SystemExit(f"--region-bed {bed_path}: no valid intervals found")
+
+    data_chroms = set(split_df["chr"].astype(str))
+    raw: dict[str, list[tuple[int, int]]] = {}
+    for chrom, intervals in bed.items():
+        if chrom in data_chroms:
+            key = chrom
+        elif chrom.startswith("chr") and chrom[3:] in data_chroms:
+            key = chrom[3:]
+        elif "chr" + chrom in data_chroms:
+            key = "chr" + chrom
+        else:
+            key = chrom
+        raw.setdefault(key, []).extend(intervals)
+
+    rows = split_df.iloc[indices]
+    if mode == "exact":
+        want = {(chrom, start, end)
+                for chrom, intervals in raw.items() for start, end in intervals}
+        hit = np.asarray([
+            (str(row["chr"]), int(row["start_expanded"]) - 1, int(row["end_expanded"])) in want
+            for _, row in rows.iterrows()
+        ], dtype=bool)
+        return hit, raw
+    if mode != "overlap":
+        raise SystemExit(f"unknown --region-mode {mode!r} (use overlap or exact)")
+
+    merged: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for chrom, intervals in raw.items():
+        intervals.sort()
+        out: list[list[int]] = []
+        for start, end in intervals:
+            if out and start <= out[-1][1]:
+                out[-1][1] = max(out[-1][1], end)
+            else:
+                out.append([start, end])
+        arr = np.asarray(out, dtype=np.int64)
+        merged[chrom] = (arr[:, 0], arr[:, 1])
+
+    mask = _windows_overlapping_bed(
+        rows["chr"].astype(str).to_numpy(),
+        rows["start_expanded"].to_numpy(dtype=np.int64),
+        rows["end_expanded"].to_numpy(dtype=np.int64),
+        merged,
+    )
+    return mask, raw
+
+
+def select_bed_windows(ctx, opts, split_name: str, split_indices: np.ndarray,
+                       seed: int) -> np.ndarray:
+    """Resolve ``--region-bed`` to the set of windows to explain."""
+    composition = {}
+    if opts.region_split_any:
+        parts = []
+        for name in ("train", "val", "test"):
+            arr = np.asarray(ctx["split_idx"][name], dtype=np.int64)
+            composition[name] = arr
+            parts.append(arr)
+        candidate = np.concatenate(parts) if parts else np.array([], dtype=np.int64)
+    else:
+        candidate = np.asarray(split_indices, dtype=np.int64)
+
+    mask_overlap, bed = region_bed_mask(ctx["split_df"], candidate,
+                                        opts.region_bed, mode="overlap")
+    mask_exact, _ = region_bed_mask(ctx["split_df"], candidate,
+                                    opts.region_bed, mode="exact")
+    mask = mask_exact if opts.region_mode == "exact" else mask_overlap
+    selected = candidate[mask]
+
+    if composition:
+        counts = {name: int(np.isin(selected, arr).sum())
+                  for name, arr in composition.items()}
+        print(f"[region] BED hits by split: {counts}")
+        if counts.get("train") and not opts.allow_train_split:
+            raise SystemExit(
+                f"--region-bed hits {counts['train']} TRAIN windows; they are "
+                f"memorised. Pass --allow-train-split to include them, or drop "
+                f"--region-split-any to stay inside --split {split_name}."
+            )
+
+    n_intervals = sum(len(intervals) for intervals in bed.values())
+    print(f"[region] --region-bed {opts.region_bed}: {n_intervals} intervals on "
+          f"{len(bed)} chromosomes | {len(candidate)} candidate windows | "
+          f"overlap={int(mask_overlap.sum())} exact={int(mask_exact.sum())} "
+          f"-> using {opts.region_mode} ({selected.size} windows)")
+    if selected.size == 0:
+        raise SystemExit(
+            f"--region-bed {opts.region_bed} selects no window of split={split_name} "
+            f"(mode={opts.region_mode}).\n"
+            f"  BED chromosomes : {sorted(bed)[:10]}\n"
+            f"  data chromosomes: {sorted(set(ctx['split_df']['chr'].astype(str)))[:10]}\n"
+            "  hint: the BED must be 0-based half-open, same assembly (mm10) and "
+            "same chromosome naming (chr9 or 9 both work); if you meant to list "
+            "windows, use --region-mode exact"
+        )
+    if opts.n_windows:
+        selected = sample_window_indices(selected, int(opts.n_windows), seed)
+        print(f"[region] sub-sampled to {selected.size} windows "
+              f"(--n-windows {opts.n_windows})")
+    return np.sort(selected)
+
+
+# ---------------------------------------------------------------------------
 # Command: shapley
 # ---------------------------------------------------------------------------
 
@@ -855,8 +1122,25 @@ def cmd_shapley(opts) -> int:
             "refusing to attribute on training windows (memorised); pass "
             "--allow-train-split if you really mean it"
         )
-    indices = np.asarray(ctx["split_idx"][split], dtype=np.int64)
-    selected = sample_window_indices(indices, opts.n_windows, int(merged["seed"]))
+    seed = int(merged["seed"])
+    split_indices = np.asarray(ctx["split_idx"][split], dtype=np.int64)
+    if opts.locus and opts.window_original_idx is not None:
+        raise SystemExit("use either --locus or --window-original-idx, not both")
+    single_region = bool(opts.locus) or opts.window_original_idx is not None
+    if single_region and opts.region_bed:
+        raise SystemExit("--region-bed cannot be combined with "
+                         "--locus/--window-original-idx")
+    if single_region:
+        if opts.n_windows:
+            raise SystemExit("--n-windows cannot be combined with a single-window selector")
+        selected = select_region_windows(
+            split_df, split_indices, split,
+            locus=opts.locus, original_idx=opts.window_original_idx,
+        )
+    elif opts.region_bed:
+        selected = select_bed_windows(ctx, opts, split, split_indices, seed)
+    else:
+        selected = sample_window_indices(split_indices, opts.n_windows, seed)
     n_windows = len(selected)
     if n_windows == 0:
         raise SystemExit(f"no windows in split={split}")
@@ -871,8 +1155,15 @@ def cmd_shapley(opts) -> int:
                                        query_tracks, context_tracks)
 
     print()
-    print(f"[xai] head={head} split={split} windows={n_windows}/{len(indices)} | "
+    print(f"[xai] head={head} split={split} windows={n_windows}/{len(split_indices)} | "
           f"players={n_players} coalitions={n_coalitions} absence={opts.absence}")
+    if single_region:
+        row = split_df.iloc[int(selected[0])]
+        print(f"[region] window {row['chr']}:{int(row['start_expanded'])}-"
+              f"{int(row['end_expanded'])} (original_idx={row['original_idx']})")
+    if n_windows == 1:
+        print("[region] single-window mode: report per-CpG attribution and the "
+              "window's own share; the cluster-bootstrap CI is undefined (n/a)")
     for i, p in enumerate(players):
         role = "own trunk" if p.slot == head_idx else "context"
         print(f"      player {i}: {p.label:<12s} slot={p.slot} kind={p.kind} ({role})")
@@ -882,13 +1173,13 @@ def cmd_shapley(opts) -> int:
         print("[xai] --dry-run: resolved everything, not touching the model")
         return 0
 
-    est_min = n_windows * n_coalitions * 0.043 / 60
+    # ~0.012 s per coalition-forward measured at batch 8 on one GPU
+    est_min = n_windows * n_coalitions * 0.012 / 60
     print(f"[xai] rough estimate: {est_min:.0f} min on one GPU for {n_windows} windows")
-    if n_windows > 3000:
-        print(f"[xai] WARNING: {n_windows} windows is large; "
-              f"consider --n-windows 1500", file=sys.stderr)
+    if n_windows >= 3000:
+        print(f"[xai] NOTE: {n_windows} windows is a full-split-scale run "
+              f"(~{est_min:.0f} min); run it in tmux/nohup for safety")
 
-    seed = int(merged["seed"])
     rng_donor = np.random.default_rng(seed + 12)
     rng_seq = np.random.default_rng(seed + 13)
     rng_perm = np.random.default_rng(seed + 14)
@@ -898,11 +1189,11 @@ def cmd_shapley(opts) -> int:
     donor_loader = None
     swap_overrides: dict[str, str] = {}
     if opts.absence in ("donor", "cross-region"):
-        disjoint = np.setdiff1d(indices, selected)
-        pool_size = min(int(opts.donor_pool_size), len(disjoint))
-        pool_indices = sample_window_indices(disjoint, pool_size, seed + 21)
+        source = donor_source_indices(ctx, split, selected)
+        pool_size = min(int(opts.donor_pool_size), len(source))
+        pool_indices = sample_window_indices(source, pool_size, seed + 21)
         if len(pool_indices) == 0:
-            raise SystemExit("no disjoint donor pool available (split too small)")
+            raise SystemExit("no donor windows available (split too small)")
         pool = DonorPool.build(merged, split_df, pool_indices, track_order, n_tracks)
     if opts.absence == "cross-region":
         swap_overrides = parse_swap_paths(opts.swap_paths)
@@ -916,7 +1207,8 @@ def cmd_shapley(opts) -> int:
               + (" | other players use the random-donor pool"
                  if len(swap_overrides) < len(track_order) else ""))
     elif opts.absence == "mean":
-        pool_indices = sample_window_indices(indices, int(opts.donor_pool_size), seed + 21)
+        pool_indices = sample_window_indices(split_indices, int(opts.donor_pool_size),
+                                             seed + 21)
         pool = DonorPool.build(merged, split_df, pool_indices, track_order, n_tracks)
 
     # ---- main loop ------------------------------------------------------
@@ -930,6 +1222,7 @@ def cmd_shapley(opts) -> int:
     layer_buf: dict[str, list[tuple[np.ndarray, np.ndarray, np.ndarray]]] = {}
     flat = {"phi": {}, "inter": {}, "fact": {}, "div": {}}
     per_window = {"phi": {}}
+    per_window_extra: dict[str, list[float]] = {}
     div_sums: dict[int, float] = {}
     coalition_buf: dict[str, list[tuple[np.ndarray, np.ndarray, np.ndarray]]] = {}
     counts: list[int] = []
@@ -963,6 +1256,11 @@ def cmd_shapley(opts) -> int:
         donor_tracks = None
         if opts.absence in ("donor", "cross-region"):
             ids = rng_donor.integers(0, pool.size, size=bsz)
+            if pool.indices is not None:
+                targets = selected[g:g + bsz]
+                for b in range(bsz):
+                    if pool.indices[ids[b]] == targets[b]:
+                        ids[b] = (ids[b] + 1) % pool.size
             donor_tracks = {name: pool.gather(name, ids, device) for name in track_order}
         if opts.absence == "cross-region":
             d_tracks, _d_seq, d_base = split_batch(next(donor_iter), n_tracks)
@@ -1030,6 +1328,18 @@ def cmd_shapley(opts) -> int:
                 "n_scored": int(pos.size),
             })
             counts.append(int(pos.size))
+            if pos.size:
+                pred_vals = values[full][i].detach().cpu().numpy()[pos]
+                target_vals = tracks[head_idx][i].detach().cpu().numpy()[pos].reshape(-1)
+                per_window_extra.setdefault("pred", []).append(float(pred_vals.mean()))
+                per_window_extra.setdefault("target", []).append(float(target_vals.mean()))
+            else:
+                per_window_extra.setdefault("pred", []).append(float("nan"))
+                per_window_extra.setdefault("target", []).append(float("nan"))
+            for (a, b), tensor in inter.items():
+                key = f"{players[a].name}__{players[b].name}"
+                inter_vals = tensor[i].detach().cpu().numpy()[pos] if pos.size else np.zeros(0)
+                per_window_extra.setdefault(f"inter_{key}", []).append(float(inter_vals.sum()))
             row_ids = np.full(pos.size, g + i, dtype=np.int64)
             for a, player in enumerate(players):
                 vals = phi[a][i].detach().cpu().numpy()[pos] if pos.size else np.zeros(0, np.float32)
@@ -1135,6 +1445,11 @@ def cmd_shapley(opts) -> int:
             pd.DataFrame(strata).to_csv(strata_path, index=False)
             print(f"[out] {strata_path}")
 
+    per_window_path = out_dir / f"{stem}_per_window.csv"
+    pd.DataFrame(per_window_table(players, per_window, per_window_extra,
+                                  counts, obs_rows)).to_csv(per_window_path, index=False)
+    print(f"[out] {per_window_path}")
+
     h5ad_path = ""
     if not opts.no_h5ad:
         h5ad_path = str(out_dir / f"{stem}.h5ad")
@@ -1168,7 +1483,7 @@ def cmd_shapley(opts) -> int:
         "head": head,
         "split": split,
         "n_windows": n_windows,
-        "split_windows": int(len(indices)),
+        "split_windows": int(len(split_indices)),
         "players": [{"name": p.name, "slot": p.slot, "kind": p.kind, "label": p.label}
                     for p in players],
         "n_coalitions": n_coalitions,
@@ -1184,11 +1499,20 @@ def cmd_shapley(opts) -> int:
         "subset_reconstruction_r2": r2,
         "n_scored_values": n_values,
         "random_init_control": control,
+        "region": {
+            "locus": opts.locus,
+            "original_idx": opts.window_original_idx,
+            "bed": opts.region_bed,
+            "bed_mode": opts.region_mode,
+            "split_any": bool(opts.region_split_any),
+            "single_window": bool(n_windows == 1),
+        },
         "outputs": {
             "h5ad": h5ad_path,
             "summary_csv": str(summary_path),
             "decomposition_csv": str(decomp_path),
             "strata_csv": str(strata_path) if strata_path else "",
+            "per_window_csv": str(per_window_path),
         },
         "runtime_s": round(time.time() - t_start, 1),
     }
@@ -1310,8 +1634,8 @@ def run_random_init_control(ctx, players, opts, selected, base_seed, mask_fracti
 
     pool = None
     if opts.absence in ("donor", "mean"):
-        disjoint = np.setdiff1d(np.asarray(ctx["split_idx"][opts.split]), sub)
-        pool_idx = sample_window_indices(disjoint, 128, int(merged["seed"]) + 34)
+        source = donor_source_indices(ctx, opts.split, sub)
+        pool_idx = sample_window_indices(source, 128, int(merged["seed"]) + 34)
         if len(pool_idx):
             pool = DonorPool.build(merged, split_df, pool_idx, ctx["track_order"], n_tracks)
 
@@ -1495,6 +1819,44 @@ def decomposition_table(players, div_sums: dict[int, float], n_values: int,
     return rows
 
 
+def per_window_table(players, per_window, per_window_extra, counts,
+                     obs_rows) -> list[dict]:
+    """One row per window: its own phi / share / interaction (no cross-window mix).
+
+    This is what a "score for this region" should be read from: a single 16 kb
+    window's composition, not the global average.
+    """
+    rows = []
+    for w, obs in enumerate(obs_rows):
+        n = int(counts[w]) if w < len(counts) else 0
+        row = dict(obs)
+        row["pred_mean"] = extra_at(per_window_extra, "pred", w)
+        row["target_mean"] = extra_at(per_window_extra, "target", w)
+        means = {}
+        for p in players:
+            seq = per_window["phi"].get(p.name)
+            total = float(seq[w]) if seq and w < len(seq) else float("nan")
+            means[p.name] = total / n if n else float("nan")
+        abs_total = sum(abs(v) for v in means.values() if np.isfinite(v))
+        for p in players:
+            row[f"phi_{p.name}_mean"] = means[p.name]
+            row[f"phi_{p.name}_share"] = (
+                abs(means[p.name]) / abs_total if abs_total else float("nan")
+            )
+        for a, b in combinations(range(len(players)), 2):
+            key = f"inter_{players[a].name}__{players[b].name}"
+            row[key + "_mean"] = (
+                extra_at(per_window_extra, key, w) / n if n else float("nan")
+            )
+        rows.append(row)
+    return rows
+
+
+def extra_at(store: dict[str, list[float]], key: str, index: int) -> float:
+    seq = store.get(key)
+    return float(seq[index]) if seq and index < len(seq) else float("nan")
+
+
 def strata_table(merged, players, flat, obs_rows, counts, split_df, selected):
     """Mean phi by chromosome and by cCRE class (4th column of the DMR BED)."""
     if not flat.get("phi"):
@@ -1566,11 +1928,13 @@ def print_summary(players, summary, decomp):
     for row in summary:
         if row["kind"] != "player":
             continue
+        ci = ("n/a" if not np.isfinite(row["ci_lo"])
+              else f"[{row['ci_lo']:+.4f}, {row['ci_hi']:+.4f}]")
         rows.append([
             row["label"], f"{row['mean']:+.4f}", f"{row['mean_abs']:.4f}",
             f"{row['share_abs'] * 100:.1f}%",
             f"{row['frac_positive'] * 100:.0f}%",
-            f"[{row['ci_lo']:+.4f}, {row['ci_hi']:+.4f}]",
+            ci,
         ])
     print(fmt_table(rows, ["player", "mean phi", "mean |phi|", "share", "phi>0", "95% CI"]))
     print()
@@ -1684,6 +2048,22 @@ def build_parser() -> argparse.ArgumentParser:
     shap.add_argument("--head", default="5hmc", help="which query head to explain")
     shap.add_argument("--split", default="test", choices=["test", "val", "train"])
     shap.add_argument("--n-windows", type=int, default=0, help="0 = every window")
+    shap.add_argument("--locus", default=None,
+                      help="explain one window, e.g. chr9:119592828-119609211 "
+                           "(1-based, comma-free); mutually exclusive with --n-windows")
+    shap.add_argument("--window-original-idx", type=int, default=None,
+                      help="explain one window by its original_idx (column 4 of "
+                           "*_test_regions.bed); mutually exclusive with --locus")
+    shap.add_argument("--region-bed", default=None,
+                      help="explain only windows overlapping this BED (0-based "
+                           "half-open, mm10); an omitted --n-windows means all hits")
+    shap.add_argument("--region-split-any", action="store_true",
+                      help="with --region-bed: search train/val/test instead of only "
+                           "--split (train hits still need --allow-train-split)")
+    shap.add_argument("--region-mode", default="overlap", choices=["overlap", "exact"],
+                      help="with --region-bed: 'overlap' = any window touching the "
+                           "BED (training --test-bed semantics); 'exact' = only "
+                           "windows whose coordinates are listed")
     shap.add_argument("--players", default="seq,other,atac,rna,self",
                       help="comma list of seq/other/self/<track>; 4 players -> 16 forwards")
     shap.add_argument("--absence", default="donor",

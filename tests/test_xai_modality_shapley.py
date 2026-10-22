@@ -18,10 +18,12 @@ multi-linear game, so a bug in the coalition weights cannot hide:
 from __future__ import annotations
 
 import sys
+import tempfile
 import traceback
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -32,9 +34,13 @@ from run_xai_modality_shapley import (  # noqa: E402
     factorial_interaction,
     harsanyi_dividends,
     pairwise_shapley_interaction,
+    parse_locus,
+    per_window_table,
     permuted_track,
+    region_bed_mask,
     resolve_players,
     scored_positions,
+    select_region_windows,
     sequence_absence,
     shapley_values,
     subset_name,
@@ -270,6 +276,126 @@ def test_resolve_players_rejects_non_context_track():
                                 ["5mc", "5hmc"], ["atac", "rna"], [[2, 3], [2, 3]]),
         "5mc outside the 5hmc context",
     )
+
+
+# ---------------------------------------------------------------------------
+# Region selection (single window)
+# ---------------------------------------------------------------------------
+
+def tiny_split():
+    """Three windows: chr9 1000-17000, chr9 12000-28000 (overlapping), chrX."""
+    return pd.DataFrame({
+        "chr": ["chr9", "chr9", "chrX"],
+        "start_expanded": [1000, 12000, 100],
+        "end_expanded": [17000, 28000, 16000],
+        "original_idx": [5, 6, 7],
+    })
+
+
+def test_parse_locus():
+    assert parse_locus("chr9:119592828-119609211") == ("chr9", 119592828, 119609211)
+    assert parse_locus("chr9:1,000-2,000") == ("chr9", 1000, 2000)
+    assert parse_locus(" chr9 : 1-2 ") == ("chr9", 1, 2)
+    expect_exit(lambda: parse_locus("chr9"), "missing colon")
+    expect_exit(lambda: parse_locus("chr9:abc-2000"), "non-integer start")
+    expect_exit(lambda: parse_locus("chr9:3000-2000"), "start > end")
+
+
+def test_select_region_exact_and_contained():
+    split_df = tiny_split()
+    idx = np.arange(3)
+    assert select_region_windows(split_df, idx, "test",
+                                 locus="chr9:1000-17000").tolist() == [0]
+    assert select_region_windows(split_df, idx, "test",
+                                 locus="chr9:1500-2500").tolist() == [0]
+    assert select_region_windows(split_df, idx, "test",
+                                 locus="chr9:20000-21000").tolist() == [1]
+
+
+def test_select_region_overlap_tier():
+    # straddles the left edge of window 0 and touches no other window
+    assert select_region_windows(tiny_split(), np.arange(3), "test",
+                                 locus="chr9:500-2000").tolist() == [0]
+
+
+def test_select_region_ambiguous_is_an_error():
+    # contained in BOTH overlapping windows -> must not pick one silently
+    expect_exit(lambda: select_region_windows(tiny_split(), np.arange(3), "test",
+                                              locus="chr9:13000-14000"),
+                "ambiguous locus")
+
+
+def test_select_region_unknown_chrom():
+    expect_exit(lambda: select_region_windows(tiny_split(), np.arange(3), "test",
+                                              locus="chr8:1-2"),
+                "chromosome not in split")
+
+
+def test_select_region_original_idx():
+    split_df = tiny_split()
+    idx = np.arange(3)
+    assert select_region_windows(split_df, idx, "test",
+                                 original_idx=7).tolist() == [2]
+    expect_exit(lambda: select_region_windows(split_df, idx, "test",
+                                              original_idx=999),
+                "original_idx not in split")
+
+
+def test_per_window_table_is_window_local():
+    players = [Player("5mc", 0, "track", "5mc"),
+               Player("atac", 2, "track", "atac")]
+    per_window = {"phi": {"5mc": [1.0, 2.0], "atac": [-1.0, 1.0]}}
+    extra = {"pred": [10.0, 20.0], "target": [11.0, 21.0],
+             "inter_5mc__atac": [0.5, -0.5]}
+    counts = [2, 1]
+    obs = [
+        {"chr": "chr9", "start_expanded": 1, "end_expanded": 2,
+         "original_idx": 3, "n_scored": 2},
+        {"chr": "chrX", "start_expanded": 4, "end_expanded": 5,
+         "original_idx": 6, "n_scored": 1},
+    ]
+    rows = per_window_table(players, per_window, extra, counts, obs)
+    assert rows[0]["phi_5mc_mean"] == 0.5
+    assert rows[0]["phi_atac_mean"] == -0.5
+    assert rows[0]["phi_5mc_share"] == 0.5
+    assert rows[0]["phi_atac_share"] == 0.5
+    assert rows[0]["inter_5mc__atac_mean"] == 0.25
+    assert rows[1]["phi_atac_mean"] == 1.0
+    assert abs(rows[1]["phi_5mc_share"] - 2.0 / 3.0) < 1e-12
+
+
+def test_region_bed_mask_and_chrom_normalisation():
+    split_df = tiny_split()
+    idx = np.arange(3)
+    with tempfile.TemporaryDirectory() as tmp:
+        bed = Path(tmp) / "regions.bed"
+        # BED is 0-based half-open. Window 0 is 1000-17000 (1-based) and window 1
+        # starts at 12000, so [999, 17000) overlaps BOTH in overlap mode, while
+        # exact mode matches window 0 only.
+        bed.write_text("chr9\t999\t17000\n")
+        exact, _ = region_bed_mask(split_df, idx, str(bed), mode="exact")
+        overlap, _ = region_bed_mask(split_df, idx, str(bed), mode="overlap")
+        assert exact.tolist() == [True, False, False]
+        assert overlap.tolist() == [True, True, False]
+
+        # a BED interval inside window 1 only
+        bed.write_text("chr9\t18000\t19000\n")
+        mask, _ = region_bed_mask(split_df, idx, str(bed))
+        assert mask.tolist() == [False, True, False]
+
+        # chromosome written without the "chr" prefix must still match
+        bed.write_text("9\t999\t17000\n")
+        exact, _ = region_bed_mask(split_df, idx, str(bed), mode="exact")
+        assert exact.tolist() == [True, False, False]
+
+        bed.write_text("chrX\t100\t200\n")
+        mask, _ = region_bed_mask(split_df, idx, str(bed))
+        assert mask.tolist() == [False, False, True]
+
+        # no overlap -> all False (select_bed_windows turns this into an error)
+        bed.write_text("chr7\t1\t2\n")
+        mask, _ = region_bed_mask(split_df, idx, str(bed))
+        assert not mask.any()
 
 
 # ---------------------------------------------------------------------------
