@@ -21,6 +21,7 @@ dist/
 *.egg-info/
 logs/
 examples/
+deliverables/
 
 # Virtual environments
 .venv/
