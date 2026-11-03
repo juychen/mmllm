@@ -775,6 +775,42 @@ def generate_pretraining_cpg_mask(
     return cpg_mask.unsqueeze(-1)  # (N, seq_len, 1)
 
 
+def generate_cpg_pair_mask(
+    base_ids_tensor: torch.Tensor,
+    mask_fraction: float = 0.15,
+    neighborhood_bp: int = 50,
+    seed: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """CpG-pair mask with a neighborhood buffer.
+
+    Selects ``mask_fraction`` of CpG PAIRS (the forward C of each CpG), then:
+      - hide_mask: 1 for the C, G and +/- ``neighborhood_bp`` around the pair
+      - loss_mask: 1 only at the C of each selected CpG
+
+    Both masks are (N, L, 1).  The hide mask is passed to the model as
+    ``position_mask``; the loss mask is used only for MSE/R2 so G and buffer
+    positions do not contribute to the reconstruction loss.
+    """
+    n, length = base_ids_tensor.shape
+    neighborhood_bp = max(0, int(neighborhood_bp))
+    cpg_c = find_forward_cpg_positions(base_ids_tensor)  # (N, L), C followed by G
+    hide = torch.zeros((n, length, 1), dtype=torch.float32)
+    loss = torch.zeros((n, length, 1), dtype=torch.float32)
+    rng = np.random.RandomState(seed)
+    for i in range(n):
+        idx = torch.nonzero(cpg_c[i], as_tuple=False).squeeze(-1)
+        if idx.numel() == 0:
+            continue
+        num = max(1, int(idx.numel() * float(mask_fraction)))
+        selected = rng.choice(idx.numpy(), size=num, replace=False)
+        for p in selected.tolist():
+            lo = max(0, p - neighborhood_bp)
+            hi = min(length, p + 1 + neighborhood_bp)
+            hide[i, lo:hi, 0] = 1.0
+            loss[i, p, 0] = 1.0
+    return hide, loss
+
+
 def apply_mask_to_track(track_tensor: torch.Tensor, mask_tensor: torch.Tensor) -> torch.Tensor:
     """Zero out track values at masked positions. mask_tensor: 1.0 = masked."""
     return track_tensor * (1.0 - mask_tensor)

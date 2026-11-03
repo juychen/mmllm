@@ -41,6 +41,7 @@ CUDA_VISIBLE_DEVICES="${GPU:-3}" python run_multiquery_pretraining.py \
   --query-tracks 5mc 5hmc \
   --context-mode all-others \
   --mask-fraction 0.15 \
+  --mask-neighborhood-bp "${MASK_NEIGHBORHOOD_BP:-50}" \
   --mask-mode cpg_forward \
   --drop-p-5mc 0.0 --drop-p-5hmc 0.0 --drop-p-atac "${DROP_ATAC:-0.2}" --drop-p-rna 1.0 --drop-p-seq 0.0 \
   --scheduler cosine \

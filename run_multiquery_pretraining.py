@@ -59,6 +59,7 @@ from data import (
     LazyM5cSequenceAtacRnaDataset,
     add_clip_at_zero_argument,
     ensure_path_list,
+    generate_cpg_pair_mask,
     generate_pretraining_cpg_mask,
     load_data,
     resolve_train_val_test_split,
@@ -169,6 +170,21 @@ def sample_position_mask(
     (training); a fixed seed makes validation/test masks reproducible.
     """
     return generate_pretraining_cpg_mask(base_ids_batch, mask_fraction=mask_fraction, seed=seed)
+
+
+def sample_cpg_pair_masks(
+    base_ids_batch: torch.Tensor,
+    mask_fraction: float,
+    neighborhood_bp: int,
+    seed: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return (hide_mask, loss_mask) for CpG-pair + neighborhood masking."""
+    return generate_cpg_pair_mask(
+        base_ids_batch,
+        mask_fraction=mask_fraction,
+        neighborhood_bp=neighborhood_bp,
+        seed=seed,
+    )
 
 
 def sample_track_presence(
@@ -526,6 +542,7 @@ def evaluate(
     context_tracks: list[str],
     amp: bool = False,
     mask_seed: int | None = None,
+    mask_neighborhood_bp: int = 50,
     return_predictions: bool = False,
 ):
     """Reconstruction metrics on a held-out loader (query tracks are the heads).
@@ -559,17 +576,20 @@ def evaluate(
             sequence_batch = batch[num_q + num_c].to(device)
             base_ids_batch = batch[num_q + num_c + 1]
 
-            position_mask = sample_position_mask(
+            hide_mask, loss_mask = sample_cpg_pair_masks(
                 base_ids_batch,
                 mask_fraction,
+                mask_neighborhood_bp,
                 seed=None if mask_seed is None else mask_seed + batch_index,
-            ).to(device)
+            )
+            hide_mask = hide_mask.to(device)
+            loss_mask = loss_mask.to(device)
             targets = queries
 
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp):
-                preds = model(queries, sequence_batch, context, position_mask=position_mask)
+                preds = model(queries, sequence_batch, context, position_mask=hide_mask)
                 total_loss, losses = compute_masked_reconstruction_loss(
-                    preds, targets, position_mask, query_tracks
+                    preds, targets, loss_mask, query_tracks
                 )
 
             batch_size = queries[0].size(0)
@@ -581,7 +601,7 @@ def evaluate(
             for name, pred, target in zip(query_tracks, preds, targets):
                 all_preds[name].append(pred.detach().cpu())
                 all_targets[name].append(target.detach().cpu())
-                all_masks[name].append(position_mask.detach().cpu())
+                all_masks[name].append(loss_mask.detach().cpu())
             if return_predictions:
                 all_base_ids.append(base_ids_batch.detach().cpu())
 
@@ -756,7 +776,11 @@ def run_experiment(
 
             # Layer 1: shared position mask (all signal tracks, incl. every query).
             # Layer 2: modality mask — each track's presence re-drawn per step/sample.
-            position_mask = sample_position_mask(base_ids_batch, args.mask_fraction).to(device)
+            hide_mask, loss_mask = sample_cpg_pair_masks(
+                base_ids_batch, args.mask_fraction, args.mask_neighborhood_bp,
+            )
+            hide_mask = hide_mask.to(device)
+            loss_mask = loss_mask.to(device)
             query_present = sample_track_presence(
                 batch_size=queries[0].size(0),
                 track_names=query_tracks,
@@ -779,13 +803,13 @@ def run_experiment(
                     queries,
                     sequence_batch,
                     context,
-                    position_mask=position_mask,
+                    position_mask=hide_mask,
                     query_present=query_present,
                     track_present=track_present,
                     sequence_present=sequence_present,
                 )
                 total_loss, losses = compute_masked_reconstruction_loss(
-                    preds, targets, position_mask, query_tracks
+                    preds, targets, loss_mask, query_tracks
                 )
                 total_loss = total_loss / args.gradient_accumulation_steps
 
@@ -810,6 +834,7 @@ def run_experiment(
         val_metrics = evaluate(
             model, prepared.val_loader, device, args.mask_fraction,
             query_tracks, context_tracks, amp=args.amp, mask_seed=args.seed + 1000,
+            mask_neighborhood_bp=args.mask_neighborhood_bp,
         )
 
         if scheduler is not None:
@@ -858,6 +883,7 @@ def run_experiment(
     final_val_metrics = evaluate(
         model, prepared.val_loader, device, args.mask_fraction,
         query_tracks, context_tracks, amp=args.amp, mask_seed=args.seed + 1000,
+        mask_neighborhood_bp=args.mask_neighborhood_bp,
     )
     save_checkpoint(
         last_checkpoint_path,
@@ -875,6 +901,7 @@ def run_experiment(
         final_val_metrics = evaluate(
             model, prepared.val_loader, device, args.mask_fraction,
             query_tracks, context_tracks, amp=args.amp, mask_seed=args.seed + 1000,
+            mask_neighborhood_bp=args.mask_neighborhood_bp,
         )
 
     # Held-out test: evaluated exactly once on the best checkpoint with its own
@@ -888,12 +915,14 @@ def run_experiment(
             test_metrics, test_payload = evaluate(
                 model, prepared.test_loader, device, args.mask_fraction,
                 query_tracks, context_tracks, amp=args.amp, mask_seed=args.seed + 2000,
+                mask_neighborhood_bp=args.mask_neighborhood_bp,
                 return_predictions=True,
             )
         else:
             test_metrics = evaluate(
                 model, prepared.test_loader, device, args.mask_fraction,
                 query_tracks, context_tracks, amp=args.amp, mask_seed=args.seed + 2000,
+                mask_neighborhood_bp=args.mask_neighborhood_bp,
             )
         test_detail = ", ".join(
             f"{n}: R²={test_metrics[f'val_{n}_r2']:.4f} ρ={test_metrics[f'val_{n}_pearsonr']:.4f}"
@@ -1052,7 +1081,10 @@ def parse_args():
     add_clip_at_zero_argument(parser)
     parser.add_argument("--mask-mode", choices=["cpg_both", "cpg_forward", "ch_only", "c_only", "all"],
                         default="cpg_forward",
-                        help="Only used to build the lazy dataset's (unused) supervised loss mask.")
+                        help="Legacy; the multi-query training now uses CpG-pair masking.")
+    parser.add_argument("--mask-neighborhood-bp", type=int, default=50,
+                        help="Hide +/- this many bp around each selected CpG pair (default 50). "
+                             "0 = hide only the C/G pair. Loss is computed only at the selected C.")
     # outputs
     parser.add_argument("--output-csv", default="output/multiquery_pretraining_results.csv")
     parser.add_argument("--output-json", default="output/multiquery_pretraining_results.json")
@@ -1090,7 +1122,7 @@ def main():
     print(f"  context mode      : {args.context_mode}"
           + ("  (each query also sees the OTHER queries)" if args.context_mode == "all-others"
              else "  (queries do NOT see each other)"))
-    print(f"  mask fraction     : {args.mask_fraction}  (shared across all signal tracks)")
+    print(f"  mask fraction     : {args.mask_fraction} of CpG pairs; hide +/-{args.mask_neighborhood_bp} bp; loss C only")
     print(f"  modality drop p   : 5mc={args.drop_p_5mc} 5hmc={args.drop_p_5hmc} "
           f"atac={args.drop_p_atac} rna={args.drop_p_rna} seq={args.drop_p_seq}")
     print(f"  blocks / hidden   : {args.num_blocks} / {args.hidden_dim}  (blocks shared across queries)")
