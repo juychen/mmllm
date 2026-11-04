@@ -38,7 +38,7 @@
 # Two runs sequential ~10-12 days; parallel on two GPUs ~5-6 days.
 # ---------------------------------------------------------------------------
 
-set -u
+set +u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MMLLM_DIR="${MMLLM_DIR:-$SCRIPT_DIR}"

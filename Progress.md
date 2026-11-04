@@ -1,5 +1,71 @@
 # mmllm
-mmllm
+
+## 2026-11-03 · 最新进展（置顶）
+
+> **口径先看这里**：11-03 起同时换了**掩码规则**和**test 集定义**，新数字不能直接和 10-23/10-26 的 0.797 / 0.688 比。
+>
+> - **掩码**：从「随机遮 15% 的单 CpG」改为「随机遮 15% 的 **CpG 对**，隐藏 C/G ±50 bp 邻域，loss 只算 C」（commit `00e9e54` "ADD strict masking"，见 [data.py](data.py) `generate_cpg_pair_mask`）。相邻 CpG 的信息被遮掉，**任务变难**。
+> - **test 集**：改为显式 `output/holdout_testchroms/cpg_test.bed`（7,412 窗口：chr8 尾 640 / chr9 4,422 / chrX 2,290 / chrY 60）。已核对：它与旧 `auto_3way` 产出的 `test_regions.bed` **逐窗口完全一致**，所以历史 test 数字仍然可比。
+> - **val 集**：带 `--test-bed` 时 val = 非 test 池的 20%（15,845 窗口），旧 `auto_3way` 是 9,520 → **val 数字不可直接比**。
+
+### 一、相对上一版（2026-10-23 汇报）改了什么
+
+| 项 | 上一版（10-23 ~ 10-26） | 本版（11-03） |
+|---|---|---|
+| 掩码 | 单 CpG，15% | **CpG 对 + ±50 bp 邻域隐藏，loss 只在 C** |
+| test 集 | `auto_3way` 尾部（隐式，事后才知道是 chr8尾/9/X/Y） | **显式 holdout BED**，窗口集合与旧 test 完全相同 |
+| val 集 | 9,520（10%） | 15,845（带 test-bed 时 = 非 test 池的 20%） |
+| 2-head 主线 | 30 ep（10-07：val 0.688） | **100 ep × 3 条**（drop 0.0 / 0.1 / 0.2），进行中 |
+| 数据规模 | cCRE 80,137 | 另加 **全基因组 pool 142,217**、**6 组池化 379,230** |
+| 调参 | 无 | **`parametest.py`**：独立 5-epoch 筛查框架 |
+
+### 二、已完成的结果（唯一跑完的长跑）
+
+**4-head 100ep**（旧单-CpG 掩码、`auto_3way`、no-drop）：2026-10-26 10:02 → 11-02 00:54，**best epoch 98**
+
+| 指标 | 5mc | 5hmc | ATAC | RNA |
+|---|---|---|---|---|
+| val R² | 0.797 | 0.688 | 0.980 | 0.937 |
+| test R² | 0.773 | 0.667 | 0.978 | 0.935 |
+| test Pearson | 0.881 | 0.818 | 0.991 | 0.968 |
+
+- 同一个 run 从 30 ep 到 98 ep：val **+0.012**（5mc）/ **+0.016**（5hmc），代价是 2 天 → 6.6 天 → **收益明显递减**
+- 对比 2-head all-others（10-23 汇报）：test 5mc 0.773 vs 0.773（持平），5hmc 0.667 vs **0.673**（四头反而略低）→ 四个头没有给甲基化带来净收益
+
+### 三、进行中（11-03 起跑，均在新掩码下）
+
+| 实验 | 进度 | 当前 val R²（5mc / 5hmc） | 每 epoch | 预计完成 |
+|---|---|---|---|---|
+| AMY_MC 2-head drop0.1 | ep5/100 | 0.699 / 0.585（ep4） | 40.6 min | 11-06 上午 |
+| AMY_MC 2-head drop0.0 | ep3/100 | 0.641 / 0.507（ep2） | 40.7 min | 11-06 中午 |
+| AMY_MC 2-head drop0.2 | ep3/100 | 0.605 / 0.502（ep2） | 40.7 min | 11-06 中午 |
+| 全基因组 train pool（142,217 DMRs） | ep2/100 | 0.030 / 0.139（ep1） | 76 min | 11-08 夜间 |
+| 6 组池化 2-head 30ep | ep1 | — | ~5.1 h（估算） | ~11-10 |
+
+- 新掩码下 ep1 就拿到 0.60 / 0.49，是**任务变难后的正常水平，不是退化**；要和旧的 0.797/0.688 对比，必须等 ≥30 ep 的新基线
+- 全基因组 run 的 ep1（0.03 / 0.14）低得多，因为窗口不再富集在 cCRE 上，任务本身更难
+
+### 四、调参框架与一条协议结论
+
+新增 [parametest.py](parametest.py)：独立脚本，只 import `data.py`/`models.py`/`utils.py`，自己起训练循环；5 epoch；**train/val/test 三段都构建、都评测、都落盘 BED**；val mask 按窗口身份定死（`crc32(chr:start)^seed`），因此与 batch size / 梯度累积无关，配置之间可比。
+
+实测结论（**建议写进方法学**）：**短筛查的预算要按 optimizer step 算，不能按 epoch 算。**
+
+- 生产脚本 2-head 1 epoch = 56,880×2(RC) ÷ 32 ÷ 8 = **444 个 optimizer step**
+- 代理集 12k × 5 epoch = 只有 **340 步**，模型还停在「预测均值」，val R² = **0.002**
+- 而且 5-epoch 的 cosine 会在步数用完之前就把 lr 衰减到 `min_lr`，等于把后半程的学习率浪费掉
+
+对策已写进脚本默认值：screening 强制 constant lr（`--force-scheduler none`），代理集提到 20k（≈560 步）。当前 sweep 已按要求停止，没有配置跑完；脚本与 split BED 保留，一条命令可恢复。
+
+### 五、下一步
+
+1. 等 drop 0.1 / 0.0 / 0.2 三条跑到 ≥30 ep，建立**新掩码下的 2-head 基线**，再谈是否相对 0.797/0.688 有提升
+2. 若新掩码确实更难，考虑 mask_fraction 0.15 → 0.10，或把 ±50 bp 邻域收窄，作为独立消融
+3. 全基因组 pool 的 ep1 明显落后，建议先用 30k 子集确认学习率是否合适，再烧 100 ep
+4. 6 组池化 5.1 h/epoch × 30 ep ≈ 6.4 天，是否值得跑满 30 ep 需要单独决策（可先用 2 组做 pilot）
+
+---
+
 ## EXP-0 the initial toy experiment with Hyena on 5mC and 5hmC tracks, using the same 10k regions as in the original Hyena toy experiment. The goal is to see if Hyena can learn to predict the 5mC track from the 5hmC track, which are known to be correlated but not identical.
 ### Note:0414 I have tried to tune the initial param, confirming the crosshyena with long_mixer='conv' and filter_len=4. Then add the Hyena layer. The r2 in 3000 data dataset is around 0.4.\
 ## Note: 0415 I have run the model from 1000 to 70000 data points. The r2 is around 0.5 and pearson r is 0.7 for 70000 data points, which is pretty good for this toy experiment. The model is still underfitting, and I will try to tune the hyperparameters and train for more epochs to see if I can get better performance.
