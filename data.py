@@ -811,6 +811,44 @@ def generate_cpg_pair_mask(
     return hide, loss
 
 
+def generate_cpg_pair_mask_mixed(
+    base_ids_tensor: torch.Tensor,
+    mask_fraction: float = 0.15,
+    widths: tuple[int, ...] = (0, 10, 25, 50, 100),
+    seed: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """CpG-pair mask where every selected pair draws its own buffer width.
+
+    Same selection rule as ``generate_cpg_pair_mask`` (``mask_fraction`` of the
+    forward C of each CpG, one shared draw per window), but the buffer around
+    each selected pair is sampled independently from ``widths``.  The loss mask
+    is still the C of each selected pair only.
+
+    Training on this mask exposes the model to scattered single-site holes, tight
+    holes and wide block holes *within the same window*, which is what a single
+    fixed-width protocol never shows it.
+    """
+    n, length = base_ids_tensor.shape
+    widths = tuple(sorted({max(0, int(w)) for w in widths})) or (0,)
+    cpg_c = find_forward_cpg_positions(base_ids_tensor)  # (N, L), C followed by G
+    hide = torch.zeros((n, length, 1), dtype=torch.float32)
+    loss = torch.zeros((n, length, 1), dtype=torch.float32)
+    rng = np.random.RandomState(seed)
+    for i in range(n):
+        idx = torch.nonzero(cpg_c[i], as_tuple=False).squeeze(-1)
+        if idx.numel() == 0:
+            continue
+        num = max(1, int(idx.numel() * float(mask_fraction)))
+        selected = rng.choice(idx.numpy(), size=num, replace=False)
+        drawn = rng.choice(np.asarray(widths), size=num)
+        for p, w in zip(selected.tolist(), drawn.tolist()):
+            lo = max(0, p - int(w))
+            hi = min(length, p + 1 + int(w))
+            hide[i, lo:hi, 0] = 1.0
+            loss[i, p, 0] = 1.0
+    return hide, loss
+
+
 def apply_mask_to_track(track_tensor: torch.Tensor, mask_tensor: torch.Tensor) -> torch.Tensor:
     """Zero out track values at masked positions. mask_tensor: 1.0 = masked."""
     return track_tensor * (1.0 - mask_tensor)

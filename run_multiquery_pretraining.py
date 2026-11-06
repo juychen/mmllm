@@ -60,6 +60,7 @@ from data import (
     add_clip_at_zero_argument,
     ensure_path_list,
     generate_cpg_pair_mask,
+    generate_cpg_pair_mask_mixed,
     generate_pretraining_cpg_mask,
     load_data,
     resolve_train_val_test_split,
@@ -757,6 +758,12 @@ def run_experiment(
 
     num_q = len(query_tracks)
     num_c = len(context_tracks)
+    mixed_widths = tuple(
+        int(w) for w in str(getattr(args, "mask_widths", "") or "").replace(" ", "").split(",") if w
+    )
+    if mixed_widths:
+        print(f"  mask widths       : mixed per-CpG draw from {list(mixed_widths)} "
+              f"(evaluation still uses +/-{args.mask_neighborhood_bp} bp)")
 
     for epoch in range(1, args.num_epochs + 1):
         last_epoch = epoch
@@ -776,9 +783,14 @@ def run_experiment(
 
             # Layer 1: shared position mask (all signal tracks, incl. every query).
             # Layer 2: modality mask — each track's presence re-drawn per step/sample.
-            hide_mask, loss_mask = sample_cpg_pair_masks(
-                base_ids_batch, args.mask_fraction, args.mask_neighborhood_bp,
-            )
+            if mixed_widths:
+                hide_mask, loss_mask = generate_cpg_pair_mask_mixed(
+                    base_ids_batch, args.mask_fraction, mixed_widths,
+                )
+            else:
+                hide_mask, loss_mask = sample_cpg_pair_masks(
+                    base_ids_batch, args.mask_fraction, args.mask_neighborhood_bp,
+                )
             hide_mask = hide_mask.to(device)
             loss_mask = loss_mask.to(device)
             query_present = sample_track_presence(
@@ -1085,6 +1097,11 @@ def parse_args():
     parser.add_argument("--mask-neighborhood-bp", type=int, default=50,
                         help="Hide +/- this many bp around each selected CpG pair (default 50). "
                              "0 = hide only the C/G pair. Loss is computed only at the selected C.")
+    parser.add_argument("--mask-widths", default="",
+                        help="Mixed-width training: comma list of buffer widths, e.g. "
+                             "'0,10,25,50,100'. Each selected CpG pair then draws its own width, so "
+                             "scattered, tight and wide holes appear in the same window. Overrides "
+                             "--mask-neighborhood-bp during training (evaluation keeps the fixed width).")
     # outputs
     parser.add_argument("--output-csv", default="output/multiquery_pretraining_results.csv")
     parser.add_argument("--output-json", default="output/multiquery_pretraining_results.json")

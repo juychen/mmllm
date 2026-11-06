@@ -89,6 +89,7 @@ from data import (
     LazyM5cSequenceAtacRnaDataset,
     find_cpg_candidate_positions,
     find_forward_cpg_positions,
+    generate_cpg_pair_mask,
     generate_pretraining_cpg_mask,
     load_data,
     resolve_train_val_test_split,
@@ -733,6 +734,34 @@ def scored_positions(base_ids: torch.Tensor, position_mask: torch.Tensor,
     return position_mask.squeeze(-1).bool() & cpg
 
 
+def build_scoring_masks(base_ids_cpu: torch.Tensor, mask_fraction: float,
+                        mask_scheme: str, neighborhood_bp: int,
+                        seed_base: int, bsz: int, device) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return (hide_mask, score_mask) in the requested masking regime.
+
+    ``pair`` reproduces the training-time mask of the cpgpair runs: for each
+    selected CpG pair hide the C, the G and +/- ``neighborhood_bp``, and score
+    only the C (the G carries no signal).  ``single`` is the legacy scattered
+    15%-of-CpGs mask that every earlier XAI run used.
+    """
+    hides, scores = [], []
+    for i in range(bsz):
+        if mask_scheme == "pair":
+            hide, loss = generate_cpg_pair_mask(
+                base_ids_cpu[i:i + 1], mask_fraction, neighborhood_bp,
+                seed=seed_base + i,
+            )
+            hides.append(hide[0])
+            scores.append(loss[0])
+        else:
+            mask = generate_pretraining_cpg_mask(
+                base_ids_cpu[i:i + 1], mask_fraction, seed=seed_base + i,
+            )[0]
+            hides.append(mask)
+            scores.append(mask)
+    return torch.stack(hides, dim=0).to(device), torch.stack(scores, dim=0).to(device)
+
+
 # ---------------------------------------------------------------------------
 # Statistics helpers
 # ---------------------------------------------------------------------------
@@ -1167,6 +1196,8 @@ def cmd_shapley(opts) -> int:
     print()
     print(f"[xai] head={head} split={split} windows={n_windows}/{len(split_indices)} | "
           f"players={n_players} coalitions={n_coalitions} absence={opts.absence}")
+    print(f"[xai] scoring mask: scheme={opts.mask_scheme} "
+          f"neighborhood_bp={opts.mask_neighborhood_bp} positions={opts.positions}")
     if single_region:
         row = split_df.iloc[int(selected[0])]
         print(f"[region] window {row['chr']}:{int(row['start_expanded'])}-"
@@ -1256,12 +1287,10 @@ def cmd_shapley(opts) -> int:
                 f"length-locked and cannot score a padded/truncated window"
             )
 
-        position_mask = torch.stack([
-            generate_pretraining_cpg_mask(base_ids_cpu[i:i + 1], mask_fraction,
-                                          seed=base_seed + g + i)[0]
-            for i in range(bsz)
-        ], dim=0).to(device)
-        scored = scored_positions(base_ids, position_mask, opts.positions)
+        position_mask, score_mask = build_scoring_masks(
+            base_ids_cpu, mask_fraction, opts.mask_scheme,
+            opts.mask_neighborhood_bp, base_seed + g, bsz, device)
+        scored = scored_positions(base_ids, score_mask, opts.positions)
 
         donor_tracks = None
         if opts.absence in ("donor", "cross-region"):
@@ -1663,12 +1692,10 @@ def run_random_init_control(ctx, players, opts, selected, base_seed, mask_fracti
         tracks = [t.to(device) for t in tracks]
         sequence, base_ids = sequence.to(device), base_ids.to(device)
         bsz = base_ids.shape[0]
-        position_mask = torch.stack([
-            generate_pretraining_cpg_mask(base_ids_cpu[i:i + 1], mask_fraction,
-                                          seed=base_seed + g + i)[0]
-            for i in range(bsz)
-        ], dim=0).to(device)
-        scored = scored_positions(base_ids, position_mask, opts.positions).cpu().numpy()
+        position_mask, score_mask = build_scoring_masks(
+            base_ids_cpu, mask_fraction, opts.mask_scheme,
+            opts.mask_neighborhood_bp, base_seed + g, bsz, device)
+        scored = scored_positions(base_ids, score_mask, opts.positions).cpu().numpy()
 
         donor_tracks = None
         if opts.absence == "donor":
@@ -2087,6 +2114,11 @@ def build_parser() -> argparse.ArgumentParser:
     shap.add_argument("--swap-paths", default=None,
                       help="cross-region donors: '5mc=...,atac=...,rna=...'")
     shap.add_argument("--positions", default="cpg_forward", choices=["cpg_forward", "cpg", "c"])
+    shap.add_argument("--mask-scheme", default="single", choices=["single", "pair"],
+                      help="single = legacy scattered 15%% of CpGs; "
+                           "pair = the training mask (hide C+G+/-neighbourhood, score the C)")
+    shap.add_argument("--mask-neighborhood-bp", type=int, default=50,
+                      help="buffer width for --mask-scheme pair (training runs used 50)")
     shap.add_argument("--batch-size", type=int, default=8)
     shap.add_argument("--bootstrap", type=int, default=1000)
     shap.add_argument("--control", default="random-init", choices=["none", "random-init"])
