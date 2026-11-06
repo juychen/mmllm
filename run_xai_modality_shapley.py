@@ -748,7 +748,7 @@ def cluster_bootstrap_mean(per_window_sum: np.ndarray, per_window_count: np.ndar
     if per_window_sum.size == 0 or total_count == 0:
         return float("nan"), float("nan"), float("nan")
     point = float(per_window_sum.sum() / total_count)
-    if per_window_sum.size < 2:
+    if per_window_sum.size < 2 or int(n_boot) <= 0:
         return point, float("nan"), float("nan")
     rng = np.random.default_rng(seed)
     n = per_window_sum.size
@@ -949,9 +949,13 @@ def select_region_windows(split_df: pd.DataFrame, split_indices: np.ndarray,
     )
 
 
-def read_bed_raw(bed_path: str) -> dict[str, list[tuple[int, int]]]:
-    """Parse a BED into {chrom: [(start, end), ...]} WITHOUT merging intervals.
+def read_bed_raw(bed_path: str, coordinate: int = 0) -> dict[str, list[tuple[int, int]]]:
+    """Parse a BED into {chrom: [(start0, end0), ...]} WITHOUT merging intervals.
 
+    ``coordinate=0`` is the BED standard: 0-based, half-open.  ``coordinate=1``
+    accepts a 1-based inclusive file and converts it to 0-based half-open
+    (``start0 = start - 1``, ``end0 = end``).  This matters for files produced
+    by tools that print 1-based inclusive intervals (IGV/samtools-style).
     ``data._load_split_bed`` merges overlapping intervals, which is right for
     "does this window overlap the region set" but destroys exact-window lists
     (the 16 kb windows of this project overlap each other heavily).
@@ -972,13 +976,15 @@ def read_bed_raw(bed_path: str) -> dict[str, list[tuple[int, int]]]:
                 start, end = int(parts[1]), int(parts[2])
             except ValueError:
                 continue
+            if int(coordinate) == 1:
+                start, end = start - 1, end
             if end > start:
                 raw.setdefault(parts[0], []).append((start, end))
     return raw
 
 
 def region_bed_mask(split_df: pd.DataFrame, indices: np.ndarray, bed_path: str,
-                    mode: str = "overlap") -> tuple[np.ndarray, dict]:
+                    mode: str = "overlap", coordinate: int = 0) -> tuple[np.ndarray, dict]:
     """Boolean mask over ``indices`` for the windows selected by ``bed_path``.
 
     ``mode='overlap'`` (default): any dataset window overlapping a BED interval,
@@ -989,12 +995,13 @@ def region_bed_mask(split_df: pd.DataFrame, indices: np.ndarray, bed_path: str,
     ``mode='exact'``: only windows whose coordinates are listed in the BED
     (0-based half-open), i.e. "the BED is a list of windows".
 
-    Chromosome names are normalised, so a BED written as ``9`` matches data
-    stored as ``chr9``.
+    ``coordinate=1`` means the input is 1-based inclusive; it is converted to
+    0-based half-open before matching.  Chromosome names are normalised, so a
+    BED written as ``9`` matches data stored as ``chr9``.
     """
     from data import _windows_overlapping_bed
 
-    bed = read_bed_raw(bed_path)
+    bed = read_bed_raw(bed_path, coordinate=coordinate)
     if not bed:
         raise SystemExit(f"--region-bed {bed_path}: no valid intervals found")
 
@@ -1058,10 +1065,13 @@ def select_bed_windows(ctx, opts, split_name: str, split_indices: np.ndarray,
     else:
         candidate = np.asarray(split_indices, dtype=np.int64)
 
+    coordinate = int(getattr(opts, "bed_coordinate", 0))
     mask_overlap, bed = region_bed_mask(ctx["split_df"], candidate,
-                                        opts.region_bed, mode="overlap")
+                                        opts.region_bed, mode="overlap",
+                                        coordinate=coordinate)
     mask_exact, _ = region_bed_mask(ctx["split_df"], candidate,
-                                    opts.region_bed, mode="exact")
+                                    opts.region_bed, mode="exact",
+                                    coordinate=coordinate)
     mask = mask_exact if opts.region_mode == "exact" else mask_overlap
     selected = candidate[mask]
 
@@ -2054,9 +2064,13 @@ def build_parser() -> argparse.ArgumentParser:
     shap.add_argument("--window-original-idx", type=int, default=None,
                       help="explain one window by its original_idx (column 4 of "
                            "*_test_regions.bed); mutually exclusive with --locus")
-    shap.add_argument("--region-bed", default=None,
-                      help="explain only windows overlapping this BED (0-based "
-                           "half-open, mm10); an omitted --n-windows means all hits")
+    shap.add_argument("--region-bed", "--bed", dest="region_bed", default=None,
+                      help="explain only windows overlapping this BED (default "
+                           "0-based half-open, mm10); an omitted --n-windows means "
+                           "all hits")
+    shap.add_argument("--bed-coordinate", type=int, choices=[0, 1], default=0,
+                      help="coordinate convention of --region-bed: 0 = BED "
+                           "0-based half-open (default), 1 = 1-based inclusive")
     shap.add_argument("--region-split-any", action="store_true",
                       help="with --region-bed: search train/val/test instead of only "
                            "--split (train hits still need --allow-train-split)")
