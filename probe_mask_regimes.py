@@ -45,6 +45,11 @@ def main() -> int:
     ap.add_argument("--tag", default="")
     ap.add_argument("--iso-bp", type=int, default=0,
                     help="only score CpGs whose nearest other CpG is farther than this")
+    ap.add_argument("--extra", default="",
+                    help="diagnostic regimes: decoy (single hole + an unrelated 101 bp hole), "
+                         "visneigh (bp50 hole but neighbouring CpG C values are left visible)")
+    ap.add_argument("--decoy-bp", default="101",
+                    help="comma list of decoy hole sizes for the decoy regime")
     opts = ap.parse_args()
     opts.test_regions_bed = None
     opts.seed = None
@@ -52,6 +57,14 @@ def main() -> int:
 
     bps = [int(b) for b in str(opts.bps).split(",") if str(b).strip()]
     regimes = ([("single", None)] if opts.with_single else []) + [(f"bp{b}", b) for b in bps]
+    extras = [e.strip() for e in str(opts.extra or "").split(",") if e.strip()]
+    decoy_sizes = [int(x) for x in str(opts.decoy_bp).split(",") if str(x).strip()]
+    for e in extras:
+        if e == "decoy":
+            for w in decoy_sizes:
+                regimes.append((f"decoy{w}", ("decoy", w)))
+        else:
+            regimes.append((e, e))
 
     ctx = X.prepare(opts)
     merged, model, device = ctx["merged"], ctx["model"], ctx["device"]
@@ -86,13 +99,42 @@ def main() -> int:
             hidden = {"single": single}
             scored = {"single": single.squeeze(-1).bool()}
             for name, bp in regimes:
-                if bp is None:
+                if bp is None or isinstance(bp, tuple) or bp == "visneigh":
                     continue
                 pair = [generate_cpg_pair_mask(base_ids[i:i + 1], mf, bp,
                                                seed=base_seed + g + i) for i in range(bsz)]
                 hidden[name] = torch.cat([p[0] for p in pair], 0)
                 scored[name] = torch.cat([p[1] for p in pair], 0).squeeze(-1).bool()
             fwd = find_forward_cpg_positions(base_ids).bool()
+            L = single.shape[1]
+            if "decoy" in extras:
+                # same single-base hole at the scored C, plus a hole of a given size somewhere
+                # else in the window: does the model need to see a big hole at all, or does the
+                # hole have to cover the scored base?
+                for w in decoy_sizes:
+                    dec = single.clone()
+                    for i in range(bsz):
+                        for p in torch.nonzero(single[i, :, 0] > 0).flatten().tolist():
+                            a = p + 250
+                            if a + w > L:
+                                a = max(0, p - 250 - w)
+                            dec[i, a:min(L, a + w), 0] = 1
+                    hidden[f"decoy{w}"] = dec
+                    scored[f"decoy{w}"] = single.squeeze(-1).bool().clone()
+            if "visneigh" in extras:
+                # bp50 hole, but the C of every *other* CpG inside the hole is left visible:
+                # if the model were confused by neighbours it cannot use, this should hurt.
+                vn = hidden["bp50"].clone()
+                sc_f = scored["bp50"]
+                for i in range(bsz):
+                    sc = torch.nonzero(sc_f[i]).flatten().tolist()
+                    for q in torch.nonzero(fwd[i]).flatten().tolist():
+                        if q in sc:
+                            continue
+                        if any(abs(q - p) <= 50 for p in sc):
+                            vn[i, q, 0] = 0
+                hidden["visneigh"] = vn
+                scored["visneigh"] = sc_f.clone()
             if opts.iso_bp > 0:
                 iso = torch.zeros_like(fwd)
                 for i in range(bsz):
