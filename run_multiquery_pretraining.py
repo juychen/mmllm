@@ -56,6 +56,7 @@ import torch
 import torch.nn as nn
 
 from data import (
+    find_forward_cpg_positions,
     LazyM5cSequenceAtacRnaDataset,
     add_clip_at_zero_argument,
     ensure_path_list,
@@ -66,6 +67,7 @@ from data import (
     resolve_train_val_test_split,
     write_train_val_beds,
 )
+from mask_blocks import generate_cpg_block_mask, generate_cpg_mixed_budget_mask
 from models import MultiQueryMaskedPretrainingModel
 from utils import (
     derive_test_h5ad_path,
@@ -545,6 +547,7 @@ def evaluate(
     mask_seed: int | None = None,
     mask_neighborhood_bp: int = 50,
     return_predictions: bool = False,
+    loss_mask_mode: str = "loss",
 ):
     """Reconstruction metrics on a held-out loader (query tracks are the heads).
 
@@ -585,6 +588,11 @@ def evaluate(
             )
             hide_mask = hide_mask.to(device)
             loss_mask = loss_mask.to(device)
+            if loss_mask_mode == "hide_cpg":
+                cpg_fwd = find_forward_cpg_positions(base_ids_batch).unsqueeze(-1).float().to(device)
+                loss_mask = hide_mask * cpg_fwd
+            elif loss_mask_mode == "hide":
+                loss_mask = hide_mask
             targets = queries
 
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp):
@@ -615,6 +623,8 @@ def evaluate(
         target_cat = torch.cat(all_targets[name], dim=0)
         mask_cat = torch.cat(all_masks[name], dim=0)
         mask_bool = mask_cat.bool()
+        if name == query_tracks[0]:
+            result["eval_n_positions"] = int(mask_bool.sum().item())
         masked_pred = pred_cat[mask_bool]
         masked_target = target_cat[mask_bool]
 
@@ -761,6 +771,13 @@ def run_experiment(
     mixed_widths = tuple(
         int(w) for w in str(getattr(args, "mask_widths", "") or "").replace(" ", "").split(",") if w
     )
+    if getattr(args, "mask_width_budget", False):
+        print(f"  mask scheme       : mixed widths {list(mixed_widths or (0,10,25,50,100))} under a "
+              f"{args.mask_fraction:.0%} HIDDEN-CpG budget (loss on every hidden C)")
+    if getattr(args, "mask_block", False):
+        print(f"  mask scheme       : contiguous blocks anchored on {args.mask_fraction:.0%} of CpGs, "
+              f"block length [{args.mask_block_min_bp}, {args.mask_block_max_bp}] bp "
+              f"(evaluation still uses +/-{args.mask_neighborhood_bp} bp)")
     if mixed_widths:
         print(f"  mask widths       : mixed per-CpG draw from {list(mixed_widths)} "
               f"(evaluation still uses +/-{args.mask_neighborhood_bp} bp)")
@@ -783,7 +800,17 @@ def run_experiment(
 
             # Layer 1: shared position mask (all signal tracks, incl. every query).
             # Layer 2: modality mask — each track's presence re-drawn per step/sample.
-            if mixed_widths:
+            if getattr(args, "mask_width_budget", False):
+                hide_mask, loss_mask = generate_cpg_mixed_budget_mask(
+                    base_ids_batch, args.mask_fraction, mixed_widths or (0, 10, 25, 50, 100),
+                )
+            elif args.mask_block:
+                hide_mask, loss_mask = generate_cpg_block_mask(
+                    base_ids_batch, args.mask_fraction,
+                    min_block_bp=args.mask_block_min_bp,
+                    max_block_bp=args.mask_block_max_bp,
+                )
+            elif mixed_widths:
                 hide_mask, loss_mask = generate_cpg_pair_mask_mixed(
                     base_ids_batch, args.mask_fraction, mixed_widths,
                 )
@@ -793,6 +820,9 @@ def run_experiment(
                 )
             hide_mask = hide_mask.to(device)
             loss_mask = loss_mask.to(device)
+            if getattr(args, "train_loss_mask", "loss") == "hide_cpg":
+                cpg_fwd = find_forward_cpg_positions(base_ids_batch).unsqueeze(-1).float().to(device)
+                loss_mask = hide_mask * cpg_fwd
             query_present = sample_track_presence(
                 batch_size=queries[0].size(0),
                 track_names=query_tracks,
@@ -1097,6 +1127,20 @@ def parse_args():
     parser.add_argument("--mask-neighborhood-bp", type=int, default=50,
                         help="Hide +/- this many bp around each selected CpG pair (default 50). "
                              "0 = hide only the C/G pair. Loss is computed only at the selected C.")
+    parser.add_argument("--mask-width-budget", action="store_true",
+                        help="Use --mask-widths but cap the fraction of HIDDEN CpGs at --mask-fraction.")
+    parser.add_argument(
+        "--train-loss-mask",
+        choices=["loss", "hide_cpg"],
+        default="loss",
+        help="which positions the training MSE is computed on: 'loss' = the selected CpG C only "
+             "(original behaviour), 'hide_cpg' = every forward C hidden by the hole (hole completion)",
+    )
+    parser.add_argument("--mask-block", action="store_true",
+                        help="Hide contiguous blocks (min 100 bp) anchored on the sampled CpGs; "
+                             "loss is computed on every forward C inside the block.")
+    parser.add_argument("--mask-block-min-bp", type=int, default=100)
+    parser.add_argument("--mask-block-max-bp", type=int, default=400)
     parser.add_argument("--mask-widths", default="",
                         help="Mixed-width training: comma list of buffer widths, e.g. "
                              "'0,10,25,50,100'. Each selected CpG pair then draws its own width, so "
