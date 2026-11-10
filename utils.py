@@ -179,6 +179,17 @@ def export_prediction_signals_h5ad(
 
     ensure_parent_dir(output_path)
 
+    # Model heads return (N, L, 1); the exporter (and mask/plot helpers) expect (N, L).
+    predictions = np.asarray(predictions)
+    targets = np.asarray(targets)
+    masks = np.asarray(masks)
+    if predictions.ndim == 3 and predictions.shape[-1] == 1:
+        predictions = predictions[..., 0]
+    if targets.ndim == 3 and targets.shape[-1] == 1:
+        targets = targets[..., 0]
+    if masks.ndim == 3 and masks.shape[-1] == 1:
+        masks = masks[..., 0]
+
     N, L = predictions.shape
     seqs = region_metadata["sequence"].values
 

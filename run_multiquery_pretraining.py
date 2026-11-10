@@ -548,6 +548,7 @@ def evaluate(
     mask_neighborhood_bp: int = 50,
     return_predictions: bool = False,
     loss_mask_mode: str = "loss",
+    presence_fn=None,
 ):
     """Reconstruction metrics on a held-out loader (query tracks are the heads).
 
@@ -596,7 +597,8 @@ def evaluate(
             targets = queries
 
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp):
-                preds = model(queries, sequence_batch, context, position_mask=hide_mask)
+                extra = presence_fn(queries[0].size(0)) if presence_fn is not None else {}
+                preds = model(queries, sequence_batch, context, position_mask=hide_mask, **extra)
                 total_loss, losses = compute_masked_reconstruction_loss(
                     preds, targets, loss_mask, query_tracks
                 )
@@ -877,6 +879,7 @@ def run_experiment(
             model, prepared.val_loader, device, args.mask_fraction,
             query_tracks, context_tracks, amp=args.amp, mask_seed=args.seed + 1000,
             mask_neighborhood_bp=args.mask_neighborhood_bp,
+            loss_mask_mode="hide_cpg",
         )
 
         if scheduler is not None:
@@ -926,6 +929,7 @@ def run_experiment(
         model, prepared.val_loader, device, args.mask_fraction,
         query_tracks, context_tracks, amp=args.amp, mask_seed=args.seed + 1000,
         mask_neighborhood_bp=args.mask_neighborhood_bp,
+        loss_mask_mode="hide_cpg",
     )
     save_checkpoint(
         last_checkpoint_path,
@@ -944,6 +948,7 @@ def run_experiment(
             model, prepared.val_loader, device, args.mask_fraction,
             query_tracks, context_tracks, amp=args.amp, mask_seed=args.seed + 1000,
             mask_neighborhood_bp=args.mask_neighborhood_bp,
+            loss_mask_mode="hide_cpg",
         )
 
     # Held-out test: evaluated exactly once on the best checkpoint with its own
@@ -958,6 +963,7 @@ def run_experiment(
                 model, prepared.test_loader, device, args.mask_fraction,
                 query_tracks, context_tracks, amp=args.amp, mask_seed=args.seed + 2000,
                 mask_neighborhood_bp=args.mask_neighborhood_bp,
+                loss_mask_mode="hide_cpg",
                 return_predictions=True,
             )
         else:
@@ -965,6 +971,7 @@ def run_experiment(
                 model, prepared.test_loader, device, args.mask_fraction,
                 query_tracks, context_tracks, amp=args.amp, mask_seed=args.seed + 2000,
                 mask_neighborhood_bp=args.mask_neighborhood_bp,
+                loss_mask_mode="hide_cpg",
             )
         test_detail = ", ".join(
             f"{n}: R²={test_metrics[f'val_{n}_r2']:.4f} ρ={test_metrics[f'val_{n}_pearsonr']:.4f}"
@@ -1132,7 +1139,7 @@ def parse_args():
     parser.add_argument(
         "--train-loss-mask",
         choices=["loss", "hide_cpg"],
-        default="loss",
+        default="hide_cpg",
         help="which positions the training MSE is computed on: 'loss' = the selected CpG C only "
              "(original behaviour), 'hide_cpg' = every forward C hidden by the hole (hole completion)",
     )

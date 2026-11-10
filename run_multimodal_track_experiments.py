@@ -183,7 +183,10 @@ def collect_predictions(model: nn.Module, loader, device: torch.device):
             targets.append(target_batch.detach().cpu())
             masks.append(mask_batch.detach().cpu())
 
-    return torch.cat(preds, dim=0), torch.cat(targets, dim=0), torch.cat(masks, dim=0)
+    def _squeeze(t: torch.Tensor) -> torch.Tensor:
+        return t.squeeze(-1) if t.ndim == 3 and t.shape[-1] == 1 else t
+
+    return _squeeze(torch.cat(preds, dim=0)), _squeeze(torch.cat(targets, dim=0)), _squeeze(torch.cat(masks, dim=0))
 
 
 def run_experiment(num_dmrs: int, args, df_dmr, seqs, mcg_tracks, hmcg_tracks, atac_tracks) -> ExperimentResult:
