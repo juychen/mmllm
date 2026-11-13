@@ -49,6 +49,8 @@ class PresenceSampler:
             tp[-1] = flag(True)
         elif self.mode == "ctx":
             tp = [flag(True) for _ in range(self.num_c)]
+        elif self.mode == "self":
+            qp[-1] = flag(True)
         elif self.mode == "seq":
             sp = flag(True)
         elif self.mode != "base":

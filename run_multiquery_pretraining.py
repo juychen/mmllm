@@ -252,8 +252,12 @@ def compute_masked_reconstruction_loss(
 ) -> tuple[torch.Tensor, dict[str, float]]:
     losses = {}
     total = 0.0
-    for name, pred, target in zip(head_track_names, preds, targets):
-        loss = masked_mse_loss(pred, target, position_mask)
+    if isinstance(position_mask, (list, tuple)):
+        masks = list(position_mask)
+    else:
+        masks = [position_mask] * len(head_track_names)
+    for name, pred, target, pm in zip(head_track_names, preds, targets, masks):
+        loss = masked_mse_loss(pred, target, pm)
         losses[name] = float(loss.detach().cpu().item())
         total = total + loss
     total = total / max(1, len(head_track_names))
@@ -589,11 +593,15 @@ def evaluate(
             )
             hide_mask = hide_mask.to(device)
             loss_mask = loss_mask.to(device)
-            if loss_mask_mode == "hide_cpg":
-                cpg_fwd = find_forward_cpg_positions(base_ids_batch).unsqueeze(-1).float().to(device)
-                loss_mask = hide_mask * cpg_fwd
-            elif loss_mask_mode == "hide":
-                loss_mask = hide_mask
+            cpg_fwd = find_forward_cpg_positions(base_ids_batch).unsqueeze(-1).float().to(device)
+            per_head_masks = []
+            for name in query_tracks:
+                if name in ("5mc", "5hmc"):
+                    pm = hide_mask * cpg_fwd if loss_mask_mode in ("hide_cpg", "hide") else loss_mask
+                else:
+                    pm = hide_mask if loss_mask_mode in ("hide_cpg", "hide") else loss_mask
+                per_head_masks.append(pm)
+            loss_mask = per_head_masks
             targets = queries
 
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp):
@@ -840,6 +848,22 @@ def run_experiment(
             sequence_present = sample_sequence_presence(
                 batch_size=queries[0].size(0), drop_p=args.drop_p_seq, device=device,
             )
+            cpg_fwd_all = find_forward_cpg_positions(base_ids_batch).unsqueeze(-1).float().to(device)
+            whole_on = getattr(args, "whole_track_loss", True)
+            per_head_masks = []
+            for ti, name in enumerate(query_tracks):
+                if name in ("5mc", "5hmc"):
+                    pm = hide_mask * cpg_fwd_all
+                    full = cpg_fwd_all
+                else:
+                    pm = hide_mask
+                    full = torch.ones_like(hide_mask)
+                if whole_on:
+                    absent = (query_present[ti] < 0.5).float()
+                    if float(absent.sum()) > 0:
+                        pm = torch.maximum(pm, full * absent)
+                per_head_masks.append(pm)
+            loss_mask = per_head_masks
             targets = queries
 
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=args.amp):
@@ -1079,8 +1103,8 @@ def parse_args():
                              "the other query tracks (e.g. 5hmC keeps access to 5mC) via its own context.")
     parser.add_argument("--mask-fraction", type=float, default=0.15,
                         help="Fraction of CpG positions masked per window (shared across all tracks).")
-    parser.add_argument("--drop-p-5mc", type=float, default=0.0)
-    parser.add_argument("--drop-p-5hmc", type=float, default=0.0)
+    parser.add_argument("--drop-p-5mc", type=float, default=0.1)
+    parser.add_argument("--drop-p-5hmc", type=float, default=0.1)
     parser.add_argument("--drop-p-atac", type=float, default=0.0)
     parser.add_argument("--drop-p-rna", type=float, default=0.0)
     parser.add_argument("--drop-p-seq", type=float, default=0.0)
@@ -1170,6 +1194,10 @@ def parse_args():
     parser.add_argument("--test-h5ad-positions", choices=["cpg", "cpg_forward", "c"], default="cpg",
                         help="Positions stored in the test .h5ad: 'cpg' (C and G of every CpG; matches the "
                              "masked metric, default), 'cpg_forward' (forward-strand C only) or 'c' (all C).")
+    parser.add_argument("--whole-track-loss", action="store_true", default=True,
+                        help="when the target query track is dropped, score every forward C of that window")
+    parser.add_argument("--whole-track-target", type=str, default="5hmc",
+                        help="query track treated as the whole-track target")
     return parser.parse_args()
 
 
