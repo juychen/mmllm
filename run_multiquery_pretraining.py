@@ -617,10 +617,11 @@ def evaluate(
             for name in query_tracks:
                 track_loss_sums[name] += losses[name] * batch_size
 
-            for name, pred, target in zip(query_tracks, preds, targets):
+            for ti, name in enumerate(query_tracks):
+                pred, target = preds[ti], targets[ti]
                 all_preds[name].append(pred.detach().cpu())
                 all_targets[name].append(target.detach().cpu())
-                all_masks[name].append(loss_mask.detach().cpu())
+                all_masks[name].append(loss_mask[ti].detach().cpu())
             if return_predictions:
                 all_base_ids.append(base_ids_batch.detach().cpu())
 
